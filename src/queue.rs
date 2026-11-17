@@ -123,14 +123,10 @@ pub fn acquire_until(
     let result = (|| -> Result<Held> {
         let room = open_lock(dir.join("room.lock"))?;
         let mut announced = false;
-        // Waiters line up here (polling when there is a deadline).
-        let flags = if deadline.is_some() {
-            libc::LOCK_EX | libc::LOCK_NB
-        } else {
-            libc::LOCK_EX
-        };
+        // Waiters line up here. Everyone polls, so a waiter with a deadline
+        // is not starved by ones blocked in the kernel.
         loop {
-            if unsafe { libc::flock(room.as_raw_fd(), flags) } == 0 {
+            if unsafe { libc::flock(room.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
                 break;
             }
             let err = std::io::Error::last_os_error();

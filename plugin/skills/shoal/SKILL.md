@@ -33,6 +33,7 @@ directory, if it is inside a session).
 - After `land`, read `status` in the result:
   - **`conflicts`**: merge the target into the session, resolve, commit, and land again. The session was left unchanged.
   - **`tests_failed`**: fix the failures, or `rewind` to the `pre-land-N` checkpoint named in the result.
+  - **`timed_out`**: the tests did not fail; the land ran out of time. Land again, with a larger `timeout_secs` if the tests are slow.
   - **`target_blocked`**: the user has uncommitted edits, or untracked or ignored files (listed in `files`), in the way. Tell them; the work is safe on the branch named in the message.
   - **`nothing_to_land`**: the target already has these changes.
 - `discard` keeps work by default: it commits leftovers as WIP and saves the branch (plus any other branches and stashes) in the source repository. Pass `keep_work: false` only when the session's work is worthless.

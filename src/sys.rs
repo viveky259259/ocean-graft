@@ -343,3 +343,38 @@ pub fn process_start(pid: i32) -> Option<String> {
         (!text.is_empty()).then_some(text)
     }
 }
+
+/// Whether any process has its working directory at or under `dir`.
+pub fn is_cwd_of_a_process(dir: &Path) -> bool {
+    let Ok(dir) = dir.canonicalize() else {
+        return false;
+    };
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(procs) = std::fs::read_dir("/proc") else {
+            return false;
+        };
+        procs.flatten().any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+                && std::fs::read_link(e.path().join("cwd")).is_ok_and(|cwd| cwd.starts_with(&dir))
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let Ok(out) = Command::new("lsof")
+            .args(["-a", "-d", "cwd", "-Fn"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+        else {
+            return true; // cannot tell: assume in use
+        };
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.strip_prefix('n'))
+            .any(|cwd| Path::new(cwd).starts_with(&dir))
+    }
+}

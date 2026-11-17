@@ -84,7 +84,7 @@ pub fn worktree_create(input: &Value) -> Result<PathBuf> {
                 .filter(|d| d.is_dir())
                 .unwrap_or(cwd);
             let dir = ops::ensure_project(&repo)?;
-            match ops::refresh(&dir) {
+            match ops::refresh(&dir, false) {
                 Ok(r) if !r.up_to_date => ops::progress(format!(
                     "template refreshed to {}",
                     crate::git::short(&r.to)
@@ -102,22 +102,55 @@ pub fn worktree_create(input: &Value) -> Result<PathBuf> {
         Origin::Session(parent) => Some(parent.clone()),
         _ => None,
     };
-    for gone in ops::sweep_worktrees(&mut p, ops::worktree_idle_limit(), 3, keep.as_deref()) {
-        ops::progress(format!(
-            "removed idle worktree session {gone} (its work is saved on a shoal/ branch)"
-        ));
-    }
     let name = ops::unique_name(&p, &ops::sanitize_name(raw));
     let info = ops::create_session(&mut p, &name, &origin)?;
-    if let Some(s) = p.state.sessions.get_mut(&name) {
-        s.worktree = true;
-        p.save()?;
+    // Hooks that fire for a subagent carry agent_id / agent_type; Claude
+    // Code never removes those worktrees, so shoal sweeps them when idle.
+    let subagent = field(input, "agent_id").is_some() || field(input, "agent_type").is_some();
+    if subagent {
+        if let Some(s) = p.state.sessions.get_mut(&name) {
+            s.subagent = true;
+            p.save()?;
+        }
+    }
+    let dir = p.dir.clone();
+    drop(p);
+    if ops::subagent_idle_limit().is_some() {
+        start_background_sweep(&dir, keep.as_deref().unwrap_or(&name));
     }
     ops::progress(format!(
         "session {} ready in {} ms on branch {}",
         info.name, info.ready_ms, info.branch
     ));
     Ok(info.path.canonicalize().unwrap_or(info.path))
+}
+
+/// Sweep idle subagent sessions in a detached process, so creating a
+/// worktree never waits for it. Best effort.
+fn start_background_sweep(dir: &Path, keep: &str) {
+    use std::os::unix::process::CommandExt;
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--project")
+        .arg(dir)
+        .args(["sweep", "--keep", keep])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    if let Ok(mut child) = cmd.spawn() {
+        // Reap it without waiting: a thread is enough, the hook exits soon.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 }
 
 pub fn worktree_remove(input: &Value) -> Result<()> {
@@ -183,7 +216,10 @@ fn forget_missing_session(path: &Path) {
     if let Ok(mut p) = Project::open(dir.to_path_buf()) {
         if p.state.sessions.contains_key(&name) && p.session_path(&name).symlink_metadata().is_err()
         {
-            if let Err(err) = ops::remove(&mut p, &name, true, false) {
+            // Save, not force: on overlay the work lives in the volume, and a
+            // missing mount point does not mean it is gone. A session with
+            // nothing left is cleared without saving (already_gone).
+            if let Err(err) = ops::remove(&mut p, &name, false, true) {
                 ops::progress(format!("could not clear the record of {name}: {err:#}"));
             }
         }

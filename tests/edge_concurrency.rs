@@ -896,11 +896,14 @@ fn checkpoint_of_the_landing_session_during_its_tests() {
     });
     let land = land.unwrap();
     assert_eq!(land["status"], "landed", "{land}");
-    let cp = cp.unwrap();
+    // A checkpoint mid-land could catch the rebase half done, so it is
+    // refused with a clear message, and works again once the land is over.
+    let e = cp.unwrap_err();
+    assert!(e.contains("being landed"), "{e}");
+    let cp = env.api("checkpoint", json!({"session": "s"})).unwrap();
     assert_eq!(cp["label"], "cp1");
     let state = check_invariants(&env);
     assert_eq!(state["checkpoints"].as_array().unwrap().len(), 2);
-    // The checkpoint taken mid-land is a usable, rebased state, not a mid-rebase one.
     env.api("rewind", json!({"session": "s", "label": "cp1"}))
         .unwrap();
     assert!(!s.join(".git/rebase-merge").exists() && !s.join(".git/rebase-apply").exists());

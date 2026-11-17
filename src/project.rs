@@ -114,11 +114,13 @@ pub struct Session {
     /// Last time shoal ran something in the session (exec, run, serve, touch...).
     #[serde(default)]
     pub last_active: u64,
-    /// Made by the WorktreeCreate hook. Claude Code does not send
-    /// WorktreeRemove for subagent worktrees, so shoal removes these itself
-    /// (saving their work) once they have been idle for a long time.
-    #[serde(default)]
-    pub worktree: bool,
+    /// Made by the WorktreeCreate hook for a subagent or workflow agent (the
+    /// hook input carried agent_id or agent_type). Claude Code never sends
+    /// WorktreeRemove for those, so shoal removes them itself, saving their
+    /// work, once they have been idle for a long time. Interactive
+    /// `claude --worktree` sessions are never marked.
+    #[serde(default, alias = "worktree")]
+    pub subagent: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -148,6 +150,17 @@ pub struct State {
     pub generations: Vec<Generation>,
     pub sessions: BTreeMap<String, Session>,
     pub checkpoints: Vec<Checkpoint>,
+    /// The last template refresh that failed, so that every fork does not
+    /// rebuild (and fail on) the same commit again.
+    #[serde(default)]
+    pub refresh_failure: Option<RefreshFailure>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct RefreshFailure {
+    pub commit: String,
+    pub error: String,
+    pub at: u64,
 }
 
 impl State {
@@ -170,6 +183,7 @@ impl State {
             generations: Vec::new(),
             sessions: BTreeMap::new(),
             checkpoints: Vec::new(),
+            refresh_failure: None,
         }
     }
 }
@@ -291,6 +305,18 @@ pub fn all_projects() -> Result<Vec<PathBuf>> {
     Ok(dirs)
 }
 
+/// A port held for a session being created; released when dropped.
+pub struct PortReservation {
+    pub port: u16,
+    file: PathBuf,
+}
+
+impl Drop for PortReservation {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.file);
+    }
+}
+
 /// Session names that mean something else to `fork`.
 pub const RESERVED_SESSION_NAMES: &[&str] = &["main", "template"];
 
@@ -350,6 +376,45 @@ impl Project {
         Ok(project)
     }
 
+    /// The overlay form: volumes/<name>/upper.restore-<pid> (a staging copy)
+    /// and upper.rewind-<pid> (the layer being replaced).
+    fn recover_overlay_rewinds(&self) {
+        for name in self.state.sessions.keys() {
+            let volume = self.volume_dir(name);
+            let Ok(entries) = std::fs::read_dir(&volume) else {
+                continue;
+            };
+            let upper = volume.join("upper");
+            for entry in entries.flatten() {
+                let file = entry.file_name().to_string_lossy().into_owned();
+                let result = if let Some(pid) = file.strip_prefix("upper.restore-") {
+                    if pid.parse::<u32>().is_err() {
+                        continue;
+                    }
+                    std::fs::remove_dir_all(entry.path())
+                } else if let Some(pid) = file.strip_prefix("upper.rewind-") {
+                    if pid.parse::<u32>().is_err() {
+                        continue;
+                    }
+                    if upper.symlink_metadata().is_err() {
+                        eprintln!("shoal: restoring session {name} after an interrupted rewind");
+                        std::fs::rename(entry.path(), &upper)
+                    } else {
+                        std::fs::remove_dir_all(entry.path())
+                    }
+                } else {
+                    continue;
+                };
+                if let Err(err) = result {
+                    eprintln!(
+                        "shoal: could not clean up {}: {err}",
+                        entry.path().display()
+                    );
+                }
+            }
+        }
+    }
+
     /// A clone-backend rewind copies the checkpoint to restore-<name>-<pid>,
     /// then swaps it in, moving the old session to trash-<name>-<pid>, all
     /// under the project lock. Holding the lock now means no rewind is
@@ -357,6 +422,7 @@ impl Project {
     /// discarded; a trash directory is put back if the session directory is
     /// missing, and otherwise the swap finished and it is garbage.
     fn recover_interrupted_rewinds(&self) {
+        self.recover_overlay_rewinds();
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return;
         };
@@ -474,12 +540,34 @@ impl Project {
             .expect("a project always has a generation")
     }
 
-    /// The first free port of port_base, port_base + 10, ... (each session
-    /// has ten: its own and nine for extra services).
-    pub fn next_port(&self) -> Result<u16> {
+    /// Reserve the first free block of ten ports at port_base, port_base +
+    /// 10, ... (a session's own port and nine for extra services). Free
+    /// means: not used by a session of any project on this machine, not
+    /// reserved by a session being created right now, and not bound by
+    /// anything. The reservation lasts until the returned guard is dropped,
+    /// by which time the new session is recorded in state.json.
+    pub fn reserve_port(&self) -> Result<PortReservation> {
+        let home = shoal_home()?;
+        let reservations = home.join("ports");
+        std::fs::create_dir_all(&reservations)?;
+        let lock = File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(home.join("ports.lock"))
+            .context("could not open the port lock")?;
+        loop {
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                break;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
+                return Err(err).context("could not take the port lock");
+            }
+        }
         let mut used: HashSet<u16> = self.state.sessions.values().map(|s| s.port).collect();
-        // Sessions of other projects on this machine own their blocks too.
-        // Read without their locks: a slightly stale view only costs a skip.
+        // Other projects' sessions, read without their locks: their
+        // in-flight creations are covered by the reservations below.
         for dir in all_projects().unwrap_or_default() {
             if dir == self.dir {
                 continue;
@@ -491,21 +579,49 @@ impl Project {
                 used.extend(state.sessions.values().map(|s| s.port));
             }
         }
-        // And a port something else already listens on is no use either.
-        let busy = |port: u16| std::net::TcpListener::bind(("127.0.0.1", port)).is_err();
+        // Reservations of creations in progress; stale ones (their process
+        // is gone) are cleared.
+        if let Ok(entries) = std::fs::read_dir(&reservations) {
+            for entry in entries.flatten() {
+                let Ok(port) = entry.file_name().to_string_lossy().parse::<u16>() else {
+                    continue;
+                };
+                let owner = std::fs::read_to_string(entry.path())
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i32>().ok());
+                let alive = owner.is_some_and(|pid| {
+                    let rc = unsafe { libc::kill(pid, 0) };
+                    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+                });
+                if alive {
+                    used.insert(port);
+                } else {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        let bound = |port: u16| {
+            std::net::TcpListener::bind(("127.0.0.1", port)).is_err()
+                || std::net::TcpListener::bind(("0.0.0.0", port)).is_err()
+        };
+        let block_busy = |base: u16| (base..=base + 9).any(bound);
         let base = u32::from(self.state.port_base);
-        (0u32..)
+        let port = (0u32..)
             .map(|k| base + k * 10)
             .take_while(|port| *port + 9 <= u32::from(u16::MAX))
             .map(|port| port as u16)
-            .find(|port| !used.contains(port) && !busy(*port))
+            .find(|port| !used.contains(port) && !block_busy(*port))
             .with_context(|| {
                 format!(
-                    "no free ports left above port_base {} ({} sessions); remove sessions or lower port_base",
+                    "no free ports left above port_base {} ({} in use on this machine); remove sessions or change port_base",
                     self.state.port_base,
                     used.len()
                 )
-            })
+            })?;
+        let file = reservations.join(port.to_string());
+        std::fs::write(&file, std::process::id().to_string())?;
+        drop(lock);
+        Ok(PortReservation { port, file })
     }
 
     /// Make sure the session's directory is there, mounting it if needed (for

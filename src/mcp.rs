@@ -112,14 +112,26 @@ pub fn handle(msg: &Value, on_call: &mut dyn FnMut(Value, String, Value)) -> Opt
 /// Serve on stdin/stdout until stdin closes.
 pub fn serve() -> anyhow::Result<()> {
     let out = Arc::new(Mutex::new(std::io::stdout()));
+    // Set when a write fails (the client closed its end): no one is
+    // listening, so take no new calls.
+    let broken = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let send = {
         let out = Arc::clone(&out);
+        let broken = Arc::clone(&broken);
         move |v: Value| {
+            if broken.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
             let mut line = serde_json::to_string(&v).unwrap_or_default();
             line.push('\n');
-            let mut out = out.lock().expect("stdout lock");
-            let _ = out.write_all(line.as_bytes());
-            let _ = out.flush();
+            let mut out = out.lock().unwrap_or_else(|e| e.into_inner());
+            if out
+                .write_all(line.as_bytes())
+                .and_then(|_| out.flush())
+                .is_err()
+            {
+                broken.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
         }
     };
     let mut workers = Vec::new();
@@ -127,6 +139,12 @@ pub fn serve() -> anyhow::Result<()> {
     let mut input = stdin.lock();
     let mut raw = Vec::new();
     loop {
+        if broken.load(std::sync::atomic::Ordering::SeqCst) {
+            eprintln!(
+                "shoal mcp: the client closed its end; finishing calls in flight and exiting"
+            );
+            break;
+        }
         raw.clear();
         match input.read_until(b'\n', &mut raw) {
             Ok(0) => break,

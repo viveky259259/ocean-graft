@@ -796,7 +796,7 @@ fn test_timeout_kills_the_whole_process_group() {
             json!({"session": "a", "test": test, "timeout_secs": 1}),
         );
         let took = start.elapsed();
-        assert_eq!(r["status"], "tests_failed", "[{backend}] {r}");
+        assert_eq!(r["status"], "timed_out", "[{backend}] {r}");
         assert_eq!(r["tests"]["timed_out"], true, "{r}");
         assert_eq!(r["tests"]["passed"], false);
         assert!(r["tests"]["exit_code"].is_null(), "{r}");
@@ -836,7 +836,7 @@ fn zero_timeout_is_clamped_to_one_second_not_unlimited() {
         start.elapsed() < Duration::from_secs(15),
         "timeout_secs 0 ran without a limit"
     );
-    assert_eq!(r["status"], "tests_failed", "{r}");
+    assert_eq!(r["status"], "timed_out", "{r}");
     assert_eq!(r["tests"]["timed_out"], true);
 }
 

@@ -56,10 +56,23 @@ fn ms(d: Duration) -> u64 {
     d.as_millis() as u64
 }
 
+/// The longest a setup command may run (SHOAL_SETUP_TIMEOUT_SECS), so a
+/// hung install cannot hold up every fork behind the refresh lock.
+fn setup_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("SHOAL_SETUP_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .filter(|s| *s > 0)
+            .unwrap_or(1200),
+    )
+}
+
 fn run_setup(dir: &Path, setup: &str) -> Result<()> {
     progress(format!("running setup in the template: {setup}"));
     let start = Instant::now();
-    let status = Command::new("sh")
+    let limit = setup_timeout();
+    let mut child = Command::new("sh")
         .arg("-c")
         .arg(setup)
         .current_dir(dir)
@@ -67,8 +80,24 @@ fn run_setup(dir: &Path, setup: &str) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(std::io::stderr()))
         .stderr(Stdio::inherit())
-        .status()
+        .process_group(0)
+        .spawn()
         .with_context(|| format!("could not run setup `{setup}`"))?;
+    let pgid = child.id() as i32;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if start.elapsed() >= limit {
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+            let _ = child.wait();
+            bail!(
+                "setup command `{setup}` did not finish within {} (SHOAL_SETUP_TIMEOUT_SECS)",
+                sys::human_duration(limit)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
     if !status.success() {
         bail!("setup command `{setup}` failed ({status})");
     }
@@ -412,12 +441,28 @@ fn refresh_lock(dir: &Path) -> Result<std::fs::File> {
 /// Build a new template generation if the source branch moved. Takes the
 /// project lock only to read the state and to record the new generation;
 /// the build itself runs without it. Callers must not hold the project lock.
-pub fn refresh(dir: &Path) -> Result<RefreshReport> {
+/// How long a failed refresh of one commit is remembered before the next
+/// fork tries it again (a flaky network may have been the cause).
+const REFRESH_RETRY_AFTER: u64 = 600;
+
+/// `force` retries even a commit whose refresh failed recently.
+pub fn refresh(dir: &Path, force: bool) -> Result<RefreshReport> {
     let start = Instant::now();
     let _refreshing = refresh_lock(dir)?;
     let (latest, branch, backend, old_setup, old_inputs, source_head) = {
         let p = Project::open(dir.to_path_buf())?;
         let source_head = git::git_trim(&p.state.source, &["rev-parse", &p.state.branch])?;
+        if let Some(failed) = &p.state.refresh_failure {
+            let age = sys::now().saturating_sub(failed.at);
+            if !force && failed.commit == source_head && age < REFRESH_RETRY_AFTER {
+                bail!(
+                    "{} ({} s ago; retried automatically after {} s, or now with `shoal refresh`)",
+                    failed.error,
+                    age,
+                    REFRESH_RETRY_AFTER
+                );
+            }
+        }
         (
             p.latest().clone(),
             p.state.branch.clone(),
@@ -512,6 +557,17 @@ pub fn refresh(dir: &Path) -> Result<RefreshReport> {
         Ok(r) => r,
         Err(err) => {
             let _ = std::fs::remove_dir_all(abs(&rel));
+            if let Ok(mut p) = Project::open(dir.to_path_buf()) {
+                p.state.refresh_failure = Some(project::RefreshFailure {
+                    commit: source_head.clone(),
+                    error: format!(
+                        "refreshing the template to {} failed: {err:#}",
+                        git::short(&source_head)
+                    ),
+                    at: sys::now(),
+                });
+                let _ = p.save();
+            }
             return Err(err);
         }
     };
@@ -520,6 +576,7 @@ pub fn refresh(dir: &Path) -> Result<RefreshReport> {
         layers.extend(latest.layers.iter().cloned());
     }
     let mut p = Project::open(dir.to_path_buf())?;
+    p.state.refresh_failure = None;
     p.state.setup = setup;
     p.state.setup_inputs = inputs;
     p.state.generations.push(Generation {
@@ -584,7 +641,10 @@ pub fn sanitize_name(raw: &str) -> String {
 /// `base` with `suffix` appended, shortening `base` so the result is still a
 /// valid name of at most 40 characters.
 pub fn with_suffix(base: &str, suffix: &str) -> String {
-    let stem: String = base.chars().take(40 - suffix.len()).collect();
+    let stem: String = base
+        .chars()
+        .take(40usize.saturating_sub(suffix.len()))
+        .collect();
     format!("{}{suffix}", stem.trim_end_matches(['-', '.', '_']))
 }
 
@@ -643,13 +703,20 @@ pub fn create_session(p: &mut Project, name: &str, origin: &Origin) -> Result<Se
         bail!("session {name} already exists");
     }
     let path = p.session_path(name);
+    let orphan_checkpoints = p.dir.join("checkpoints").join(name);
+    if orphan_checkpoints.exists() && !p.state.checkpoints.iter().any(|c| c.session == name) {
+        // Left by a removal that crashed after forgetting the session.
+        std::fs::remove_dir_all(&orphan_checkpoints)?;
+    }
     if path.symlink_metadata().is_ok() || p.volume_dir(name).exists() {
         bail!(
             "{} is left over from an earlier session; remove it first",
             path.display()
         );
     }
-    let port = p.next_port()?;
+    // Held until this function returns, by when the session is saved.
+    let reservation = p.reserve_port()?;
+    let port = reservation.port;
     let start = Instant::now();
     let fork_layer = |p: &Project, parent: &str, src: &Path| -> Result<String> {
         // "+" cannot occur in names, so parent/name pairs never collide; the
@@ -683,6 +750,9 @@ pub fn create_session(p: &mut Project, name: &str, origin: &Origin) -> Result<Se
             }
             Origin::Session(parent) => {
                 let ps = p.session(parent)?.clone();
+                // Not while the parent is being landed: its rebase would be
+                // copied half done.
+                let _busy = try_session_lock(&p.dir, parent, "fork")?;
                 let parent_path = p.ensure_ready(parent)?;
                 sys::sync();
                 let lowers = match p.state.backend {
@@ -762,7 +832,7 @@ pub fn create_session(p: &mut Project, name: &str, origin: &Origin) -> Result<Se
         lowers,
         services: Vec::new(),
         last_active: sys::now(),
-        worktree: false,
+        subagent: false,
     };
     let created = (|| -> Result<Duration> {
         if p.state.backend == Backend::Overlay {
@@ -880,7 +950,21 @@ fn next_label(p: &Project, session: &str, prefix: &str) -> String {
     format!("{prefix}{}", n + 1)
 }
 
+/// Checkpoint a session. Refused while the session is being landed (its
+/// rebase would be caught half done).
 pub fn checkpoint(
+    p: &mut Project,
+    name: &str,
+    label: Option<&str>,
+    auto: bool,
+) -> Result<CheckpointInfo> {
+    p.session(name)?;
+    let _busy = try_session_lock(&p.dir, name, "checkpoint")?;
+    checkpoint_inner(p, name, label, auto)
+}
+
+/// Checkpoint without the session lock, for operations that hold it.
+fn checkpoint_inner(
     p: &mut Project,
     name: &str,
     label: Option<&str>,
@@ -961,6 +1045,34 @@ pub fn checkpoint(
         pruned,
         elapsed_ms: ms(start.elapsed()),
     })
+}
+
+const PRE_REWIND_KEPT: usize = 10;
+
+/// Drop the oldest checkpoints of `name` whose label starts with `prefix`,
+/// beyond the newest `keep`.
+fn prune_prefix(p: &mut Project, name: &str, prefix: &str, keep: usize) -> Result<()> {
+    let matching: Vec<String> = p
+        .state
+        .checkpoints
+        .iter()
+        .filter(|c| c.session == name && c.label.starts_with(prefix))
+        .map(|c| c.label.clone())
+        .collect();
+    if matching.len() <= keep {
+        return Ok(());
+    }
+    let drop: Vec<String> = matching[..matching.len() - keep].to_vec();
+    for label in &drop {
+        let dir = p.checkpoint_dir(name, label);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)?;
+        }
+    }
+    p.state
+        .checkpoints
+        .retain(|c| !(c.session == name && drop.contains(&c.label)));
+    p.save()
 }
 
 /// Drop the oldest automatic checkpoints beyond the newest few.
@@ -1066,56 +1178,56 @@ pub fn rewind(p: &mut Project, name: &str, label: &str) -> Result<RewindInfo> {
             saved.display()
         );
     }
-    // Nothing lost: if the session has changed since that checkpoint, keep
-    // its current state as a checkpoint first, so the rewind can be undone.
-    let target_fp = p
-        .state
-        .checkpoints
-        .iter()
-        .find(|c| c.session == name && c.label == label)
-        .and_then(|c| c.fingerprint.clone());
-    let path_now = p.ensure_ready(name)?;
-    let now_fp = conflicts::fingerprint_with_ignored(&path_now).ok();
-    let saved_as = if target_fp.is_some() && target_fp == now_fp {
-        None
-    } else {
-        let safety = next_label(p, name, "pre-rewind-");
-        checkpoint(p, name, Some(&safety), false)?.label
-    };
+    // Nothing lost: keep the current state as a checkpoint first, so the
+    // rewind can be undone. Always: no cheap fingerprint sees everything a
+    // rewind replaces (stashes, other branches, deep inside ignored trees).
+    let safety = next_label(p, name, "pre-rewind-");
+    let saved_as = checkpoint_inner(p, name, Some(&safety), false)?.label;
+    prune_prefix(p, name, "pre-rewind-", PRE_REWIND_KEPT)?;
     services::stop_session(p, name, None, false, true)?;
     let start = Instant::now();
     let path = p.session_path(name);
     match p.state.backend {
         Backend::Overlay => {
-            // Never delete the current layer before its replacement exists:
-            // move it aside, copy the checkpoint in, and put it back on failure.
-            if sys::is_mounted(&path) {
-                sys::unmount(&path)?;
-            }
+            // Same shape as the clone backend: copy the checkpoint into a
+            // staging layer while the session is untouched, then swap with
+            // renames. Project::open repairs a rewind killed at any point:
+            // upper.restore-* is discarded; upper.rewind-* is put back when
+            // upper is missing and discarded otherwise.
+            let pid = std::process::id();
             let volume = p.volume_dir(name);
             let upper = volume.join("upper");
             let work = volume.join("work");
-            let aside = volume.join(format!("upper.rewind-{}", std::process::id()));
-            if aside.symlink_metadata().is_ok() {
-                std::fs::remove_dir_all(&aside)?;
+            let staging = volume.join(format!("upper.restore-{pid}"));
+            let aside = volume.join(format!("upper.rewind-{pid}"));
+            for d in [&staging, &aside] {
+                if d.symlink_metadata().is_ok() {
+                    std::fs::remove_dir_all(d)?;
+                }
+            }
+            if let Err(err) = sys::clone_tree(&saved, &staging) {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(err.context(format!(
+                    "could not rewind {name} to {label}; the session is unchanged"
+                )));
+            }
+            if sys::is_mounted(&path) {
+                sys::unmount(&path)?;
             }
             if upper.exists() {
                 std::fs::rename(&upper, &aside)?;
             }
-            let restored = sys::clone_tree(&saved, &upper).and_then(|_| {
-                if work.exists() {
-                    std::fs::remove_dir_all(&work)?;
-                }
-                std::fs::create_dir_all(&work)?;
-                p.mount(&session)
-            });
-            if let Err(err) = restored {
+            std::fs::rename(&staging, &upper)?;
+            if work.exists() {
+                std::fs::remove_dir_all(&work)?;
+            }
+            std::fs::create_dir_all(&work)?;
+            if let Err(err) = p.mount(&session) {
+                // Put the old layer back and remount it.
                 let _ = std::fs::remove_dir_all(&upper);
                 if aside.exists() {
                     std::fs::rename(&aside, &upper)?;
                 }
-                let _ = std::fs::remove_dir_all(&work);
-                let _ = std::fs::create_dir_all(&work);
                 p.mount(&session)
                     .context("rewind failed and the session could not be remounted")?;
                 return Err(err.context(format!(
@@ -1359,18 +1471,24 @@ pub fn save_work(p: &Project, name: &str) -> Result<SaveInfo> {
             "refs/heads/",
         ],
     )?;
+    // Every local branch, the session's own included: import saved HEAD,
+    // which need not be on it (a detached HEAD, another branch checked
+    // out). Branches whose tip the source already has are skipped below.
+    let extra_name = |tag: &str| {
+        let tag: String = sanitize_name(tag).chars().take(24).collect();
+        with_suffix(&sanitize_name(name), &format!("--{tag}"))
+    };
     let mut extras: Vec<(String, String)> = branches
         .lines()
         .filter_map(|l| l.split_once(' '))
-        .filter(|(b, _)| *b != own)
-        .map(|(b, h)| (sanitize_name(&format!("{name}--{b}")), h.to_string()))
+        .map(|(b, h)| {
+            let tag = if b == own { "branch" } else { b };
+            (extra_name(tag), h.to_string())
+        })
         .collect();
     let stashes = git::git(&path, &["stash", "list", "--format=%H"]).unwrap_or_default();
     for (i, h) in stashes.lines().enumerate() {
-        extras.push((
-            with_suffix(&sanitize_name(name), &format!("--stash-{i}")),
-            h.to_string(),
-        ));
+        extras.push((extra_name(&format!("stash-{i}")), h.to_string()));
     }
     for (branch_name, commit) in extras {
         // Already in the source repository (the template's own branches):
@@ -1438,7 +1556,17 @@ pub fn remove(p: &mut Project, name: &str, force: bool, save: bool) -> Result<Re
         }
     }
     services::stop_session(p, name, None, false, false)?;
-    // Forget the session first, then delete its files: a crash in between
+    // The step that commonly fails (unmounting a busy overlay) goes first,
+    // while the record still exists and the call can simply be retried.
+    let session_dir = p.session_path(name);
+    if p.state.backend == Backend::Overlay && sys::is_mounted(&session_dir) {
+        sys::unmount(&session_dir).with_context(|| {
+            format!(
+                "could not unmount {name} (is a shell or editor using it?); nothing was removed"
+            )
+        })?;
+    }
+    // Then forget the session, then delete its files: a crash in between
     // leaves a stray directory (skipped by name allocation, reported on
     // reuse), never a record pointing at a half-deleted session.
     p.state.checkpoints.retain(|c| c.session != name);
@@ -1457,51 +1585,60 @@ pub fn remove(p: &mut Project, name: &str, force: bool, save: bool) -> Result<Re
     })
 }
 
-/// How long a worktree session may sit idle before `sweep_worktrees`
-/// removes it (its work saved first). SHOAL_WORKTREE_IDLE_HOURS overrides.
-pub fn worktree_idle_limit() -> u64 {
-    std::env::var("SHOAL_WORKTREE_IDLE_HOURS")
+/// How long a subagent session may sit idle before `sweep_subagents`
+/// removes it (its work saved first): SHOAL_WORKTREE_IDLE_HOURS, default
+/// 72. Zero turns the sweep off.
+pub fn subagent_idle_limit() -> Option<u64> {
+    let hours = std::env::var("SHOAL_WORKTREE_IDLE_HOURS")
         .ok()
         .and_then(|h| h.trim().parse::<f64>().ok())
-        .filter(|h| *h >= 0.0)
-        .map(|h| (h * 3600.0) as u64)
-        .unwrap_or(72 * 3600)
+        .filter(|h| h.is_finite() && *h >= 0.0)
+        .unwrap_or(72.0);
+    (hours > 0.0).then_some((hours * 3600.0) as u64)
 }
 
-/// Remove worktree sessions (made for subagents, which Claude Code never
-/// removes) that have been idle longer than `max_idle_secs` and run no
-/// services. Their work is saved to the source repository first; a session
-/// that cannot be saved is left alone. At most `limit` per call, so a sweep
-/// never makes one worktree creation slow.
-pub fn sweep_worktrees(
-    p: &mut Project,
+/// Remove subagent sessions (which Claude Code never removes) idle longer
+/// than `max_idle_secs`: no running services, no live process working in
+/// them, and not `keep`. Work is saved to the source repository first; a
+/// session that cannot be saved is left alone. The project lock is held
+/// only while one session is chosen and removed at a time, never across
+/// the whole sweep. Meant to run in a background `shoal sweep`.
+pub fn sweep_subagents(
+    dir: &Path,
     max_idle_secs: u64,
     limit: usize,
     keep: Option<&str>,
-) -> Vec<String> {
-    let now = sys::now();
-    let stale: Vec<String> = p
-        .state
-        .sessions
-        .values()
-        .filter(|s| s.worktree && Some(s.name.as_str()) != keep)
-        .filter(|s| {
-            !s.services
-                .iter()
-                .any(|svc| services::state(svc) == services::State::Running)
-        })
-        .filter(|s| now.saturating_sub(services::last_activity(p, s)) > max_idle_secs)
-        .map(|s| s.name.clone())
-        .take(limit)
-        .collect();
+) -> Result<Vec<String>> {
+    let stale: Vec<String> = {
+        let p = Project::open(dir.to_path_buf())?;
+        let now = sys::now();
+        p.state
+            .sessions
+            .values()
+            .filter(|s| s.subagent && Some(s.name.as_str()) != keep)
+            .filter(|s| {
+                !s.services
+                    .iter()
+                    .any(|svc| services::state(svc) == services::State::Running)
+            })
+            .filter(|s| now.saturating_sub(services::last_activity(&p, s)) > max_idle_secs)
+            .filter(|s| !sys::is_cwd_of_a_process(&p.session_path(&s.name)))
+            .map(|s| s.name.clone())
+            .take(limit)
+            .collect()
+    };
     let mut removed = Vec::new();
     for name in stale {
-        match remove(p, &name, false, true) {
+        let mut p = Project::open(dir.to_path_buf())?;
+        if !p.state.sessions.contains_key(&name) {
+            continue;
+        }
+        match remove(&mut p, &name, false, true) {
             Ok(_) => removed.push(name),
             Err(err) => progress(format!("left idle session {name} in place: {err:#}")),
         }
     }
-    removed
+    Ok(removed)
 }
 
 // ---------------------------------------------------------------------------
@@ -1531,7 +1668,7 @@ pub struct TestRun {
 #[derive(Serialize, Debug)]
 pub struct LandReport {
     /// landed | nothing_to_land | uncommitted_changes | conflicts |
-    /// tests_failed | target_blocked | target_moving
+    /// tests_failed | timed_out | target_blocked | target_moving
     pub status: &'static str,
     pub session: String,
     pub target: String,
@@ -1629,8 +1766,44 @@ fn conflicted_files(path: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Whether checking out new file `rel` (absent at `tip`) in `source` would
+/// replace something git does not track there: the path itself, or a parent
+/// that is an untracked file or symlink where a directory must go. Tracked
+/// parents are git's business (it refuses if the user changed them).
+fn path_in_the_way(source: &Path, session: &Path, tip: &str, rel: &str) -> bool {
+    if source.join(rel).symlink_metadata().is_ok() {
+        return true;
+    }
+    let tracked_at_tip =
+        |p: &str| git::git(session, &["cat-file", "-e", &format!("{tip}:{p}")]).is_ok();
+    let parts: Vec<&str> = rel.split('/').collect();
+    for i in 1..parts.len() {
+        let prefix = parts[..i].join("/");
+        match source.join(&prefix).symlink_metadata() {
+            Ok(meta) if meta.file_type().is_dir() => continue,
+            Ok(_) => return !tracked_at_tip(&prefix),
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
 /// Serialises the final fast-forward of every land in one project.
-fn land_lock(project_dir: &Path) -> Result<std::fs::File> {
+/// Open the project within what is left of a land's time.
+fn open_by(project_dir: &Path, deadline: Instant) -> Result<Project> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    Project::open_within(project_dir.to_path_buf(), left.max(Duration::from_millis(1))).map_err(
+        |err| {
+            if format!("{err:#}").contains("busy") {
+                err.context("the land ran out of time (timeout_secs) waiting for the project; nothing was landed")
+            } else {
+                err
+            }
+        },
+    )
+}
+
+fn land_lock(project_dir: &Path, deadline: Instant) -> Result<std::fs::File> {
     use std::os::unix::io::AsRawFd;
     let file = std::fs::File::options()
         .create(true)
@@ -1639,13 +1812,20 @@ fn land_lock(project_dir: &Path) -> Result<std::fs::File> {
         .open(project_dir.join("land.lock"))
         .context("could not open the land lock")?;
     loop {
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             return Ok(file);
         }
         let err = std::io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::EINTR) {
+        if !matches!(
+            err.raw_os_error(),
+            Some(libc::EWOULDBLOCK) | Some(libc::EINTR)
+        ) {
             return Err(err).context("could not take the land lock");
         }
+        if Instant::now() >= deadline {
+            bail!("the land ran out of time (timeout_secs) waiting for another land to finish; nothing was landed");
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -1656,13 +1836,13 @@ pub fn land(project_dir: &Path, name: &str, o: &LandOptions) -> Result<LandRepor
     // test_timeout bounds the whole land: queue waits, retries and tests.
     let deadline = Instant::now() + o.test_timeout;
     let _busy = {
-        let p = Project::open(project_dir.to_path_buf())?;
+        let p = open_by(project_dir, deadline)?;
         p.session(name)?;
         try_session_lock(project_dir, name, "land")
             .map_err(|_| anyhow::anyhow!("{name} is already being landed"))?
     };
     let (path, source, target, port, test) = {
-        let mut p = Project::open(project_dir.to_path_buf())?;
+        let mut p = open_by(project_dir, deadline)?;
         let path = p.ensure_ready(name)?;
         let s = p.session(name)?.clone();
         p.mark_active(name)?;
@@ -1729,9 +1909,9 @@ pub fn land(project_dir: &Path, name: &str, o: &LandOptions) -> Result<LandRepor
         let based = git::git(&path, &["merge-base", "--is-ancestor", &tip, "HEAD"]).is_ok();
         if !based {
             if report.checkpoint.is_none() {
-                let mut p = Project::open(project_dir.to_path_buf())?;
+                let mut p = open_by(project_dir, deadline)?;
                 let label = next_label(&p, name, "pre-land-");
-                let cp = checkpoint(&mut p, name, Some(&label), false)?;
+                let cp = checkpoint_inner(&mut p, name, Some(&label), false)?;
                 report.checkpoint = cp.label;
             }
             let rebase = git_with_identity(&path)
@@ -1780,7 +1960,17 @@ pub fn land(project_dir: &Path, name: &str, o: &LandOptions) -> Result<LandRepor
                 Err(err) => return Err(err),
             };
             let passed = run.passed;
+            let timed_out = run.timed_out;
             report.tests = Some(run);
+            if timed_out {
+                // Out of time (waiting for a test slot, or the tests ran
+                // past the deadline): not a test failure.
+                report.status = "timed_out";
+                report.message = format!(
+                    "the land ran out of time (timeout_secs) before the tests finished; they did not fail, and nothing was landed on {target}. Land again with a larger timeout_secs, or when the machine is less busy"
+                );
+                return Ok(report);
+            }
             if !passed {
                 report.status = "tests_failed";
                 report.message = match &report.checkpoint {
@@ -1796,21 +1986,30 @@ pub fn land(project_dir: &Path, name: &str, o: &LandOptions) -> Result<LandRepor
         // leave one's files checked out under the other's commit.
         let head = git::head(&path)?;
         let saved = save_branch(&source, &path, name)?;
-        let _land_guard = land_lock(project_dir)?;
+        let _land_guard = land_lock(project_dir, deadline)?;
         let checked_out = git::git_trim(&source, &["symbolic-ref", "-q", "HEAD"])
             .map(|r| r == target_ref)
             .unwrap_or(false);
         if checked_out {
             // git refuses to overwrite untracked files, but silently replaces
             // ignored ones (.env, local config). Refuse for both.
+            // --no-renames: a file that arrives by rename is still a new path.
             let added = git::git(
                 &path,
-                &["diff", "--name-only", "-z", "--diff-filter=A", &tip, &head],
+                &[
+                    "diff",
+                    "--no-renames",
+                    "--name-only",
+                    "-z",
+                    "--diff-filter=A",
+                    &tip,
+                    &head,
+                ],
             )?;
             let in_the_way: Vec<String> = added
                 .split('\0')
                 .filter(|f| !f.is_empty())
-                .filter(|f| source.join(f).symlink_metadata().is_ok())
+                .filter(|f| path_in_the_way(&source, &path, &tip, f))
                 .map(str::to_string)
                 .collect();
             if !in_the_way.is_empty() {

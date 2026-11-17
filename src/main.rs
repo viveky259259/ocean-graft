@@ -6,6 +6,16 @@
 //! branch and its installed dependencies, created in milliseconds and storing
 //! only what it changes.
 
+/// Like std's eprintln!, but a closed stderr is ignored instead of
+/// panicking: the MCP server ignores SIGPIPE, and a diagnostic must never
+/// abort an operation halfway. Shadows std's macro in every module.
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 mod config;
 mod conflicts;
 mod gateway;
@@ -98,6 +108,13 @@ enum Cmd {
     /// List sessions
     #[command(alias = "list")]
     Ls,
+    /// Remove idle subagent sessions, saving their work (run by the plugin)
+    #[command(hide = true)]
+    Sweep {
+        /// A session never to remove
+        #[arg(long)]
+        keep: Option<String>,
+    },
     /// Show one session in detail
     Status { name: String },
     /// Print a session's directory
@@ -244,8 +261,9 @@ fn main() {
     // Exit quietly when the reader goes away (`shoal ls | head`), like other CLIs,
     // instead of panicking on a broken pipe.
     let cli = Cli::parse();
-    // The MCP server must survive its client closing the pipe: a write
-    // error then ends the server cleanly after in-flight calls finish.
+    // The MCP server must survive its client closing a pipe: SIGPIPE stays
+    // ignored, a failed write marks the connection broken, and the server
+    // stops taking calls and exits once in-flight calls finish.
     if !matches!(cli.command, Cmd::Mcp) {
         unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     }
@@ -340,6 +358,15 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Stop { name, service } => cmd_stop(&mut p, &name, service.as_deref())?,
         Cmd::Services => cmd_services(&p)?,
         Cmd::Wake { name } => cmd_wake(&mut p, &name)?,
+        Cmd::Sweep { keep } => {
+            let dir = p.dir.clone();
+            drop(p); // the sweep locks per session
+            if let Some(limit) = ops::subagent_idle_limit() {
+                for gone in ops::sweep_subagents(&dir, limit, 3, keep.as_deref())? {
+                    eprintln!("removed idle subagent session {gone}; its work is saved in the source repository");
+                }
+            }
+        }
         Cmd::Touch { name } => {
             p.session(&name)?;
             p.mark_active(&name)?;
@@ -397,7 +424,7 @@ fn cmd_init(args: InitArgs) -> Result<()> {
 }
 
 fn cmd_refresh(dir: &std::path::Path) -> Result<()> {
-    let r = ops::refresh(dir)?;
+    let r = ops::refresh(dir, true)?;
     let p = Project::open(dir.to_path_buf())?;
     if r.up_to_date {
         println!(
