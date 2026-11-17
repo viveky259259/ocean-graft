@@ -23,9 +23,30 @@ pub fn head(dir: &Path) -> Result<String> {
     git_trim(dir, &["rev-parse", "HEAD"])
 }
 
+/// A directory outside any git repository (as opposed to a git failure).
+#[derive(Debug)]
+pub struct NotARepository(pub PathBuf);
+
+impl std::fmt::Display for NotARepository {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} is not inside a git repository", self.0.display())
+    }
+}
+
+impl std::error::Error for NotARepository {}
+
 pub fn toplevel(dir: &Path) -> Result<PathBuf> {
-    let top = git_trim(dir, &["rev-parse", "--show-toplevel"])
-        .with_context(|| format!("{} is not inside a git repository", dir.display()))?;
+    let top = match git_trim(dir, &["rev-parse", "--show-toplevel"]) {
+        Ok(top) => top,
+        Err(err) => {
+            let not_repo = format!("{err:#}").contains("not a git repository");
+            return Err(if not_repo {
+                anyhow::Error::new(NotARepository(dir.to_path_buf())).context(format!("{err:#}"))
+            } else {
+                err.context(format!("{} is not inside a git repository", dir.display()))
+            });
+        }
+    };
     Ok(PathBuf::from(top).canonicalize()?)
 }
 
@@ -35,6 +56,40 @@ pub fn status_lines(dir: &Path) -> Result<Vec<String>> {
         .lines()
         .map(str::to_string)
         .collect())
+}
+
+/// The paths `git status` reports as changed or untracked, unquoted (spaces
+/// and non-ASCII names come back as they are on disk). A rename reports its
+/// new path.
+pub fn status_paths(dir: &Path) -> Result<Vec<String>> {
+    let out = output_bytes(command(dir).args(["status", "--porcelain", "-z"]))?;
+    let mut paths = Vec::new();
+    let mut records = out.split(|b| *b == 0).filter(|r| !r.is_empty());
+    while let Some(record) = records.next() {
+        if record.len() < 4 {
+            continue;
+        }
+        let (code, path) = (&record[..2], &record[3..]);
+        paths.push(String::from_utf8_lossy(path).into_owned());
+        if code.contains(&b'R') || code.contains(&b'C') {
+            records.next(); // the original path
+        }
+    }
+    Ok(paths)
+}
+
+fn output_bytes(cmd: &mut Command) -> Result<Vec<u8>> {
+    let out = cmd
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("could not run git")?;
+    if !out.status.success() {
+        bail!(
+            "git failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(out.stdout)
 }
 
 pub fn count_commits(dir: &Path, range: &str) -> Result<u32> {

@@ -191,7 +191,7 @@ fn session_status(p: &Project, name: &str) -> Result<Value> {
     let path = p.ensure_ready(name)?;
     let branch = git::git_trim(&path, &["rev-parse", "--abbrev-ref", "HEAD"])?;
     let commits = git::count_commits(&path, &format!("{}..HEAD", s.base_commit))?;
-    let dirty = git::status_lines(&path)?;
+    let dirty = git::status_paths(&path)?;
     let idle = sys::now().saturating_sub(services::last_activity(p, s));
     let checkpoints: Vec<Value> = p
         .state
@@ -217,7 +217,7 @@ fn session_status(p: &Project, name: &str) -> Result<Value> {
         "parent": s.parent,
         "commits": commits,
         "uncommitted_count": dirty.len(),
-        "uncommitted": dirty.iter().take(50).map(|l| l[3.min(l.len())..].to_string()).collect::<Vec<_>>(),
+        "uncommitted": dirty.iter().take(50).collect::<Vec<_>>(),
         "idle_secs": idle,
         "checkpoints": checkpoints,
         "services": svcs,
@@ -236,30 +236,56 @@ fn conflicts_json(report: &conflicts::Report) -> Value {
 }
 
 fn status(args: &Value) -> Result<Value> {
+    // Validate every argument before looking for the project, so a bad
+    // argument is an error and never reads as "no project".
+    let path_arg = opt_str(args, "path")?;
+    opt_str(args, "project")?;
+    let session_arg = opt_str(args, "session")?;
     let dir = match project_dir(args, false) {
         Ok(dir) => dir,
-        Err(err) => {
+        Err(err)
+            if err.downcast_ref::<ops::NoProject>().is_some()
+                || err.downcast_ref::<git::NotARepository>().is_some() =>
+        {
             return Ok(json!({
                 "initialized": false,
                 "message": format!("{err:#}"),
                 "next": "call fork to create the first session; the project is set up automatically",
             }))
         }
+        Err(err) => return Err(err),
     };
     let p = Project::open(dir)?;
-    let current = match opt_str(args, "path")? {
-        Some(path) => ops::session_for_path(&p, Path::new(&path)),
-        None => opt_str(args, "session")?,
+    let current = match (path_arg, session_arg) {
+        (Some(path), _) => ops::session_for_path(&p, Path::new(&path)),
+        (None, Some(_)) => Some(session_name(&p, args)?),
+        (None, None) => None,
     };
     let source_head = git::git_trim(&p.state.source, &["rev-parse", &p.state.branch]).ok();
     let latest = p.latest();
     let cfg = config::load(&p.state.source).unwrap_or_default();
+    // One broken session must not hide the others.
     let mut sessions = Vec::new();
+    let mut broken = 0;
     for name in p.state.sessions.keys() {
-        sessions.push(session_status(&p, name)?);
+        match session_status(&p, name) {
+            Ok(v) => sessions.push(v),
+            Err(err) => {
+                broken += 1;
+                sessions.push(json!({
+                    "name": name,
+                    "path": p.session_path(name),
+                    "error": format!("{err:#}"),
+                    "next": "discard this session with keep_work: false if its directory is gone",
+                }));
+            }
+        }
     }
-    let overlaps = if p.state.sessions.len() >= 2 {
-        Some(conflicts_json(&conflicts::check(&p)?))
+    let overlaps = if p.state.sessions.len() - broken >= 2 {
+        match conflicts::check(&p) {
+            Ok(report) => Some(conflicts_json(&report)),
+            Err(err) => Some(json!({"error": format!("{err:#}")})),
+        }
     } else {
         None
     };
@@ -288,6 +314,7 @@ fn fork(args: &Value) -> Result<Value> {
     if count == 0 || count > MAX_FORKS {
         bail!("count must be between 1 and {MAX_FORKS}");
     }
+    let name_arg = opt_str(args, "name")?;
     let from_main = matches!(from.as_str(), "main" | "template");
     if from_main && at.is_some() {
         bail!("at needs from to name a session: checkpoints belong to sessions");
@@ -313,7 +340,7 @@ fn fork(args: &Value) -> Result<Value> {
             None => Origin::Session(from.clone()),
         }
     };
-    let base = match opt_str(args, "name")? {
+    let base = match name_arg {
         Some(n) => ops::sanitize_name(&n),
         None if from_main => "task".to_string(),
         None => ops::sanitize_name(&format!("{from}-fork")),
@@ -321,11 +348,11 @@ fn fork(args: &Value) -> Result<Value> {
     let mut created = Vec::new();
     for i in 1..=count {
         let wanted = if count > 1 {
-            format!("{base}-{i}")
+            ops::with_suffix(&base, &format!("-{i}"))
         } else {
             base.clone()
         };
-        let name = ops::unique_name(&p, &ops::sanitize_name(&wanted));
+        let name = ops::unique_name(&p, &wanted);
         match ops::create_session(&mut p, &name, &origin) {
             Ok(info) => created.push(info),
             Err(err) if !created.is_empty() => {

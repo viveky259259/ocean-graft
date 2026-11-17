@@ -59,12 +59,10 @@ pub fn handle(msg: &Value, on_call: &mut dyn FnMut(Value, String, Value)) -> Opt
     let id = obj.get("id").cloned();
     let Some(method) = obj.get("method").and_then(Value::as_str) else {
         // A response from the client, or junk: never answer a response.
-        return match id {
-            Some(id) if !obj.contains_key("result") && !obj.contains_key("error") => {
-                Some(error(id, -32600, "missing method"))
-            }
-            _ => None,
-        };
+        if obj.contains_key("result") || obj.contains_key("error") {
+            return None;
+        }
+        return Some(error(id.unwrap_or(Value::Null), -32600, "missing method"));
     };
     let Some(id) = id else {
         return None; // notifications (initialized, cancelled, ...) need no answer
@@ -125,12 +123,25 @@ pub fn serve() -> anyhow::Result<()> {
     };
     let mut workers = Vec::new();
     let stdin = std::io::stdin();
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(line) => line,
+    let mut input = stdin.lock();
+    let mut raw = Vec::new();
+    loop {
+        raw.clear();
+        match input.read_until(b'\n', &mut raw) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(err) => {
                 eprintln!("shoal mcp: reading stdin failed: {err}");
                 break;
+            }
+        }
+        // One undecodable line is a parse error, not the end of the session.
+        let line = match std::str::from_utf8(&raw) {
+            Ok(line) => line.trim_end_matches(['\n', '\r']).to_string(),
+            Err(err) => {
+                send(error(Value::Null, -32700, format!("parse error: {err}")));
+                continue;
             }
         };
         if line.trim().is_empty() {
@@ -155,7 +166,15 @@ pub fn serve() -> anyhow::Result<()> {
             let mut on_call = |id: Value, name: String, args: Value| {
                 let send = send.clone();
                 workers.push(std::thread::spawn(move || {
-                    send(result(id, tool_result(&name, &args)));
+                    // A panic in a tool must still answer the call.
+                    let outcome = std::panic::catch_unwind(|| tool_result(&name, &args))
+                        .unwrap_or_else(|_| {
+                            json!({
+                                "content": [{"type": "text", "text": format!("shoal: internal error while running {name}; see stderr")}],
+                                "isError": true,
+                            })
+                        });
+                    send(result(id, outcome));
                 }));
             };
             if let Some(response) = handle(&m, &mut on_call) {

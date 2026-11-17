@@ -115,6 +115,41 @@ pub fn fingerprint(dir: &Path) -> Result<String> {
     Ok(format!("{hash:016x}"))
 }
 
+/// `fingerprint` plus the ignored files and directories (.env, deps/...),
+/// for deciding whether a turn changed anything worth a checkpoint. An
+/// ignored directory counts by its own mtime, so a change deep inside it is
+/// noticed only when an entry directly in it is added or removed: cheap
+/// enough to run at the end of every turn even with node_modules.
+pub fn fingerprint_with_ignored(dir: &Path) -> Result<String> {
+    let base = fingerprint(dir)?;
+    let out = git::command(dir)
+        .args([
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--ignored=traditional",
+            "--untracked-files=normal",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    if !out.status.success() {
+        bail!(
+            "git status failed in {}: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let mut hash = u64::from_str_radix(&base, 16).unwrap_or(0xcbf2_9ce4_8422_2325);
+    for record in out.stdout.split(|b| *b == 0) {
+        if let Some(rel) = record.strip_prefix(b"! ") {
+            hash = fnv(rel, hash);
+            let rel = String::from_utf8_lossy(rel);
+            hash = stat_into(dir, rel.trim_end_matches('/'), hash);
+        }
+    }
+    Ok(format!("{hash:016x}"))
+}
+
 fn stat_into(dir: &Path, rel: &str, hash: u64) -> u64 {
     match std::fs::symlink_metadata(dir.join(rel)) {
         Ok(m) => {

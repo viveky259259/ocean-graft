@@ -34,13 +34,48 @@ pub struct Config {
 }
 
 pub const FILE_NAME: &str = "shoal.toml";
+const MAX_FILE: u64 = 256 * 1024;
+/// Each session takes a block of ten ports, so the last base must leave room.
+pub const PORT_BASE_MAX: u16 = u16::MAX - 9;
+
+/// Read shoal.toml without following a symlink out of the repository and
+/// without blocking on a FIFO or device someone named shoal.toml.
+fn read_config_text(path: &Path) -> Result<Option<String>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let meta = match path.symlink_metadata() {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("could not read {}", path.display())),
+    };
+    if !meta.file_type().is_file() {
+        bail!(
+            "{} must be a regular file (not a symlink, directory or FIFO)",
+            path.display()
+        );
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("could not read {}", path.display()))?;
+    if !file.metadata()?.file_type().is_file() {
+        bail!("{} must be a regular file", path.display());
+    }
+    let mut text = String::new();
+    file.take(MAX_FILE + 1)
+        .read_to_string(&mut text)
+        .with_context(|| format!("could not read {} as UTF-8 text", path.display()))?;
+    if text.len() as u64 > MAX_FILE {
+        bail!("{} is larger than {} KiB", path.display(), MAX_FILE / 1024);
+    }
+    Ok(Some(text))
+}
 
 pub fn read_file(repo: &Path) -> Result<FileConfig> {
     let path = repo.join(FILE_NAME);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FileConfig::default()),
-        Err(e) => return Err(e).with_context(|| format!("could not read {}", path.display())),
+    let Some(text) = read_config_text(&path)? else {
+        return Ok(FileConfig::default());
     };
     let parsed: FileConfig =
         toml::from_str(&text).with_context(|| format!("{} is not valid", path.display()))?;
@@ -49,6 +84,14 @@ pub fn read_file(repo: &Path) -> Result<FileConfig> {
         if item.is_empty() || rel.is_absolute() || rel.components().any(|c| c.as_os_str() == "..") {
             bail!(
                 "{}: copy entries must be paths inside the repository, got {item:?}",
+                path.display()
+            );
+        }
+    }
+    if let Some(port) = parsed.port_base {
+        if port == 0 || port > PORT_BASE_MAX {
+            bail!(
+                "{}: port_base must be between 1 and {PORT_BASE_MAX}, got {port}",
                 path.display()
             );
         }

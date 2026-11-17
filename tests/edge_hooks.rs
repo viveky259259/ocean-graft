@@ -67,8 +67,22 @@ fn run_hook_raw(
     )
 }
 
-fn hook(env: &Env, event: &str, input: &Value, dir: &Path, project_dir: Option<&Path>) -> HookResult {
-    run_hook_raw(env, event, input.to_string().as_bytes(), dir, project_dir, &[]).0
+fn hook(
+    env: &Env,
+    event: &str,
+    input: &Value,
+    dir: &Path,
+    project_dir: Option<&Path>,
+) -> HookResult {
+    run_hook_raw(
+        env,
+        event,
+        input.to_string().as_bytes(),
+        dir,
+        project_dir,
+        &[],
+    )
+    .0
 }
 
 fn timed_hook(env: &Env, event: &str, input: &Value, dir: &Path) -> (HookResult, Duration) {
@@ -91,9 +105,12 @@ fn expect_created(env: &Env, r: &HookResult, name: &str) -> PathBuf {
         "worktree-create for {name} failed\nstdout:\n{}\nstderr:\n{}",
         r.stdout, r.stderr
     );
-    let path = session_path(env, name)
-        .canonicalize()
-        .unwrap_or_else(|e| panic!("session {name} has no directory ({e}); stdout {:?}", r.stdout));
+    let path = session_path(env, name).canonicalize().unwrap_or_else(|e| {
+        panic!(
+            "session {name} has no directory ({e}); stdout {:?}",
+            r.stdout
+        )
+    });
     assert_eq!(
         r.last_line(),
         path.display().to_string(),
@@ -107,7 +124,8 @@ fn expect_created(env: &Env, r: &HookResult, name: &str) -> PathBuf {
     );
     assert!(path.is_dir());
     assert_eq!(
-        env.git(&path, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        env.git(&path, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .trim(),
         format!("shoal/{name}")
     );
     assert!(
@@ -192,7 +210,9 @@ fn has_project_state(env: &Env) -> bool {
     let Ok(entries) = fs::read_dir(env.home().join("projects")) else {
         return false;
     };
-    entries.flatten().any(|e| e.path().join("state.json").exists())
+    entries
+        .flatten()
+        .any(|e| e.path().join("state.json").exists())
 }
 
 fn plain_dir(env: &Env, name: &str) -> PathBuf {
@@ -202,10 +222,17 @@ fn plain_dir(env: &Env, name: &str) -> PathBuf {
 }
 
 fn source_branches(env: &Env) -> Vec<String> {
-    env.git(&env.repo(), &["for-each-ref", "--format=%(refname:short)", "refs/heads/shoal/"])
-        .lines()
-        .map(str::to_string)
-        .collect()
+    env.git(
+        &env.repo(),
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads/shoal/",
+        ],
+    )
+    .lines()
+    .map(str::to_string)
+    .collect()
 }
 
 fn set_last_active(env: &Env, session: &str, value: u64) {
@@ -280,12 +307,29 @@ fn create_auto_inits_from_shoal_toml_and_keeps_stdout_clean() {
             ),
         );
         assert!(!has_project_state(&env));
-        let r = hook(&env, "worktree-create", &create_input("first", &env.repo()), &env.repo(), None);
+        let r = hook(
+            &env,
+            "worktree-create",
+            &create_input("first", &env.repo()),
+            &env.repo(),
+            None,
+        );
         let path = expect_created(&env, &r, "first");
-        assert!(!r.stdout.contains("NOISE"), "[{backend}] setup stdout leaked: {:?}", r.stdout);
-        assert!(r.stderr.contains("SETUP-STDOUT-NOISE"), "[{backend}] setup output should go to stderr");
+        assert!(
+            !r.stdout.contains("NOISE"),
+            "[{backend}] setup stdout leaked: {:?}",
+            r.stdout
+        );
+        assert!(
+            r.stderr.contains("SETUP-STDOUT-NOISE"),
+            "[{backend}] setup output should go to stderr"
+        );
         assert_eq!(read(path.join("deps/installed.txt")), "lib 1.0\n");
-        assert_eq!(read(path.join(".env")), "SECRET=1\n", "[{backend}] copy entry missing");
+        assert_eq!(
+            read(path.join(".env")),
+            "SECRET=1\n",
+            "[{backend}] copy entry missing"
+        );
         let state = env.state();
         assert_eq!(state["backend"], backend);
         assert_eq!(state["port_base"], env.port_base);
@@ -344,8 +388,10 @@ fn create_sanitises_names() {
     assert!(!env.root.path().join("pwned").exists());
 }
 
+// Fixed bug: (medium) sanitize_name keeps "..", "..." and a ".lock" suffix, so the
+// branch shoal/<name> is not a valid git ref and the hook fails.
 /// Names that pass shoal's own validation but make an invalid git branch.
-/// BUG: sanitize_name keeps "..", and names ending in ".lock", so the branch
+/// sanitize_name keeps "..", and names ending in ".lock", so the branch
 /// shoal/<name> is not a valid ref and `git switch -C` fails: the hook exits 1
 /// and `claude --worktree a..b` / `--worktree release.lock` cannot start.
 #[test]
@@ -355,13 +401,23 @@ fn create_sanitises_names_git_rejects_as_branches() {
     let repo = env.repo();
     let mut failures = Vec::new();
     for raw in ["a..b", "release.lock", "v1...v2"] {
-        let r = hook(&env, "worktree-create", &json!({"name": raw, "cwd": repo}), &repo, None);
+        let r = hook(
+            &env,
+            "worktree-create",
+            &json!({"name": raw, "cwd": repo}),
+            &repo,
+            None,
+        );
         if r.code != 0 {
             failures.push(format!("{raw:?}: exit {} {}", r.code, r.stderr.trim()));
             continue;
         }
         let path = PathBuf::from(r.last_line());
-        assert!(path.is_dir(), "{raw:?}: printed path {} does not exist", path.display());
+        assert!(
+            path.is_dir(),
+            "{raw:?}: printed path {} does not exist",
+            path.display()
+        );
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let branch = env.git(&path, &["rev-parse", "--abbrev-ref", "HEAD"]);
         assert_eq!(branch.trim(), format!("shoal/{name}"));
@@ -374,7 +430,10 @@ fn create_sanitises_names_git_rejects_as_branches() {
             "half-made session directory left behind: {name}"
         );
     }
-    assert!(failures.is_empty(), "names that should have been sanitised: {failures:#?}");
+    assert!(
+        failures.is_empty(),
+        "names that should have been sanitised: {failures:#?}"
+    );
 }
 
 /// Repeated names are numbered; a name that is itself numbered gets another
@@ -385,16 +444,36 @@ fn create_numbers_name_collisions() {
     env.init("clone");
     let repo = env.repo();
     let input = |n: &str| json!({"name": n, "cwd": repo});
-    expect_created(&env, &hook(&env, "worktree-create", &input("dup"), &repo, None), "dup");
-    expect_created(&env, &hook(&env, "worktree-create", &input("dup"), &repo, None), "dup-2");
-    expect_created(&env, &hook(&env, "worktree-create", &input("dup"), &repo, None), "dup-3");
-    expect_created(&env, &hook(&env, "worktree-create", &input("dup-2"), &repo, None), "dup-2-2");
+    expect_created(
+        &env,
+        &hook(&env, "worktree-create", &input("dup"), &repo, None),
+        "dup",
+    );
+    expect_created(
+        &env,
+        &hook(&env, "worktree-create", &input("dup"), &repo, None),
+        "dup-2",
+    );
+    expect_created(
+        &env,
+        &hook(&env, "worktree-create", &input("dup"), &repo, None),
+        "dup-3",
+    );
+    expect_created(
+        &env,
+        &hook(&env, "worktree-create", &input("dup-2"), &repo, None),
+        "dup-2-2",
+    );
 
     // A leftover directory (not in state) with someone's file in it.
     let leftover = sessions_dir(&env).join("left");
     fs::create_dir_all(&leftover).unwrap();
     fs::write(leftover.join("keep.txt"), "precious\n").unwrap();
-    expect_created(&env, &hook(&env, "worktree-create", &input("left"), &repo, None), "left-2");
+    expect_created(
+        &env,
+        &hook(&env, "worktree-create", &input("left"), &repo, None),
+        "left-2",
+    );
     assert_eq!(read(leftover.join("keep.txt")), "precious\n");
     assert!(env.state()["sessions"]["left"].is_null());
 
@@ -402,7 +481,11 @@ fn create_numbers_name_collisions() {
     let dup = session_path(&env, "dup");
     let r = hook(&env, "worktree-remove", &remove_input(&dup), &repo, None);
     assert_eq!(r.code, 0, "{}", r.stderr);
-    expect_created(&env, &hook(&env, "worktree-create", &input("dup"), &repo, None), "dup");
+    expect_created(
+        &env,
+        &hook(&env, "worktree-create", &input("dup"), &repo, None),
+        "dup",
+    );
 }
 
 /// Where the hook looks for the repository: the input's cwd, then
@@ -416,30 +499,63 @@ fn create_finds_the_repository_from_cwd_or_project_dir() {
     let outside = plain_dir(&env, "elsewhere");
 
     // Only CLAUDE_PROJECT_DIR (no cwd in the input, process elsewhere).
-    let r = hook(&env, "worktree-create", &json!({"name": "pd-only"}), &outside, Some(&repo));
+    let r = hook(
+        &env,
+        "worktree-create",
+        &json!({"name": "pd-only"}),
+        &outside,
+        Some(&repo),
+    );
     expect_created(&env, &r, "pd-only");
 
     // Only cwd, a subdirectory of the repository.
-    let r = hook(&env, "worktree-create", &json!({"name": "cwd-sub", "cwd": repo.join("src")}), &outside, None);
+    let r = hook(
+        &env,
+        "worktree-create",
+        &json!({"name": "cwd-sub", "cwd": repo.join("src")}),
+        &outside,
+        None,
+    );
     expect_created(&env, &r, "cwd-sub");
 
     // CLAUDE_PROJECT_DIR points nowhere: fall back to cwd.
     let gone = env.root.path().join("does-not-exist");
-    let r = hook(&env, "worktree-create", &json!({"name": "pd-missing", "cwd": repo}), &outside, Some(&gone));
+    let r = hook(
+        &env,
+        "worktree-create",
+        &json!({"name": "pd-missing", "cwd": repo}),
+        &outside,
+        Some(&gone),
+    );
     expect_created(&env, &r, "pd-missing");
 
     // cwd is not a repository but CLAUDE_PROJECT_DIR is.
-    let r = hook(&env, "worktree-create", &json!({"name": "pd-wins", "cwd": outside}), &outside, Some(&repo));
+    let r = hook(
+        &env,
+        "worktree-create",
+        &json!({"name": "pd-wins", "cwd": outside}),
+        &outside,
+        Some(&repo),
+    );
     expect_created(&env, &r, "pd-wins");
 
     // Nothing but the process's own directory.
-    let r = hook(&env, "worktree-create", &json!({"name": "proc-cwd"}), &repo, None);
+    let r = hook(
+        &env,
+        "worktree-create",
+        &json!({"name": "proc-cwd"}),
+        &repo,
+        None,
+    );
     expect_created(&env, &r, "proc-cwd");
 
     // All of them in the one project (project_dir() asserts exactly one).
     assert_eq!(env.state()["sessions"].as_object().unwrap().len(), 5);
     for s in env.state()["sessions"].as_object().unwrap().values() {
-        assert!(s["parent"].is_null(), "template sessions have no parent: {s}");
+        assert!(
+            s["parent"].is_null(),
+            "template sessions have no parent: {s}"
+        );
     }
 }
 
@@ -469,12 +585,28 @@ fn create_inside_a_session_forks_it_with_uncommitted_and_ignored_files() {
             Some(&env.repo()),
         );
         let child = expect_created(&env, &r, "child");
-        assert_eq!(env.state()["sessions"]["child"]["parent"], "parent", "[{backend}]");
+        assert_eq!(
+            env.state()["sessions"]["child"]["parent"],
+            "parent",
+            "[{backend}]"
+        );
         assert_eq!(read(child.join("committed.txt")), "c\n", "[{backend}]");
-        assert_eq!(read(child.join("src/app.txt")), "edited by parent\n", "[{backend}]");
+        assert_eq!(
+            read(child.join("src/app.txt")),
+            "edited by parent\n",
+            "[{backend}]"
+        );
         assert_eq!(read(child.join("untracked.txt")), "u\n", "[{backend}]");
-        assert_eq!(read(child.join("deps/extra.txt")), "ignored\n", "[{backend}]");
-        assert_eq!(read(child.join("deps/installed.txt")), "lib 1.0\n", "[{backend}]");
+        assert_eq!(
+            read(child.join("deps/extra.txt")),
+            "ignored\n",
+            "[{backend}]"
+        );
+        assert_eq!(
+            read(child.join("deps/installed.txt")),
+            "lib 1.0\n",
+            "[{backend}]"
+        );
         assert_eq!(read(child.join(".env")), "SECRET=parent\n", "[{backend}]");
         assert_eq!(
             env.git(&child, &["rev-parse", "HEAD~0"]),
@@ -482,7 +614,8 @@ fn create_inside_a_session_forks_it_with_uncommitted_and_ignored_files() {
             "[{backend}] child starts at the parent's HEAD"
         );
         assert_eq!(
-            env.git(&parent, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+            env.git(&parent, &["rev-parse", "--abbrev-ref", "HEAD"])
+                .trim(),
             "shoal/parent",
             "[{backend}] parent's branch must not change"
         );
@@ -490,14 +623,28 @@ fn create_inside_a_session_forks_it_with_uncommitted_and_ignored_files() {
         // Isolation both ways.
         fs::write(child.join("src/app.txt"), "edited by child\n").unwrap();
         fs::write(parent.join("only-parent.txt"), "p\n").unwrap();
-        assert_eq!(read(parent.join("src/app.txt")), "edited by parent\n", "[{backend}]");
+        assert_eq!(
+            read(parent.join("src/app.txt")),
+            "edited by parent\n",
+            "[{backend}]"
+        );
         assert!(!child.join("only-parent.txt").exists(), "[{backend}]");
 
         // A fork of the fork (grandchild) works too.
-        let r = hook(&env, "worktree-create", &create_input("grandchild", &child), &child, None);
+        let r = hook(
+            &env,
+            "worktree-create",
+            &create_input("grandchild", &child),
+            &child,
+            None,
+        );
         let grand = expect_created(&env, &r, "grandchild");
         assert_eq!(env.state()["sessions"]["grandchild"]["parent"], "child");
-        assert_eq!(read(grand.join("src/app.txt")), "edited by child\n", "[{backend}]");
+        assert_eq!(
+            read(grand.join("src/app.txt")),
+            "edited by child\n",
+            "[{backend}]"
+        );
     }
 }
 
@@ -510,38 +657,81 @@ fn create_refreshes_the_template_when_the_branch_moved() {
         let env = Env::new(5216 + i as u16 * 2);
         write_config(
             &env,
-            &config_for(&env, backend, "echo REFRESH-NOISE; mkdir -p deps && cat deps.lock > deps/installed.txt"),
+            &config_for(
+                &env,
+                backend,
+                "echo REFRESH-NOISE; mkdir -p deps && cat deps.lock > deps/installed.txt",
+            ),
         );
         let repo = env.repo();
-        let r = hook(&env, "worktree-create", &create_input("one", &repo), &repo, None);
+        let r = hook(
+            &env,
+            "worktree-create",
+            &create_input("one", &repo),
+            &repo,
+            None,
+        );
         expect_created(&env, &r, "one");
 
         // Unchanged branch: no new generation.
-        let r = hook(&env, "worktree-create", &create_input("two", &repo), &repo, None);
+        let r = hook(
+            &env,
+            "worktree-create",
+            &create_input("two", &repo),
+            &repo,
+            None,
+        );
         expect_created(&env, &r, "two");
-        assert_eq!(env.state()["generations"].as_array().unwrap().len(), 1, "[{backend}]");
+        assert_eq!(
+            env.state()["generations"].as_array().unwrap().len(),
+            1,
+            "[{backend}]"
+        );
 
         fs::write(repo.join("src/app.txt"), "new upstream\n").unwrap();
         fs::write(repo.join("deps.lock"), "lib 2.0\n").unwrap();
         env.git(&repo, &["commit", "-q", "-am", "upstream moved"]);
         let head = env.git(&repo, &["rev-parse", "HEAD"]);
-        let r = hook(&env, "worktree-create", &create_input("three", &repo), &repo, None);
+        let r = hook(
+            &env,
+            "worktree-create",
+            &create_input("three", &repo),
+            &repo,
+            None,
+        );
         let three = expect_created(&env, &r, "three");
         assert!(!r.stdout.contains("NOISE"), "[{backend}] {:?}", r.stdout);
         assert_eq!(env.git(&three, &["rev-parse", "HEAD"]), head, "[{backend}]");
         assert_eq!(read(three.join("src/app.txt")), "new upstream\n");
-        assert_eq!(read(three.join("deps/installed.txt")), "lib 2.0\n", "[{backend}] setup re-ran");
+        assert_eq!(
+            read(three.join("deps/installed.txt")),
+            "lib 2.0\n",
+            "[{backend}] setup re-ran"
+        );
         assert_eq!(env.state()["generations"].as_array().unwrap().len(), 2);
         // Existing sessions are untouched.
-        assert_eq!(read(session_path(&env, "one").join("src/app.txt")), "line one\nline two\nline three\n");
+        assert_eq!(
+            read(session_path(&env, "one").join("src/app.txt")),
+            "line one\nline two\nline three\n"
+        );
 
         // History rewritten in the source (amend): next session follows it.
         fs::write(repo.join("src/app.txt"), "amended\n").unwrap();
         env.git(&repo, &["commit", "-q", "-a", "--amend", "-m", "amended"]);
         let amended = env.git(&repo, &["rev-parse", "HEAD"]);
-        let r = hook(&env, "worktree-create", &create_input("four", &repo), &repo, None);
+        let r = hook(
+            &env,
+            "worktree-create",
+            &create_input("four", &repo),
+            &repo,
+            None,
+        );
         let four = expect_created(&env, &r, "four");
-        assert_eq!(env.git(&four, &["rev-parse", "HEAD"]), amended, "[{backend}]");
+        assert_eq!(
+            env.git(&four, &["rev-parse", "HEAD"]),
+            amended,
+            "[{backend}]"
+        );
         assert_eq!(read(four.join("src/app.txt")), "amended\n");
         assert_eq!(env.state()["generations"].as_array().unwrap().len(), 3);
     }
@@ -553,17 +743,37 @@ fn create_refreshes_the_template_when_the_branch_moved() {
 fn create_fails_loudly_outside_a_usable_repository() {
     let env = Env::new(5220);
     let plain = plain_dir(&env, "plain");
-    let r = hook(&env, "worktree-create", &create_input("x", &plain), &plain, None);
+    let r = hook(
+        &env,
+        "worktree-create",
+        &create_input("x", &plain),
+        &plain,
+        None,
+    );
     assert_eq!(r.code, 1, "stdout {:?} stderr {:?}", r.stdout, r.stderr);
-    assert!(r.stdout.trim().is_empty(), "no path may be printed: {:?}", r.stdout);
+    assert!(
+        r.stdout.trim().is_empty(),
+        "no path may be printed: {:?}",
+        r.stdout
+    );
     assert!(r.stderr.contains("worktree-create"), "{}", r.stderr);
-    assert!(r.stderr.contains("git"), "reason should mention git: {}", r.stderr);
+    assert!(
+        r.stderr.contains("git"),
+        "reason should mention git: {}",
+        r.stderr
+    );
     assert!(!has_project_state(&env));
 
     // A repository with no commits.
     let empty = plain_dir(&env, "empty");
     env.git(&empty, &["init", "-q", "-b", "main"]);
-    let r = hook(&env, "worktree-create", &create_input("x", &empty), &empty, None);
+    let r = hook(
+        &env,
+        "worktree-create",
+        &create_input("x", &empty),
+        &empty,
+        None,
+    );
     assert_eq!(r.code, 1, "{}", r.stderr);
     assert!(r.stdout.trim().is_empty());
     assert!(!r.stderr.trim().is_empty());
@@ -572,7 +782,13 @@ fn create_fails_loudly_outside_a_usable_repository() {
     // Detached HEAD in the source repository.
     let repo = env.repo();
     env.git(&repo, &["checkout", "-q", "--detach"]);
-    let r = hook(&env, "worktree-create", &create_input("x", &repo), &repo, None);
+    let r = hook(
+        &env,
+        "worktree-create",
+        &create_input("x", &repo),
+        &repo,
+        None,
+    );
     assert_eq!(r.code, 1, "{}", r.stderr);
     assert!(r.stdout.trim().is_empty());
     assert!(r.stderr.contains("detached"), "{}", r.stderr);
@@ -580,7 +796,13 @@ fn create_fails_loudly_outside_a_usable_repository() {
 
     // The cwd does not exist at all.
     let gone = env.root.path().join("gone");
-    let r = hook(&env, "worktree-create", &create_input("x", &gone), &plain, None);
+    let r = hook(
+        &env,
+        "worktree-create",
+        &create_input("x", &gone),
+        &plain,
+        None,
+    );
     assert_eq!(r.code, 1, "{}", r.stderr);
     assert!(r.stdout.trim().is_empty());
 }
@@ -592,7 +814,12 @@ fn create_handles_bad_and_empty_stdin() {
     let env = Env::new(5222);
     env.init("clone");
     let repo = env.repo();
-    for bad in [&b"{not json"[..], b"{\"name\": \"x\"", b"\xff\xfe\x00garbage", b"nul\x00l"] {
+    for bad in [
+        &b"{not json"[..],
+        b"{\"name\": \"x\"",
+        b"\xff\xfe\x00garbage",
+        b"nul\x00l",
+    ] {
         let (r, _) = run_hook_raw(&env, "worktree-create", bad, &repo, None, &[]);
         assert_eq!(r.code, 1, "input {bad:?}: {}", r.stderr);
         assert!(r.stdout.is_empty(), "input {bad:?} printed {:?}", r.stdout);
@@ -602,7 +829,7 @@ fn create_handles_bad_and_empty_stdin() {
 
     // More than the 4 MiB input limit: must fail, not hang, not half-create.
     let mut big = br#"{"name": "big", "pad": ""#.to_vec();
-    big.extend(std::iter::repeat(b'x').take(5 * 1024 * 1024));
+    big.extend(std::iter::repeat_n(b'x', 5 * 1024 * 1024));
     big.extend(br#""}"#);
     let (r, took) = run_hook_raw(&env, "worktree-create", &big, &repo, None, &[]);
     assert_eq!(r.code, 1, "{}", r.stderr);
@@ -614,13 +841,17 @@ fn create_handles_bad_and_empty_stdin() {
     expect_created(&env, &r, "worktree");
     let (r, _) = run_hook_raw(&env, "worktree-create", b"  \n\t ", &repo, None, &[]);
     expect_created(&env, &r, "worktree-2");
-    for (raw, expected) in [(&b"[]"[..], "worktree-3"), (b"null", "worktree-4"), (b"\"str\"", "worktree-5")] {
+    for (raw, expected) in [
+        (&b"[]"[..], "worktree-3"),
+        (b"null", "worktree-4"),
+        (b"\"str\"", "worktree-5"),
+    ] {
         let (r, _) = run_hook_raw(&env, "worktree-create", raw, &repo, None, &[]);
         expect_created(&env, &r, expected);
     }
     // A large but legal input works.
     let mut ok = br#"{"name": "padded", "pad": ""#.to_vec();
-    ok.extend(std::iter::repeat(b'y').take(1024 * 1024));
+    ok.extend(std::iter::repeat_n(b'y', 1024 * 1024));
     ok.extend(br#""}"#);
     let (r, _) = run_hook_raw(&env, "worktree-create", &ok, &repo, None, &[]);
     expect_created(&env, &r, "padded");
@@ -633,27 +864,74 @@ fn create_handles_bad_and_empty_stdin() {
 fn create_reports_setup_and_config_failures() {
     let env = Env::new(5224);
     let repo = env.repo();
-    write_config(&env, &config_for(&env, "clone", "echo partial > half.txt; echo SETUP-FAILED-OUT; exit 7"));
-    let r = hook(&env, "worktree-create", &create_input("x", &repo), &repo, None);
+    write_config(
+        &env,
+        &config_for(
+            &env,
+            "clone",
+            "echo partial > half.txt; echo SETUP-FAILED-OUT; exit 7",
+        ),
+    );
+    let r = hook(
+        &env,
+        "worktree-create",
+        &create_input("x", &repo),
+        &repo,
+        None,
+    );
     assert_eq!(r.code, 1, "{}", r.stderr);
-    assert!(r.stdout.is_empty(), "stdout must stay empty on failure: {:?}", r.stdout);
+    assert!(
+        r.stdout.is_empty(),
+        "stdout must stay empty on failure: {:?}",
+        r.stdout
+    );
     assert!(r.stderr.contains("setup"), "{}", r.stderr);
     assert!(!has_project_state(&env));
     let leftover: Vec<PathBuf> = fs::read_dir(env.home().join("projects"))
-        .map(|d| d.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect())
+        .map(|d| {
+            d.flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect()
+        })
         .unwrap_or_default();
-    assert!(leftover.is_empty(), "half-built project left behind: {leftover:?}");
-    assert!(!repo.join("half.txt").exists(), "setup must run in the template, not the source");
+    assert!(
+        leftover.is_empty(),
+        "half-built project left behind: {leftover:?}"
+    );
+    assert!(
+        !repo.join("half.txt").exists(),
+        "setup must run in the template, not the source"
+    );
 
-    write_config(&env, &config_for(&env, "clone", "mkdir -p deps && cat deps.lock > deps/installed.txt"));
-    let r = hook(&env, "worktree-create", &create_input("x", &repo), &repo, None);
+    write_config(
+        &env,
+        &config_for(
+            &env,
+            "clone",
+            "mkdir -p deps && cat deps.lock > deps/installed.txt",
+        ),
+    );
+    let r = hook(
+        &env,
+        "worktree-create",
+        &create_input("x", &repo),
+        &repo,
+        None,
+    );
     let x = expect_created(&env, &r, "x");
     assert!(x.join("deps/installed.txt").exists());
 
     // An invalid shoal.toml in a second repository.
     let env2 = Env::new(5226);
     write_config(&env2, "bogus_key = 1\n");
-    let r = hook(&env2, "worktree-create", &create_input("y", &env2.repo()), &env2.repo(), None);
+    let r = hook(
+        &env2,
+        "worktree-create",
+        &create_input("y", &env2.repo()),
+        &env2.repo(),
+        None,
+    );
     assert_eq!(r.code, 1, "{}", r.stderr);
     assert!(r.stdout.is_empty());
     assert!(r.stderr.contains("shoal.toml"), "{}", r.stderr);
@@ -666,11 +944,28 @@ fn create_reports_setup_and_config_failures() {
 fn create_concurrently_on_first_use() {
     for (i, backend) in backends().into_iter().enumerate() {
         let env = Env::new(5228 + i as u16 * 2);
-        write_config(&env, &config_for(&env, backend, "sleep 0.5; mkdir -p deps && cat deps.lock > deps/installed.txt"));
+        write_config(
+            &env,
+            &config_for(
+                &env,
+                backend,
+                "sleep 0.5; mkdir -p deps && cat deps.lock > deps/installed.txt",
+            ),
+        );
         let repo = env.repo();
         let results: Vec<HookResult> = std::thread::scope(|s| {
             let handles: Vec<_> = (0..4)
-                .map(|_| s.spawn(|| hook(&env, "worktree-create", &create_input("par", &repo), &repo, None)))
+                .map(|_| {
+                    s.spawn(|| {
+                        hook(
+                            &env,
+                            "worktree-create",
+                            &create_input("par", &repo),
+                            &repo,
+                            None,
+                        )
+                    })
+                })
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
@@ -679,14 +974,30 @@ fn create_concurrently_on_first_use() {
             assert_eq!(r.code, 0, "[{backend}] {}", r.stderr);
             assert_eq!(r.stdout.lines().count(), 1, "[{backend}] {:?}", r.stdout);
             let p = PathBuf::from(r.last_line());
-            assert!(p.join("deps/installed.txt").exists(), "[{backend}] {}", p.display());
+            assert!(
+                p.join("deps/installed.txt").exists(),
+                "[{backend}] {}",
+                p.display()
+            );
             paths.insert(p);
         }
         assert_eq!(paths.len(), 4, "[{backend}] distinct paths");
-        let names: BTreeSet<String> = env.state()["sessions"].as_object().unwrap().keys().cloned().collect();
-        let expected: BTreeSet<String> = ["par", "par-2", "par-3", "par-4"].iter().map(|s| s.to_string()).collect();
+        let names: BTreeSet<String> = env.state()["sessions"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        let expected: BTreeSet<String> = ["par", "par-2", "par-3", "par-4"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         assert_eq!(names, expected, "[{backend}]");
-        assert_eq!(env.state()["generations"].as_array().unwrap().len(), 1, "[{backend}]");
+        assert_eq!(
+            env.state()["generations"].as_array().unwrap().len(),
+            1,
+            "[{backend}]"
+        );
     }
 }
 
@@ -699,11 +1010,21 @@ fn create_with_corrupt_state_fails_without_reinitialising() {
     let s = fork(&env, "s");
     let state_path = env.project_dir().join("state.json");
     fs::write(&state_path, "{{{ garbage").unwrap();
-    let r = hook(&env, "worktree-create", &create_input("x", &env.repo()), &env.repo(), None);
+    let r = hook(
+        &env,
+        "worktree-create",
+        &create_input("x", &env.repo()),
+        &env.repo(),
+        None,
+    );
     assert_eq!(r.code, 1, "{}", r.stderr);
     assert!(r.stdout.is_empty());
     assert!(r.stderr.contains("state"), "{}", r.stderr);
-    assert_eq!(read(&state_path), "{{{ garbage", "state must not be overwritten");
+    assert_eq!(
+        read(&state_path),
+        "{{{ garbage",
+        "state must not be overwritten"
+    );
     assert!(s.join("src/app.txt").exists());
 }
 
@@ -721,34 +1042,69 @@ fn remove_saves_uncommitted_work_then_deletes() {
         env.init(backend);
         let repo = env.repo();
         let main_before = env.git(&repo, &["rev-parse", "main"]);
-        let r = hook(&env, "worktree-create", &create_input("work", &repo), &repo, None);
+        let r = hook(
+            &env,
+            "worktree-create",
+            &create_input("work", &repo),
+            &repo,
+            None,
+        );
         let path = expect_created(&env, &r, "work");
         fs::write(path.join("src/app.txt"), "changed in session\n").unwrap();
         fs::write(path.join("new.txt"), "brand new\n").unwrap();
         fs::remove_file(path.join("README.md")).unwrap();
-        env.api("checkpoint", json!({"session": "work", "label": "mine"})).unwrap();
+        env.api("checkpoint", json!({"session": "work", "label": "mine"}))
+            .unwrap();
 
         let r = hook(&env, "worktree-remove", &remove_input(&path), &repo, None);
         assert_eq!(r.code, 0, "[{backend}] {}", r.stderr);
         assert!(r.stdout.trim().is_empty(), "[{backend}] {:?}", r.stdout);
-        assert!(!path.exists(), "[{backend}] session directory should be gone");
+        assert!(
+            !path.exists(),
+            "[{backend}] session directory should be gone"
+        );
         assert!(env.state()["sessions"]["work"].is_null());
-        assert!(checkpoints(&env, "work").is_empty(), "[{backend}] checkpoints dropped from state");
+        assert!(
+            checkpoints(&env, "work").is_empty(),
+            "[{backend}] checkpoints dropped from state"
+        );
         assert!(!env.project_dir().join("checkpoints/work").exists());
 
-        assert_eq!(source_branches(&env), vec!["shoal/work".to_string()], "[{backend}]");
-        assert_eq!(env.git(&repo, &["show", "shoal/work:src/app.txt"]), "changed in session\n");
-        assert_eq!(env.git(&repo, &["show", "shoal/work:new.txt"]), "brand new\n");
+        assert_eq!(
+            source_branches(&env),
+            vec!["shoal/work".to_string()],
+            "[{backend}]"
+        );
+        assert_eq!(
+            env.git(&repo, &["show", "shoal/work:src/app.txt"]),
+            "changed in session\n"
+        );
+        assert_eq!(
+            env.git(&repo, &["show", "shoal/work:new.txt"]),
+            "brand new\n"
+        );
         let tree = env.git(&repo, &["ls-tree", "--name-only", "shoal/work"]);
-        assert!(!tree.lines().any(|l| l == "README.md"), "[{backend}] deletion saved too");
-        assert!(env.git(&repo, &["log", "-1", "--format=%s", "shoal/work"]).contains("WIP"));
+        assert!(
+            !tree.lines().any(|l| l == "README.md"),
+            "[{backend}] deletion saved too"
+        );
+        assert!(env
+            .git(&repo, &["log", "-1", "--format=%s", "shoal/work"])
+            .contains("WIP"));
         assert_eq!(env.git(&repo, &["rev-parse", "shoal/work~1"]), main_before);
 
         // The user's checkout did not move or change.
         assert_eq!(env.git(&repo, &["rev-parse", "main"]), main_before);
-        assert_eq!(env.git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(), "main");
+        assert_eq!(
+            env.git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"])
+                .trim(),
+            "main"
+        );
         assert!(env.git(&repo, &["status", "--porcelain"]).trim().is_empty());
-        assert_eq!(read(repo.join("src/app.txt")), "line one\nline two\nline three\n");
+        assert_eq!(
+            read(repo.join("src/app.txt")),
+            "line one\nline two\nline three\n"
+        );
     }
 }
 
@@ -758,7 +1114,17 @@ fn remove_imports_committed_work_without_wip() {
     let env = Env::new(5238);
     env.init("clone");
     let repo = env.repo();
-    let path = expect_created(&env, &hook(&env, "worktree-create", &create_input("c", &repo), &repo, None), "c");
+    let path = expect_created(
+        &env,
+        &hook(
+            &env,
+            "worktree-create",
+            &create_input("c", &repo),
+            &repo,
+            None,
+        ),
+        "c",
+    );
     fs::write(path.join("feature.txt"), "f\n").unwrap();
     env.git(&path, &["add", "feature.txt"]);
     env.git(&path, &["commit", "-q", "-m", "a feature"]);
@@ -767,7 +1133,11 @@ fn remove_imports_committed_work_without_wip() {
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert!(!path.exists());
     assert_eq!(env.git(&repo, &["rev-parse", "shoal/c"]), head);
-    assert_eq!(env.git(&repo, &["log", "-1", "--format=%s", "shoal/c"]).trim(), "a feature");
+    assert_eq!(
+        env.git(&repo, &["log", "-1", "--format=%s", "shoal/c"])
+            .trim(),
+        "a feature"
+    );
 }
 
 /// A clean session with no commits is removed without creating a branch.
@@ -777,13 +1147,27 @@ fn remove_clean_session_creates_no_branch() {
         let env = Env::new(5240 + i as u16 * 2);
         env.init(backend);
         let repo = env.repo();
-        let path = expect_created(&env, &hook(&env, "worktree-create", &create_input("clean", &repo), &repo, None), "clean");
+        let path = expect_created(
+            &env,
+            &hook(
+                &env,
+                "worktree-create",
+                &create_input("clean", &repo),
+                &repo,
+                None,
+            ),
+            "clean",
+        );
         // Ignored files only: not work that a branch could carry.
         fs::write(path.join("deps/cache.bin"), "cache\n").unwrap();
         let r = hook(&env, "worktree-remove", &remove_input(&path), &repo, None);
         assert_eq!(r.code, 0, "[{backend}] {}", r.stderr);
         assert!(!path.exists(), "[{backend}]");
-        assert!(source_branches(&env).is_empty(), "[{backend}] {:?}", source_branches(&env));
+        assert!(
+            source_branches(&env).is_empty(),
+            "[{backend}] {:?}",
+            source_branches(&env)
+        );
         assert!(env.state()["sessions"].as_object().unwrap().is_empty());
     }
 }
@@ -797,7 +1181,17 @@ fn remove_refuses_paths_that_are_not_sessions() {
     let env = Env::new(5244);
     env.init("clone");
     let repo = env.repo();
-    let real = expect_created(&env, &hook(&env, "worktree-create", &create_input("real", &repo), &repo, None), "real");
+    let real = expect_created(
+        &env,
+        &hook(
+            &env,
+            "worktree-create",
+            &create_input("real", &repo),
+            &repo,
+            None,
+        ),
+        "real",
+    );
 
     let outside = plain_dir(&env, "precious");
     fs::write(outside.join("keep.txt"), "do not delete\n").unwrap();
@@ -822,9 +1216,19 @@ fn remove_refuses_paths_that_are_not_sessions() {
     ];
     for path in &candidates {
         let r = hook(&env, "worktree-remove", &remove_input(path), &repo, None);
-        assert_eq!(r.code, 1, "{} should be refused; stderr {}", path.display(), r.stderr);
+        assert_eq!(
+            r.code,
+            1,
+            "{} should be refused; stderr {}",
+            path.display(),
+            r.stderr
+        );
         assert!(!r.stderr.trim().is_empty());
-        assert!(path.symlink_metadata().is_ok(), "{} was deleted", path.display());
+        assert!(
+            path.symlink_metadata().is_ok(),
+            "{} was deleted",
+            path.display()
+        );
     }
     assert_eq!(read(outside.join("keep.txt")), "do not delete\n");
     assert_eq!(read(ghost.join("keep.txt")), "ghost data\n");
@@ -842,17 +1246,43 @@ fn remove_refuses_a_path_inside_a_session() {
         let env = Env::new(5246 + i as u16 * 2);
         env.init(backend);
         let repo = env.repo();
-        let path = expect_created(&env, &hook(&env, "worktree-create", &create_input("s", &repo), &repo, None), "s");
+        let path = expect_created(
+            &env,
+            &hook(
+                &env,
+                "worktree-create",
+                &create_input("s", &repo),
+                &repo,
+                None,
+            ),
+            "s",
+        );
         fs::write(path.join("src/work.txt"), "work\n").unwrap();
-        for inner in [path.join("src"), path.join(".git"), path.join("src/work.txt")] {
+        for inner in [
+            path.join("src"),
+            path.join(".git"),
+            path.join("src/work.txt"),
+        ] {
             let r = hook(&env, "worktree-remove", &remove_input(&inner), &repo, None);
-            assert_eq!(r.code, 1, "[{backend}] {} should be refused", inner.display());
-            assert!(r.stderr.contains("inside session"), "[{backend}] {}", r.stderr);
+            assert_eq!(
+                r.code,
+                1,
+                "[{backend}] {} should be refused",
+                inner.display()
+            );
+            assert!(
+                r.stderr.contains("inside session"),
+                "[{backend}] {}",
+                r.stderr
+            );
             assert!(inner.exists(), "[{backend}] {} deleted", inner.display());
         }
         assert_eq!(read(path.join("src/work.txt")), "work\n");
         assert!(env.state()["sessions"]["s"].is_object());
-        assert!(source_branches(&env).is_empty(), "[{backend}] nothing saved for a refused removal");
+        assert!(
+            source_branches(&env).is_empty(),
+            "[{backend}] nothing saved for a refused removal"
+        );
     }
 }
 
@@ -863,18 +1293,50 @@ fn remove_tolerates_gone_paths_and_path_spellings() {
     let env = Env::new(5250);
     env.init("clone");
     let repo = env.repo();
-    let r = hook(&env, "worktree-remove", &remove_input(&env.root.path().join("never-existed")), &repo, None);
+    let r = hook(
+        &env,
+        "worktree-remove",
+        &remove_input(&env.root.path().join("never-existed")),
+        &repo,
+        None,
+    );
     assert_eq!(r.code, 0, "{}", r.stderr);
 
-    let a = expect_created(&env, &hook(&env, "worktree-create", &create_input("a", &repo), &repo, None), "a");
+    let a = expect_created(
+        &env,
+        &hook(
+            &env,
+            "worktree-create",
+            &create_input("a", &repo),
+            &repo,
+            None,
+        ),
+        "a",
+    );
     let with_slash = PathBuf::from(format!("{}/", a.display()));
-    let r = hook(&env, "worktree-remove", &remove_input(&with_slash), &repo, None);
+    let r = hook(
+        &env,
+        "worktree-remove",
+        &remove_input(&with_slash),
+        &repo,
+        None,
+    );
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert!(!a.exists());
     let r = hook(&env, "worktree-remove", &remove_input(&a), &repo, None);
     assert_eq!(r.code, 0, "second removal: {}", r.stderr);
 
-    let b = expect_created(&env, &hook(&env, "worktree-create", &create_input("b", &repo), &repo, None), "b");
+    let b = expect_created(
+        &env,
+        &hook(
+            &env,
+            "worktree-create",
+            &create_input("b", &repo),
+            &repo,
+            None,
+        ),
+        "b",
+    );
     let dotted = sessions_dir(&env).join(".").join("b");
     let r = hook(&env, "worktree-remove", &remove_input(&dotted), &repo, None);
     assert_eq!(r.code, 0, "{}", r.stderr);
@@ -890,7 +1352,12 @@ fn remove_requires_a_worktree_path() {
     env.init("clone");
     let repo = env.repo();
     let s = fork(&env, "s");
-    for input in [json!({}), json!({"worktree_path": ""}), json!({"worktree_path": 5}), json!({"worktree_path": null})] {
+    for input in [
+        json!({}),
+        json!({"worktree_path": ""}),
+        json!({"worktree_path": 5}),
+        json!({"worktree_path": null}),
+    ] {
         let r = hook(&env, "worktree-remove", &input, &s, None);
         assert_eq!(r.code, 1, "{input}: {}", r.stderr);
         assert!(r.stderr.contains("worktree_path"), "{input}: {}", r.stderr);
@@ -911,24 +1378,52 @@ fn remove_keeps_the_session_when_saving_fails() {
     let env = Env::new(5254);
     env.init("clone");
     let repo = env.repo();
-    let path = expect_created(&env, &hook(&env, "worktree-create", &create_input("w", &repo), &repo, None), "w");
+    let path = expect_created(
+        &env,
+        &hook(
+            &env,
+            "worktree-create",
+            &create_input("w", &repo),
+            &repo,
+            None,
+        ),
+        "w",
+    );
     fs::write(path.join("src/app.txt"), "unsaved work\n").unwrap();
     let moved = env.root.path().join("repo-moved");
     fs::rename(&repo, &moved).unwrap();
-    let r = hook(&env, "worktree-remove", &remove_input(&path), env.root.path(), None);
+    let r = hook(
+        &env,
+        "worktree-remove",
+        &remove_input(&path),
+        env.root.path(),
+        None,
+    );
     fs::rename(&moved, &repo).unwrap();
-    assert_eq!(r.code, 1, "removal must fail when the work cannot be saved: {}", r.stderr);
-    assert!(path.exists(), "session deleted although its work was not saved");
+    assert_eq!(
+        r.code, 1,
+        "removal must fail when the work cannot be saved: {}",
+        r.stderr
+    );
+    assert!(
+        path.exists(),
+        "session deleted although its work was not saved"
+    );
     assert_eq!(read(path.join("src/app.txt")), "unsaved work\n");
     assert!(env.state()["sessions"]["w"].is_object());
 
     let r = hook(&env, "worktree-remove", &remove_input(&path), &repo, None);
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert!(!path.exists());
-    assert_eq!(env.git(&repo, &["show", "shoal/w:src/app.txt"]), "unsaved work\n");
+    assert_eq!(
+        env.git(&repo, &["show", "shoal/w:src/app.txt"]),
+        "unsaved work\n"
+    );
 }
 
-/// BUG: a second session with a name that was used before (Claude Code reuses
+// Fixed bug: (critical) worktree-remove force-fetches into shoal/<name>, so a reused
+// worktree name overwrites the work saved from the earlier session.
+/// A second session with a name that was used before (Claude Code reuses
 /// worktree names) is saved with a forced fetch to the same branch
 /// shoal/<name>, overwriting the first session's saved work. The first WIP
 /// commit is left on no branch at all (only in the reflog).
@@ -937,17 +1432,52 @@ fn remove_does_not_overwrite_work_saved_by_an_earlier_session_of_the_same_name()
     let env = Env::new(5256);
     env.init("clone");
     let repo = env.repo();
-    let first = expect_created(&env, &hook(&env, "worktree-create", &create_input("fix", &repo), &repo, None), "fix");
+    let first = expect_created(
+        &env,
+        &hook(
+            &env,
+            "worktree-create",
+            &create_input("fix", &repo),
+            &repo,
+            None,
+        ),
+        "fix",
+    );
     fs::write(first.join("first.txt"), "first attempt\n").unwrap();
-    assert_eq!(hook(&env, "worktree-remove", &remove_input(&first), &repo, None).code, 0);
-    let saved_first = env.git(&repo, &["rev-parse", "shoal/fix"]).trim().to_string();
+    assert_eq!(
+        hook(&env, "worktree-remove", &remove_input(&first), &repo, None).code,
+        0
+    );
+    let saved_first = env
+        .git(&repo, &["rev-parse", "shoal/fix"])
+        .trim()
+        .to_string();
 
-    let second = expect_created(&env, &hook(&env, "worktree-create", &create_input("fix", &repo), &repo, None), "fix");
+    let second = expect_created(
+        &env,
+        &hook(
+            &env,
+            "worktree-create",
+            &create_input("fix", &repo),
+            &repo,
+            None,
+        ),
+        "fix",
+    );
     fs::write(second.join("second.txt"), "second attempt\n").unwrap();
     let r = hook(&env, "worktree-remove", &remove_input(&second), &repo, None);
     assert_eq!(r.code, 0, "{}", r.stderr);
 
-    let holders = env.git(&repo, &["for-each-ref", "--contains", &saved_first, "--format=%(refname)", "refs/heads/"]);
+    let holders = env.git(
+        &repo,
+        &[
+            "for-each-ref",
+            "--contains",
+            &saved_first,
+            "--format=%(refname)",
+            "refs/heads/",
+        ],
+    );
     assert!(
         !holders.trim().is_empty(),
         "the first session's saved work ({saved_first}) is on no branch any more; branches: {:?}",
@@ -956,7 +1486,10 @@ fn remove_does_not_overwrite_work_saved_by_an_earlier_session_of_the_same_name()
     // And the second session's work is saved somewhere too.
     let all = source_branches(&env);
     assert!(
-        all.iter().any(|b| env.git(&repo, &["ls-tree", "--name-only", b]).lines().any(|l| l == "second.txt")),
+        all.iter().any(|b| env
+            .git(&repo, &["ls-tree", "--name-only", b])
+            .lines()
+            .any(|l| l == "second.txt")),
         "second session's work not saved: {all:?}"
     );
 }
@@ -980,12 +1513,20 @@ fn stop_checkpoints_only_when_something_changed() {
     let stop = |cwd: &Path, event: &str| {
         let r = hook(&env, "stop", &turn_input(event, cwd), cwd, None);
         assert_eq!(r.code, 0, "{}", r.stderr);
-        assert!(r.stdout.is_empty(), "stop must print nothing: {:?}", r.stdout);
+        assert!(
+            r.stdout.is_empty(),
+            "stop must print nothing: {:?}",
+            r.stdout
+        );
     };
     stop(&s, "Stop");
     assert_eq!(auto_labels(&env, "s"), vec!["turn-1"]);
     stop(&s, "Stop");
-    assert_eq!(auto_labels(&env, "s"), vec!["turn-1"], "no change, no checkpoint");
+    assert_eq!(
+        auto_labels(&env, "s"),
+        vec!["turn-1"],
+        "no change, no checkpoint"
+    );
 
     fs::write(s.join("src/app.txt"), "turn two\n").unwrap();
     stop(&s, "Stop");
@@ -999,17 +1540,22 @@ fn stop_checkpoints_only_when_something_changed() {
 
     fs::write(s.join("src/sub.txt"), "subagent\n").unwrap();
     stop(&s.join("src"), "SubagentStop");
-    assert_eq!(auto_labels(&env, "s"), vec!["turn-1", "turn-2", "turn-3", "turn-4"]);
+    assert_eq!(
+        auto_labels(&env, "s"),
+        vec!["turn-1", "turn-2", "turn-3", "turn-4"]
+    );
     for (_, auto) in checkpoints(&env, "s") {
         assert!(auto);
     }
 
-    env.api("rewind", json!({"session": "s", "label": "turn-2"})).unwrap();
+    env.api("rewind", json!({"session": "s", "label": "turn-2"}))
+        .unwrap();
     assert_eq!(read(s.join("src/app.txt")), "turn two\n");
     assert!(!s.join("src/sub.txt").exists());
 }
 
-/// BUG: the change fingerprint ignores ignored files (it uses `git status`
+// Fixed bug: (medium) the Stop hook's change detection misses edits to ignored files.
+/// The change fingerprint ignores ignored files (it uses `git status`
 /// without --ignored), so a turn that only edits an ignored file (.env,
 /// generated config, a vendored dependency) is never checkpointed even
 /// though checkpoints are documented to include ignored files.
@@ -1022,10 +1568,16 @@ fn stop_checkpoints_a_change_to_an_ignored_file() {
     let env = Env::new(5262);
     env.init("overlay");
     let s = fork(&env, "s");
-    assert_eq!(hook(&env, "stop", &turn_input("Stop", &s), &s, None).code, 0);
+    assert_eq!(
+        hook(&env, "stop", &turn_input("Stop", &s), &s, None).code,
+        0
+    );
     assert_eq!(auto_labels(&env, "s"), vec!["turn-1"]);
     fs::write(s.join(".env"), "SECRET=rotated\n").unwrap();
-    assert_eq!(hook(&env, "stop", &turn_input("Stop", &s), &s, None).code, 0);
+    assert_eq!(
+        hook(&env, "stop", &turn_input("Stop", &s), &s, None).code,
+        0
+    );
     assert_eq!(
         auto_labels(&env, "s"),
         vec!["turn-1", "turn-2"],
@@ -1044,7 +1596,8 @@ fn stop_keeps_the_newest_twenty_and_never_prunes_manual() {
     let env = Env::new(5264);
     env.init("overlay");
     let s = fork(&env, "s");
-    env.api("checkpoint", json!({"session": "s", "label": "before"})).unwrap();
+    env.api("checkpoint", json!({"session": "s", "label": "before"}))
+        .unwrap();
     for i in 1..=23 {
         fs::write(s.join("src/app.txt"), format!("turn {i}\n")).unwrap();
         if i == 10 {
@@ -1065,16 +1618,24 @@ fn stop_keeps_the_newest_twenty_and_never_prunes_manual() {
     assert!(manual.contains(&"before".to_string()));
     let dir = env.project_dir().join("checkpoints/s");
     for i in 1..=3 {
-        assert!(!dir.join(format!("turn-{i}")).exists(), "turn-{i} still on disk");
+        assert!(
+            !dir.join(format!("turn-{i}")).exists(),
+            "turn-{i} still on disk"
+        );
     }
     for label in expected.iter().chain(manual.iter()) {
         assert!(dir.join(label).exists(), "{label} missing on disk");
     }
     // Oldest kept auto checkpoint restores its turn; manual one restores too.
-    env.api("rewind", json!({"session": "s", "label": "turn-4"})).unwrap();
+    env.api("rewind", json!({"session": "s", "label": "turn-4"}))
+        .unwrap();
     assert_eq!(read(s.join("src/app.txt")), "turn 4\n");
-    env.api("rewind", json!({"session": "s", "label": "before"})).unwrap();
-    assert_eq!(read(s.join("src/app.txt")), "line one\nline two\nline three\n");
+    env.api("rewind", json!({"session": "s", "label": "before"}))
+        .unwrap();
+    assert_eq!(
+        read(s.join("src/app.txt")),
+        "line one\nline two\nline three\n"
+    );
 }
 
 /// Simultaneous Stop and SubagentStop hooks after one change make exactly one
@@ -1117,11 +1678,20 @@ fn stop_with_expensive_checkpoints_only_marks_active() {
     assert!(r.stdout.is_empty());
     let marker = fs::read_to_string(env.project_dir().join(".reflink")).unwrap_or_default();
     if marker.trim() == "no" {
-        assert!(checkpoints(&env, "s").is_empty(), "no checkpoints without reflinks");
+        assert!(
+            checkpoints(&env, "s").is_empty(),
+            "no checkpoints without reflinks"
+        );
     } else {
         assert_eq!(auto_labels(&env, "s"), vec!["turn-1"]);
     }
-    assert!(env.state()["sessions"]["s"]["last_active"].as_u64().unwrap() + 60 >= now_secs());
+    assert!(
+        env.state()["sessions"]["s"]["last_active"]
+            .as_u64()
+            .unwrap()
+            + 60
+            >= now_secs()
+    );
 }
 
 /// Outside a session every turn hook is a silent no-op: in an initialised
@@ -1147,22 +1717,38 @@ fn turn_hooks_outside_a_session_are_silent_noops() {
         for event in ["stop", "session-start", "prompt"] {
             let r = hook(e, event, &turn_input("Stop", dir), dir, None);
             assert_eq!(r.code, 0, "{event} in {}: {}", dir.display(), r.stderr);
-            assert!(r.stdout.is_empty(), "{event} in {} printed {:?}", dir.display(), r.stdout);
+            assert!(
+                r.stdout.is_empty(),
+                "{event} in {} printed {:?}",
+                dir.display(),
+                r.stdout
+            );
             // No cwd in the input: CLAUDE_PROJECT_DIR, then the process dir.
             let r = hook(e, event, &json!({}), dir, Some(dir));
             assert_eq!(r.code, 0);
             assert!(r.stdout.is_empty());
         }
     }
-    assert_eq!(read(env.project_dir().join("state.json")), state_before, "state must not change");
-    assert!(!has_project_state(&fresh), "a turn hook must never initialise a project");
+    assert_eq!(
+        read(env.project_dir().join("state.json")),
+        state_before,
+        "state must not change"
+    );
+    assert!(
+        !has_project_state(&fresh),
+        "a turn hook must never initialise a project"
+    );
 }
 
 /// When another process holds the project lock, every turn hook gives up
 /// within ~6 seconds, exits 0 and prints nothing; nothing is checkpointed.
 #[test]
 fn turn_hooks_give_up_when_the_project_is_locked() {
-    let backend = if overlay_available() { "overlay" } else { "clone" };
+    let backend = if overlay_available() {
+        "overlay"
+    } else {
+        "clone"
+    };
     let env = Env::new(5274);
     env.init(backend);
     let s = fork(&env, "s");
@@ -1188,7 +1774,10 @@ fn turn_hooks_give_up_when_the_project_is_locked() {
         for (event, r, took) in results {
             assert_eq!(r.code, 0, "{event}: {}", r.stderr);
             assert!(r.stdout.is_empty(), "{event} printed {:?}", r.stdout);
-            assert!(took < Duration::from_millis(6500), "{event} took {took:?} with the lock held");
+            assert!(
+                took < Duration::from_millis(6500),
+                "{event} took {took:?} with the lock held"
+            );
         }
         assert!(checkpoints(&env, "s").is_empty());
         assert_eq!(env.state()["sessions"]["s"]["last_active"], 0);
@@ -1200,14 +1789,17 @@ fn turn_hooks_give_up_when_the_project_is_locked() {
     if backend == "overlay" {
         assert_eq!(auto_labels(&env, "s"), vec!["turn-1"]);
     }
-    assert!(env.state()["sessions"]["s"]["last_active"].as_u64().unwrap() > 0);
+    assert!(
+        env.state()["sessions"]["s"]["last_active"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
 }
 
 /// Every turn hook exits 0 with a corrupt, empty, wrong-version or missing
-/// state.json, with malformed stdin, and with oversized stdin.
-/// BUG (low) is flagged inside: a corrupt state.json is skipped silently;
-/// rule 5 says turn hooks write diagnostics to stderr, and here the user is
-/// never told that checkpoints have stopped.
+/// state.json, with malformed stdin, and with oversized stdin, and
+/// WorktreeRemove never deletes a session whose state it cannot read.
 #[test]
 fn turn_hooks_exit_zero_on_errors() {
     let env = Env::new(5276);
@@ -1225,7 +1817,6 @@ fn turn_hooks_exit_zero_on_errors() {
         ("wrong-shape", Some("[1, 2, 3]".to_string())),
         ("missing", None),
     ];
-    let mut silent = Vec::new();
     for (what, content) in &corruptions {
         match content {
             Some(c) => fs::write(&state_path, c).unwrap(),
@@ -1236,15 +1827,25 @@ fn turn_hooks_exit_zero_on_errors() {
         for event in ["stop", "session-start", "prompt"] {
             let r = hook(&env, event, &turn_input("Stop", &s), &s, None);
             assert_eq!(r.code, 0, "{event} with {what} state: {}", r.stderr);
-            assert!(r.stdout.is_empty(), "{event} with {what} state printed {:?}", r.stdout);
-            if *what == "garbage" && event == "stop" && r.stderr.trim().is_empty() {
-                silent.push(format!("{event}/{what}"));
-            }
+            assert!(
+                r.stdout.is_empty(),
+                "{event} with {what} state printed {:?}",
+                r.stdout
+            );
         }
         // WorktreeRemove must never delete a session it cannot read state for.
-        let r = hook(&env, "worktree-remove", &remove_input(&s), &env.repo(), None);
+        let r = hook(
+            &env,
+            "worktree-remove",
+            &remove_input(&s),
+            &env.repo(),
+            None,
+        );
         assert_eq!(r.code, 1, "worktree-remove with {what} state: {}", r.stderr);
-        assert!(s.join("src/app.txt").exists(), "session deleted with {what} state");
+        assert!(
+            s.join("src/app.txt").exists(),
+            "session deleted with {what} state"
+        );
     }
     fs::write(&state_path, &good).unwrap();
 
@@ -1253,19 +1854,39 @@ fn turn_hooks_exit_zero_on_errors() {
             let (r, _) = run_hook_raw(&env, event, raw, &s, None, &[]);
             assert_eq!(r.code, 0, "{event} with {raw:?}: {}", r.stderr);
             assert!(r.stdout.is_empty());
-            assert!(!r.stderr.trim().is_empty(), "{event}: malformed input should be diagnosed on stderr");
+            assert!(
+                !r.stderr.trim().is_empty(),
+                "{event}: malformed input should be diagnosed on stderr"
+            );
         }
         let mut big = br#"{"cwd": ""#.to_vec();
-        big.extend(std::iter::repeat(b'z').take(5 * 1024 * 1024));
+        big.extend(std::iter::repeat_n(b'z', 5 * 1024 * 1024));
         big.extend(br#""}"#);
         let (r, took) = run_hook_raw(&env, event, &big, &s, None, &[]);
         assert_eq!(r.code, 0, "{event} oversized: {}", r.stderr);
         assert!(r.stdout.is_empty());
         assert!(took < Duration::from_secs(20));
     }
+}
+
+// Fixed bug: (low) with a corrupt state.json the turn hooks skip silently (session_at
+// turns every error into "not in a session"), so nothing on stderr tells the
+// user that per-turn checkpoints have stopped. ARCHITECTURE.md rule 5: turn
+// hooks "always exit 0 and write diagnostics to stderr".
+/// A Stop hook inside a session whose project state is unreadable exits 0 but
+/// says why it did nothing.
+#[test]
+fn stop_with_corrupt_state_reports_on_stderr() {
+    let env = Env::new(5284);
+    env.init("clone");
+    let s = fork(&env, "s");
+    fs::write(env.project_dir().join("state.json"), "{{{ garbage").unwrap();
+    let r = hook(&env, "stop", &turn_input("Stop", &s), &s, None);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(r.stdout.is_empty());
     assert!(
-        silent.is_empty(),
-        "BUG (low): corrupt state.json skipped with no diagnostic on stderr: {silent:?}"
+        !r.stderr.trim().is_empty(),
+        "corrupt state.json was skipped with no diagnostic on stderr"
     );
 }
 
@@ -1280,18 +1901,50 @@ fn session_start_names_the_session_branch_and_port() {
     let env = Env::new(5278);
     env.init("clone");
     let repo = env.repo();
-    let s = expect_created(&env, &hook(&env, "worktree-create", &create_input("ctx", &repo), &repo, None), "ctx");
-    let child = expect_created(&env, &hook(&env, "worktree-create", &create_input("kid", &s), &s, None), "kid");
-    for (name, dir) in [("ctx", s.clone()), ("ctx", s.join("src")), ("kid", child.clone())] {
+    let s = expect_created(
+        &env,
+        &hook(
+            &env,
+            "worktree-create",
+            &create_input("ctx", &repo),
+            &repo,
+            None,
+        ),
+        "ctx",
+    );
+    let child = expect_created(
+        &env,
+        &hook(&env, "worktree-create", &create_input("kid", &s), &s, None),
+        "kid",
+    );
+    for (name, dir) in [
+        ("ctx", s.clone()),
+        ("ctx", s.join("src")),
+        ("kid", child.clone()),
+    ] {
         let input = json!({"hook_event_name": "SessionStart", "source": "startup", "cwd": dir});
         let r = hook(&env, "session-start", &input, &dir, None);
         assert_eq!(r.code, 0, "{}", r.stderr);
         let port = env.state()["sessions"][name]["port"].as_u64().unwrap();
         assert!(r.stdout.contains(&format!("\"{name}\"")), "{:?}", r.stdout);
-        assert!(r.stdout.contains(&format!("shoal/{name}")), "{:?}", r.stdout);
+        assert!(
+            r.stdout.contains(&format!("shoal/{name}")),
+            "{:?}",
+            r.stdout
+        );
         assert!(r.stdout.contains(&port.to_string()), "{:?}", r.stdout);
-        assert!(r.stdout.contains(&repo.canonicalize().unwrap().display().to_string()), "{:?}", r.stdout);
-        assert_eq!(r.stdout.trim().lines().count(), 1, "one paragraph: {:?}", r.stdout);
+        assert!(
+            r.stdout
+                .contains(&repo.canonicalize().unwrap().display().to_string()),
+            "{:?}",
+            r.stdout
+        );
+        assert_eq!(
+            r.stdout.trim().lines().count(),
+            1,
+            "one paragraph: {:?}",
+            r.stdout
+        );
     }
     // With the cwd only in CLAUDE_PROJECT_DIR.
     let r = hook(&env, "session-start", &json!({}), env.root.path(), Some(&s));
@@ -1313,16 +1966,38 @@ fn prompt_marks_only_its_session_active() {
     let _b = fork(&env, "b");
     set_last_active(&env, "a", 0);
     set_last_active(&env, "b", 0);
-    let r = hook(&env, "prompt", &json!({"hook_event_name": "UserPromptSubmit", "prompt": "hi", "cwd": a.join("src")}), &a, None);
+    let r = hook(
+        &env,
+        "prompt",
+        &json!({"hook_event_name": "UserPromptSubmit", "prompt": "hi", "cwd": a.join("src")}),
+        &a,
+        None,
+    );
     assert_eq!(r.code, 0, "{}", r.stderr);
-    assert!(r.stdout.is_empty(), "prompt must not add context: {:?}", r.stdout);
+    assert!(
+        r.stdout.is_empty(),
+        "prompt must not add context: {:?}",
+        r.stdout
+    );
     let state = env.state();
     let a_active = state["sessions"]["a"]["last_active"].as_u64().unwrap();
-    assert!(a_active + 60 >= now_secs() && a_active <= now_secs() + 1, "{a_active}");
-    assert_eq!(state["sessions"]["b"]["last_active"], 0, "other sessions untouched");
+    assert!(
+        a_active + 60 >= now_secs() && a_active <= now_secs() + 1,
+        "{a_active}"
+    );
+    assert_eq!(
+        state["sessions"]["b"]["last_active"], 0,
+        "other sessions untouched"
+    );
 
     let before = read(env.project_dir().join("state.json"));
-    let r = hook(&env, "prompt", &json!({"prompt": "hi", "cwd": env.repo()}), &env.repo(), None);
+    let r = hook(
+        &env,
+        "prompt",
+        &json!({"prompt": "hi", "cwd": env.repo()}),
+        &env.repo(),
+        None,
+    );
     assert_eq!(r.code, 0);
     assert_eq!(read(env.project_dir().join("state.json")), before);
 }
@@ -1339,14 +2014,24 @@ fn unknown_events_are_rejected_and_hooks_json_matches() {
     let env = Env::new(5282);
     env.init("clone");
     let repo = env.repo();
-    for bad in ["bogus", "Stop", "worktree_create", "WorktreeCreate", "subagent-stop", ""] {
+    for bad in [
+        "bogus",
+        "Stop",
+        "worktree_create",
+        "WorktreeCreate",
+        "subagent-stop",
+        "",
+    ] {
         let (r, _) = run_hook_raw(&env, bad, b"{}", &repo, None, &[]);
         assert_ne!(r.code, 0, "event {bad:?} accepted");
         assert!(r.stdout.is_empty(), "{bad:?}: {:?}", r.stdout);
         assert!(!r.stderr.trim().is_empty());
     }
     let out = env.shoal_in(&repo, &["hook"]);
-    assert!(!out.status.success(), "`shoal hook` with no event must fail");
+    assert!(
+        !out.status.success(),
+        "`shoal hook` with no event must fail"
+    );
 
     let hooks: Value = serde_json::from_str(&read(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin/hooks/hooks.json"),
@@ -1361,7 +2046,12 @@ fn unknown_events_are_rejected_and_hooks_json_matches() {
         ("UserPromptSubmit", "prompt"),
     ];
     let map = hooks["hooks"].as_object().unwrap();
-    assert_eq!(map.len(), expected.len(), "{:?}", map.keys().collect::<Vec<_>>());
+    assert_eq!(
+        map.len(),
+        expected.len(),
+        "{:?}",
+        map.keys().collect::<Vec<_>>()
+    );
     for (claude_event, shoal_event) in expected {
         let cmd = hooks["hooks"][claude_event][0]["hooks"][0]["command"]
             .as_str()
@@ -1390,4 +2080,161 @@ fn unknown_events_are_rejected_and_hooks_json_matches() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Locking and remounting
+// ---------------------------------------------------------------------------
+
+/// Start a hook without waiting for it.
+fn spawn_hook(env: &Env, event: &str, input: &Value, dir: &Path) -> Child {
+    let mut child = env
+        .command(BIN, dir)
+        .args(["hook", event])
+        .env("GIT_CEILING_DIRECTORIES", env.root.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.to_string().as_bytes())
+        .unwrap();
+    child
+}
+
+fn finish(child: Child, within: Duration) -> HookResult {
+    let deadline = Instant::now() + within;
+    let mut child = child;
+    while child.try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "hook did not finish within {within:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = child.wait_with_output().unwrap();
+    HookResult {
+        code: out.status.code().unwrap_or(-1),
+        stdout: stdout(&out),
+        stderr: stderr(&out),
+    }
+}
+
+/// WorktreeCreate and WorktreeRemove wait for a busy project (they must not
+/// fail or act without the lock) and complete once it is free.
+#[test]
+fn worktree_hooks_wait_for_the_project_lock() {
+    let env = Env::new(5286);
+    env.init("clone");
+    let repo = env.repo();
+    let victim = expect_created(
+        &env,
+        &hook(
+            &env,
+            "worktree-create",
+            &create_input("victim", &repo),
+            &repo,
+            None,
+        ),
+        "victim",
+    );
+    fs::write(victim.join("src/app.txt"), "victim work\n").unwrap();
+    let lock = env.project_dir().join("lock");
+
+    let held = hold_lock(&lock);
+    let create = spawn_hook(
+        &env,
+        "worktree-create",
+        &create_input("waiter", &repo),
+        &repo,
+    );
+    let remove = spawn_hook(&env, "worktree-remove", &remove_input(&victim), &repo);
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    let mut create = create;
+    let mut remove = remove;
+    while Instant::now() < deadline {
+        assert!(
+            create.try_wait().unwrap().is_none(),
+            "worktree-create finished while the project was locked"
+        );
+        assert!(
+            remove.try_wait().unwrap().is_none(),
+            "worktree-remove finished while the project was locked"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        victim.join("src/app.txt").exists(),
+        "deleted while another process held the lock"
+    );
+    assert!(env.state()["sessions"]["waiter"].is_null());
+    drop(held);
+
+    let r = finish(create, Duration::from_secs(30));
+    expect_created(&env, &r, "waiter");
+    let r = finish(remove, Duration::from_secs(30));
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(!victim.exists());
+    assert_eq!(
+        env.git(&repo, &["show", "shoal/victim:src/app.txt"]),
+        "victim work\n"
+    );
+}
+
+/// Overlay sessions unmounted (as after `shoal down` or a reboot) still work
+/// with every hook: Stop remounts and checkpoints, WorktreeCreate inside
+/// forks with the parent's work, WorktreeRemove saves the work first.
+#[test]
+fn overlay_hooks_work_after_unmount() {
+    if !overlay_available() {
+        eprintln!("skipping: needs the overlay backend");
+        return;
+    }
+    let env = Env::new(5288);
+    env.init("overlay");
+    let repo = env.repo();
+    let s = fork(&env, "s");
+    fs::write(s.join("src/app.txt"), "before unmount\n").unwrap();
+    fs::write(s.join("deps/ignored.txt"), "ignored\n").unwrap();
+    env.shoal(&["down"]);
+    assert!(
+        !s.join("src/app.txt").exists(),
+        "down should have unmounted the session"
+    );
+
+    let r = hook(&env, "stop", &turn_input("Stop", &s), &s, None);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert_eq!(auto_labels(&env, "s"), vec!["turn-1"]);
+    assert_eq!(read(s.join("src/app.txt")), "before unmount\n");
+
+    env.shoal(&["down"]);
+    let r = hook(&env, "worktree-create", &create_input("kid", &s), &s, None);
+    let kid = expect_created(&env, &r, "kid");
+    assert_eq!(read(kid.join("src/app.txt")), "before unmount\n");
+    assert_eq!(read(kid.join("deps/ignored.txt")), "ignored\n");
+
+    env.shoal(&["down"]);
+    let r = hook(&env, "session-start", &json!({"cwd": s}), &s, None);
+    assert_eq!(r.code, 0);
+    assert!(r.stdout.contains("\"s\""), "{:?}", r.stdout);
+
+    env.shoal(&["down"]);
+    let r = hook(&env, "worktree-remove", &remove_input(&s), &repo, None);
+    assert_eq!(r.code, 0, "{}", r.stderr);
+    assert!(!s.exists());
+    assert_eq!(
+        env.git(&repo, &["show", "shoal/s:src/app.txt"]),
+        "before unmount\n"
+    );
+    // The fork that sat on s's frozen layer is unaffected (`down` unmounted
+    // it too; exec mounts it again).
+    assert_eq!(
+        env.shoal(&["exec", "kid", "cat", "src/app.txt"]),
+        "before unmount\n"
+    );
+    assert_eq!(read(kid.join("deps/ignored.txt")), "ignored\n");
 }

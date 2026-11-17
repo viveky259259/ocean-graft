@@ -129,7 +129,13 @@ pub fn init(o: InitOptions) -> Result<InitReport> {
     let source = git::toplevel(&o.repo)?;
     let branch = match o.branch {
         Some(branch) => branch,
-        None => git::git_trim(&source, &["rev-parse", "--abbrev-ref", "HEAD"])?,
+        None => {
+            let symbolic = git::git_trim(&source, &["symbolic-ref", "-q", "--short", "HEAD"]);
+            match symbolic {
+                Ok(b) if !b.is_empty() => b,
+                _ => "HEAD".to_string(),
+            }
+        }
     };
     if branch == "HEAD" {
         bail!("{} has a detached HEAD; pass --branch", source.display());
@@ -192,6 +198,17 @@ pub fn init(o: InitOptions) -> Result<InitReport> {
                     source.display()
                 ));
                 continue;
+            }
+            // Lexical checks cannot see symlinks: resolve the entry and make
+            // sure it is still inside the repository.
+            let resolved = from
+                .canonicalize()
+                .with_context(|| format!("copy entry {item} cannot be resolved"))?;
+            if !resolved.starts_with(&source) {
+                bail!(
+                    "copy entry {item} resolves to {}, outside the repository",
+                    resolved.display()
+                );
             }
             let to = template.join(item);
             if to.symlink_metadata().is_ok() {
@@ -308,14 +325,30 @@ pub fn project_for_path(path: &Path, create: bool) -> Result<PathBuf> {
         let source = git::toplevel(&path)?;
         let dir = project::project_dir_for(&source)?;
         if !dir.join("state.json").exists() {
-            bail!(
-                "{} has no shoal project yet; fork from it once to create one",
-                source.display()
-            );
+            return Err(NoProject { source }.into());
         }
         Ok(dir)
     }
 }
+
+/// A git repository that has no shoal project yet (as opposed to a bad path
+/// or a broken project).
+#[derive(Debug)]
+pub struct NoProject {
+    pub source: PathBuf,
+}
+
+impl std::fmt::Display for NoProject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} has no shoal project yet; fork from it once to create one",
+            self.source.display()
+        )
+    }
+}
+
+impl std::error::Error for NoProject {}
 
 /// The session whose directory contains `path`, if any.
 pub fn session_for_path(p: &Project, path: &Path) -> Option<String> {
@@ -399,7 +432,8 @@ pub fn refresh(p: &mut Project) -> Result<RefreshReport> {
             (rel.clone(), dir)
         }
     };
-    let result = (|| -> Result<(usize, bool)> {
+    let (old_setup, old_inputs) = (p.state.setup.clone(), p.state.setup_inputs.clone());
+    let result = (|| -> Result<(usize, bool, Option<String>, Vec<String>)> {
         git::git(&build, &["fetch", "-q", "origin", &branch])?;
         git::git(&build, &["reset", "-q", "--hard", "FETCH_HEAD"])?;
         let changed: Vec<String> = git::git(
@@ -409,22 +443,35 @@ pub fn refresh(p: &mut Project) -> Result<RefreshReport> {
         .lines()
         .map(str::to_string)
         .collect();
+        // shoal.toml may have changed in these commits: the committed
+        // version decides the setup command from now on.
+        let (setup, inputs) = if changed.iter().any(|f| f == config::FILE_NAME) {
+            let cfg = config::load(&build)?;
+            let inputs = if cfg.setup_inputs.is_empty() {
+                DEFAULT_SETUP_INPUTS.iter().map(|s| s.to_string()).collect()
+            } else {
+                cfg.setup_inputs
+            };
+            (cfg.setup, inputs)
+        } else {
+            (old_setup.clone(), old_inputs.clone())
+        };
         let mut ran = false;
-        if let Some(setup) = p.state.setup.clone() {
-            if touches_setup_inputs(&changed, &p.state.setup_inputs) {
-                run_setup(&build, &setup)?;
+        if let Some(cmd) = &setup {
+            if setup != old_setup || touches_setup_inputs(&changed, &inputs) {
+                run_setup(&build, cmd)?;
                 ran = true;
             }
         }
         git::git(&build, &["status", "--porcelain"])?;
-        Ok((changed.len(), ran))
+        Ok((changed.len(), ran, setup, inputs))
     })();
     if p.state.backend == Backend::Overlay {
         sys::unmount(&build)?;
         std::fs::remove_dir_all(p.dir.join("build-work"))?;
         std::fs::remove_dir(&build)?;
     }
-    let (changed, ran) = match result {
+    let (changed, ran, setup, inputs) = match result {
         Ok(r) => r,
         Err(err) => {
             let _ = std::fs::remove_dir_all(p.abs(&rel));
@@ -435,6 +482,8 @@ pub fn refresh(p: &mut Project) -> Result<RefreshReport> {
     if p.state.backend == Backend::Overlay {
         layers.extend(latest.layers.iter().cloned());
     }
+    p.state.setup = setup;
+    p.state.setup_inputs = inputs;
     p.state.generations.push(Generation {
         id,
         commit: source_head.clone(),
@@ -467,14 +516,26 @@ pub fn sanitize_name(raw: &str) -> String {
         } else {
             '-'
         };
-        if c == '-' && out.ends_with('-') {
+        // git branch names may not contain "..", and repeated separators
+        // read badly anyway.
+        if (c == '-' && out.ends_with('-')) || (c == '.' && out.ends_with('.')) {
             continue;
         }
         out.push(c);
     }
-    let trimmed = out.trim_matches(|c| matches!(c, '-' | '.' | '_'));
-    let mut name: String = trimmed.chars().take(40).collect();
-    name = name.trim_end_matches(['-', '.']).to_string();
+    let mut name: String = out
+        .trim_matches(|c| matches!(c, '-' | '.' | '_'))
+        .chars()
+        .take(40)
+        .collect();
+    loop {
+        let trimmed = name.trim_end_matches(['-', '.', '_']);
+        let trimmed = trimmed.strip_suffix(".lock").unwrap_or(trimmed);
+        if trimmed.len() == name.len() {
+            break;
+        }
+        name = trimmed.to_string();
+    }
     if name.is_empty() {
         "session".to_string()
     } else {
@@ -482,10 +543,19 @@ pub fn sanitize_name(raw: &str) -> String {
     }
 }
 
-/// `base`, or `base-2`, `base-3`... whichever is free.
+/// `base` with `suffix` appended, shortening `base` so the result is still a
+/// valid name of at most 40 characters.
+pub fn with_suffix(base: &str, suffix: &str) -> String {
+    let stem: String = base.chars().take(40 - suffix.len()).collect();
+    format!("{}{suffix}", stem.trim_end_matches(['-', '.', '_']))
+}
+
+/// `base`, or `base-2`, `base-3`... whichever is free. Reserved names
+/// ("main", "template") are never handed out.
 pub fn unique_name(p: &Project, base: &str) -> String {
     let taken = |n: &str| {
-        p.state.sessions.contains_key(n)
+        project::RESERVED_SESSION_NAMES.contains(&n)
+            || p.state.sessions.contains_key(n)
             || p.session_path(n).symlink_metadata().is_ok()
             || p.volume_dir(n).exists()
     };
@@ -493,9 +563,7 @@ pub fn unique_name(p: &Project, base: &str) -> String {
         return base.to_string();
     }
     for i in 2.. {
-        let suffix = format!("-{i}");
-        let stem: String = base.chars().take(40 - suffix.len()).collect();
-        let candidate = format!("{}{suffix}", stem.trim_end_matches(['-', '.']));
+        let candidate = with_suffix(base, &format!("-{i}"));
         if !taken(&candidate) {
             return candidate;
         }
@@ -527,6 +595,9 @@ pub struct SessionInfo {
 
 pub fn create_session(p: &mut Project, name: &str, origin: &Origin) -> Result<SessionInfo> {
     validate_name("session", name)?;
+    if project::RESERVED_SESSION_NAMES.contains(&name) {
+        bail!("{name:?} is reserved (fork from \"main\" means the repository); pick another name");
+    }
     if p.state.sessions.contains_key(name) {
         bail!("session {name} already exists");
     }
@@ -537,9 +608,19 @@ pub fn create_session(p: &mut Project, name: &str, origin: &Origin) -> Result<Se
             path.display()
         );
     }
+    let port = p.next_port()?;
     let start = Instant::now();
     let fork_layer = |p: &Project, parent: &str, src: &Path| -> Result<String> {
-        let layer = format!("layers/fork-{parent}-{name}-{}", sys::now());
+        // "+" cannot occur in names, so parent/name pairs never collide; the
+        // counter covers re-forks of the same pair in the same second. Flat
+        // (one directory per layer under layers/), which gc relies on.
+        let stem = format!("layers/fork+{parent}+{name}+{}", sys::now());
+        let mut layer = stem.clone();
+        let mut i = 2;
+        while p.abs(&layer).symlink_metadata().is_ok() {
+            layer = format!("{stem}+{i}");
+            i += 1;
+        }
         sys::clone_tree(src, &p.abs(&layer))?;
         Ok(layer)
     };
@@ -618,7 +699,7 @@ pub fn create_session(p: &mut Project, name: &str, origin: &Origin) -> Result<Se
         generation,
         base_commit,
         branch: format!("shoal/{name}"),
-        port: p.next_port(),
+        port,
         created_at: sys::now(),
         parent: parent.clone(),
         lowers,
@@ -725,7 +806,7 @@ pub fn checkpoint(
 ) -> Result<CheckpointInfo> {
     let start = Instant::now();
     let path = p.ensure_ready(name)?;
-    let fingerprint = conflicts::fingerprint(&path).ok();
+    let fingerprint = conflicts::fingerprint_with_ignored(&path).ok();
     if auto {
         let last = p
             .state
@@ -753,6 +834,9 @@ pub fn checkpoint(
         None => next_label(p, name, "cp"),
     };
     validate_name("checkpoint", &label)?;
+    if label == "latest" {
+        bail!("\"latest\" is reserved: rewind with label \"latest\" means the newest checkpoint");
+    }
     if p.state
         .checkpoints
         .iter()
@@ -849,8 +933,8 @@ pub fn rewind(p: &mut Project, name: &str, label: &str) -> Result<RewindInfo> {
         p.state
             .checkpoints
             .iter()
-            .filter(|c| c.session == name)
-            .max_by_key(|c| (c.created_at, c.label.clone()))
+            .rev() // checkpoints are appended in the order they are taken
+            .find(|c| c.session == name)
             .map(|c| c.label.clone())
             .with_context(|| format!("{name} has no checkpoints"))?
     } else {
@@ -885,24 +969,56 @@ pub fn rewind(p: &mut Project, name: &str, label: &str) -> Result<RewindInfo> {
         .filter(|svc| services::state(svc) == services::State::Running)
         .map(|svc| svc.name.clone())
         .collect();
+    let saved = p.checkpoint_dir(name, &label);
+    if !saved.is_dir() {
+        bail!(
+            "checkpoint {name}@{label} is recorded but its files are missing ({})",
+            saved.display()
+        );
+    }
     services::stop_session(p, name, None, false, true)?;
     let start = Instant::now();
-    let saved = p.checkpoint_dir(name, &label);
     let path = p.session_path(name);
     match p.state.backend {
         Backend::Overlay => {
+            // Never delete the current layer before its replacement exists:
+            // move it aside, copy the checkpoint in, and put it back on failure.
             if sys::is_mounted(&path) {
                 sys::unmount(&path)?;
             }
             let volume = p.volume_dir(name);
-            for dir in ["upper", "work"] {
-                let dir = volume.join(dir);
-                if dir.exists() {
-                    std::fs::remove_dir_all(&dir)?;
-                }
+            let upper = volume.join("upper");
+            let work = volume.join("work");
+            let aside = volume.join(format!("upper.rewind-{}", std::process::id()));
+            if aside.symlink_metadata().is_ok() {
+                std::fs::remove_dir_all(&aside)?;
             }
-            sys::clone_tree(&saved, &volume.join("upper"))?;
-            p.mount(&session)?;
+            if upper.exists() {
+                std::fs::rename(&upper, &aside)?;
+            }
+            let restored = sys::clone_tree(&saved, &upper).and_then(|_| {
+                if work.exists() {
+                    std::fs::remove_dir_all(&work)?;
+                }
+                std::fs::create_dir_all(&work)?;
+                p.mount(&session)
+            });
+            if let Err(err) = restored {
+                let _ = std::fs::remove_dir_all(&upper);
+                if aside.exists() {
+                    std::fs::rename(&aside, &upper)?;
+                }
+                let _ = std::fs::remove_dir_all(&work);
+                let _ = std::fs::create_dir_all(&work);
+                p.mount(&session)
+                    .context("rewind failed and the session could not be remounted")?;
+                return Err(err.context(format!(
+                    "could not rewind {name} to {label}; the session is unchanged"
+                )));
+            }
+            if aside.exists() {
+                std::fs::remove_dir_all(&aside)?;
+            }
         }
         Backend::Clone => {
             let trash = p.dir.join(format!("trash-{name}-{}", std::process::id()));
@@ -971,12 +1087,60 @@ pub struct ImportInfo {
     pub uncommitted: Vec<String>,
 }
 
+/// Copy the session's HEAD into the source repository as `shoal/<name>`, or
+/// `shoal/<name>-2`, `-3`... when `shoal/<name>` already holds commits this
+/// HEAD does not contain (an earlier session of the same name, or the user's
+/// own commits). The fetch is never forced, so git itself refuses to move a
+/// branch anywhere but forward.
+pub(crate) fn save_branch(source: &Path, session: &Path, name: &str) -> Result<String> {
+    let mut last_err = None;
+    for i in 1..=50 {
+        let branch = if i == 1 {
+            format!("shoal/{name}")
+        } else {
+            format!("shoal/{name}-{i}")
+        };
+        let fetched = git::git(
+            source,
+            &[
+                "fetch",
+                "-q",
+                "--no-tags",
+                &session.to_string_lossy(),
+                &format!("HEAD:refs/heads/{branch}"),
+            ],
+        );
+        match fetched {
+            Ok(_) => return Ok(branch),
+            Err(err) => {
+                let exists = git::git(
+                    source,
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        "-q",
+                        &format!("refs/heads/{branch}"),
+                    ],
+                )
+                .is_ok();
+                if !exists {
+                    // Not a name clash: a real failure.
+                    return Err(err);
+                }
+                last_err = Some(err);
+            }
+        }
+    }
+    Err(last_err.expect("at least one attempt"))
+        .with_context(|| format!("could not save the work of {name} to any shoal/{name}-N branch"))
+}
+
 /// Copy the session's commits into the source repository as `shoal/<name>`.
 pub fn import(p: &Project, name: &str) -> Result<ImportInfo> {
     let s = p.session(name)?;
     let path = p.ensure_ready(name)?;
     let head = git::head(&path)?;
-    let uncommitted = git::status_lines(&path)?;
+    let uncommitted = git::status_paths(&path)?;
     if head == s.base_commit {
         return Ok(ImportInfo {
             session: name.to_string(),
@@ -986,17 +1150,7 @@ pub fn import(p: &Project, name: &str) -> Result<ImportInfo> {
         });
     }
     let commits = git::count_commits(&path, &format!("{}..HEAD", s.base_commit))?;
-    let branch = format!("shoal/{name}");
-    git::git(
-        &p.state.source,
-        &[
-            "fetch",
-            "-q",
-            "--no-tags",
-            &path.to_string_lossy(),
-            &format!("+HEAD:refs/heads/{branch}"),
-        ],
-    )?;
+    let branch = save_branch(&p.state.source, &path, name)?;
     Ok(ImportInfo {
         session: name.to_string(),
         branch: Some(branch),
@@ -1203,6 +1357,26 @@ fn conflicted_files(path: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Serialises the final fast-forward of every land in one project.
+fn land_lock(project_dir: &Path) -> Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(project_dir.join("land.lock"))
+        .context("could not open the land lock")?;
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(file);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINTR) {
+            return Err(err).context("could not take the land lock");
+        }
+    }
+}
+
 /// Land a session's work on the target branch of the source repository:
 /// commit (optional), rebase onto the target, test, fast-forward. Never
 /// rewrites the target and never leaves the session mid-rebase.
@@ -1233,26 +1407,23 @@ pub fn land(project_dir: &Path, name: &str, o: &LandOptions) -> Result<LandRepor
         message: String::new(),
     };
 
+    let target_ref = format!("refs/heads/{target}");
+    if git::git(&source, &["rev-parse", "--verify", "-q", &target_ref]).is_err() {
+        bail!("the source repository has no branch {target}");
+    }
+
     // 1. Uncommitted work.
-    let dirty = git::status_lines(&path)?;
+    let dirty = git::status_paths(&path)?;
     if !dirty.is_empty() {
         match &o.commit_message {
             Some(message) if !message.trim().is_empty() => commit_all(&path, message)?,
             _ => {
                 report.status = "uncommitted_changes";
-                report.files = dirty
-                    .iter()
-                    .map(|l| l[3.min(l.len())..].to_string())
-                    .collect();
+                report.files = dirty;
                 report.message = "the session has uncommitted changes; pass commit_message to commit them as part of landing, or commit them yourself".into();
                 return Ok(report);
             }
         }
-    }
-
-    let target_ref = format!("refs/heads/{target}");
-    if git::git(&source, &["rev-parse", "--verify", "-q", &target_ref]).is_err() {
-        bail!("the source repository has no branch {target}");
     }
     for attempt in 1..=3 {
         report.attempts = attempt;
@@ -1300,6 +1471,13 @@ pub fn land(project_dir: &Path, name: &str, o: &LandOptions) -> Result<LandRepor
             }
         }
         report.commits = git::count_commits(&path, &format!("{tip}..HEAD"))?;
+        if report.commits == 0 {
+            // The rebase dropped every commit: the target already has them.
+            report.status = "nothing_to_land";
+            report.message =
+                format!("{target} already contains the changes in {name} (as equivalent commits)");
+            return Ok(report);
+        }
         // 4. Tests, through the queue and without the project lock.
         if let Some(test) = &test {
             progress(format!("running `{test}` in {name}"));
@@ -1315,18 +1493,13 @@ pub fn land(project_dir: &Path, name: &str, o: &LandOptions) -> Result<LandRepor
                 return Ok(report);
             }
         }
-        // 5. Fast-forward the target, and nothing else.
+        // 5. Fast-forward the target, and nothing else. One land at a time
+        // per source repository: `git merge --ff-only` writes the user's
+        // working tree before it moves the branch, so two at once could
+        // leave one's files checked out under the other's commit.
         let head = git::head(&path)?;
-        git::git(
-            &source,
-            &[
-                "fetch",
-                "-q",
-                "--no-tags",
-                &path.to_string_lossy(),
-                &format!("+HEAD:refs/heads/shoal/{name}"),
-            ],
-        )?;
+        let saved = save_branch(&source, &path, name)?;
+        let _land_guard = land_lock(project_dir)?;
         let checked_out = git::git_trim(&source, &["symbolic-ref", "-q", "HEAD"])
             .map(|r| r == target_ref)
             .unwrap_or(false);
@@ -1367,7 +1540,7 @@ pub fn land(project_dir: &Path, name: &str, o: &LandOptions) -> Result<LandRepor
                 report.status = "target_blocked";
                 report.head = Some(head);
                 report.message = format!(
-                    "could not fast-forward {target}: {err:#}. The work is on branch shoal/{name} in the source repository"
+                    "could not fast-forward {target}: {err:#}. The work is on branch {saved} in the source repository"
                 );
                 return Ok(report);
             }

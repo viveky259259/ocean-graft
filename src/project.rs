@@ -279,15 +279,23 @@ pub fn all_projects() -> Result<Vec<PathBuf>> {
     Ok(dirs)
 }
 
+/// Session names that mean something else to `fork`.
+pub const RESERVED_SESSION_NAMES: &[&str] = &["main", "template"];
+
+/// Names become directory names and part of the git branch `shoal/<name>`,
+/// so they must be safe as both.
 pub fn validate_name(kind: &str, name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 40
         && !name.starts_with(['.', '-'])
+        && !name.ends_with('.')
+        && !name.contains("..")
+        && !name.ends_with(".lock")
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
     if !ok {
-        bail!("invalid {kind} name {name:?}: use up to 40 letters, digits, '-', '_' or '.'");
+        bail!("invalid {kind} name {name:?}: use up to 40 letters, digits, '-', '_' or '.', not starting with '.' or '-', without \"..\", and not ending in '.' or \".lock\"");
     }
     Ok(())
 }
@@ -392,12 +400,23 @@ impl Project {
             .expect("a project always has a generation")
     }
 
-    pub fn next_port(&self) -> u16 {
+    /// The first free port of port_base, port_base + 10, ... (each session
+    /// has ten: its own and nine for extra services).
+    pub fn next_port(&self) -> Result<u16> {
         let used: HashSet<u16> = self.state.sessions.values().map(|s| s.port).collect();
-        (0u16..)
-            .filter_map(|k| self.state.port_base.checked_add(k.checked_mul(10)?))
+        let base = u32::from(self.state.port_base);
+        (0u32..)
+            .map(|k| base + k * 10)
+            .take_while(|port| *port + 9 <= u32::from(u16::MAX))
+            .map(|port| port as u16)
             .find(|port| !used.contains(port))
-            .unwrap_or(self.state.port_base)
+            .with_context(|| {
+                format!(
+                    "no free ports left above port_base {} ({} sessions); remove sessions or lower port_base",
+                    self.state.port_base,
+                    used.len()
+                )
+            })
     }
 
     /// Make sure the session's directory is there, mounting it if needed (for

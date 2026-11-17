@@ -120,7 +120,12 @@ impl Env {
 
     pub fn git(&self, dir: &Path, args: &[&str]) -> String {
         let out = self.command("git", dir).args(args).output().unwrap();
-        assert!(out.status.success(), "git {args:?} in {}: {}", dir.display(), stderr(&out));
+        assert!(
+            out.status.success(),
+            "git {args:?} in {}: {}",
+            dir.display(),
+            stderr(&out)
+        );
         stdout(&out)
     }
 
@@ -166,7 +171,10 @@ impl Env {
             .unwrap();
         let text = stdout(&out);
         let value: Value = serde_json::from_str(&text).unwrap_or_else(|e| {
-            panic!("api {tool} printed non-JSON ({e}):\n{text}\nstderr:\n{}", stderr(&out))
+            panic!(
+                "api {tool} printed non-JSON ({e}):\n{text}\nstderr:\n{}",
+                stderr(&out)
+            )
         });
         if out.status.success() {
             Ok(value)
@@ -359,7 +367,8 @@ impl Mcp {
         let value = if is_error {
             Value::String(text.to_string())
         } else {
-            serde_json::from_str(text).unwrap_or_else(|e| panic!("tool text is not JSON ({e}): {text}"))
+            serde_json::from_str(text)
+                .unwrap_or_else(|e| panic!("tool text is not JSON ({e}): {text}"))
         };
         (is_error, value)
     }

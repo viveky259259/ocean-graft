@@ -35,6 +35,13 @@ impl State {
 }
 
 pub fn group_alive(pgid: i32) -> bool {
+    // A long-lived shoal (the MCP server) is the parent of the services it
+    // starts. Reap the group leader if it has exited, or it stays a zombie
+    // and kill(-pgid, 0) keeps reporting the group alive. For a group we did
+    // not start this is ECHILD and changes nothing.
+    unsafe {
+        libc::waitpid(pgid, std::ptr::null_mut(), libc::WNOHANG);
+    }
     if unsafe { libc::kill(-pgid, 0) } == 0 {
         return true;
     }
@@ -54,8 +61,24 @@ pub fn describe(service: &Service) -> &'static str {
     }
 }
 
+/// Fail early, with a clear reason, when another process already listens on
+/// `port`; otherwise a service or gateway would die after we report success.
+pub fn ensure_port_free(port: u16) -> Result<()> {
+    match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => bail!(
+            "port {port} is already in use by another process; stop it, or check `lsof -i :{port}`"
+        ),
+        Err(err) => Err(err).with_context(|| format!("could not check port {port}")),
+    }
+}
+
 /// Start the gateway that owns an on-demand service's public port.
 pub fn start_gateway(p: &Project, session: &Session, service: &mut Service) -> Result<()> {
+    ensure_port_free(service.port)?;
     let log_path = p
         .dir
         .join("logs")
@@ -130,6 +153,7 @@ pub fn group_rss_kb(pgid: i32) -> u64 {
 
 /// Start `service` for `session`, recording its process group in `service`.
 pub fn start(p: &Project, session: &Session, service: &mut Service) -> Result<()> {
+    ensure_port_free(service.internal_port.unwrap_or(service.port))?;
     let path = p.session_path(&session.name);
     let log_path = p.log_path(&session.name, &service.name);
     std::fs::create_dir_all(log_path.parent().expect("log path has a parent"))?;

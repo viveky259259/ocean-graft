@@ -56,14 +56,18 @@ fn agent_cwd(input: &Value) -> Option<PathBuf> {
 }
 
 /// The project and session `path` is inside, if it is inside a session.
-fn session_at(path: &Path, wait: Option<Duration>) -> Option<(Project, String)> {
-    let dir = ops::project_for_path(path, false).ok()?;
-    let p = match wait {
-        Some(w) => Project::open_within(dir, w).ok()?,
-        None => Project::open(dir).ok()?,
+/// A path outside any shoal project is `Ok(None)`; a project that exists but
+/// cannot be opened (busy, corrupt state) is an error, so the caller can say
+/// why it skipped.
+fn session_at(path: &Path, wait: Option<Duration>) -> Result<Option<(Project, String)>> {
+    let Ok(dir) = ops::project_for_path(path, false) else {
+        return Ok(None);
     };
-    let name = ops::session_for_path(&p, path)?;
-    Some((p, name))
+    let p = match wait {
+        Some(w) => Project::open_within(dir, w)?,
+        None => Project::open(dir)?,
+    };
+    Ok(ops::session_for_path(&p, path).map(|name| (p, name)))
 }
 
 /// Returns the path to print as the last line of stdout.
@@ -72,7 +76,7 @@ pub fn worktree_create(input: &Value) -> Result<PathBuf> {
     let cwd = agent_cwd(input).context("no working directory in the hook input")?;
     // Inside a session (a subagent of an agent that works in one), fork it,
     // so the subagent starts with the parent's uncommitted work.
-    let (mut p, origin) = match session_at(&cwd, None) {
+    let (mut p, origin) = match session_at(&cwd, None)? {
         Some((p, parent)) => (p, Origin::Session(parent)),
         None => {
             let repo = std::env::var_os("CLAUDE_PROJECT_DIR")
@@ -106,7 +110,10 @@ pub fn worktree_remove(input: &Value) -> Result<()> {
     if path.symlink_metadata().is_err() {
         return Ok(()); // already gone
     }
-    let Some((mut p, name)) = session_at(path, None) else {
+    let Some((mut p, name)) = session_at(path, None)? else {
+        if path.symlink_metadata().is_err() {
+            return Ok(()); // removed by another hook while we waited for the lock
+        }
         bail!(
             "{} is not a shoal session, so shoal will not delete it",
             path.display()
@@ -137,7 +144,7 @@ pub fn stop(input: &Value) -> Result<()> {
     let Some(cwd) = agent_cwd(input) else {
         return Ok(());
     };
-    let Some((mut p, name)) = session_at(&cwd, Some(TURN_HOOK_LOCK_WAIT)) else {
+    let Some((mut p, name)) = session_at(&cwd, Some(TURN_HOOK_LOCK_WAIT))? else {
         return Ok(());
     };
     p.mark_active(&name)?;
@@ -159,7 +166,7 @@ pub fn session_start(input: &Value) -> Result<Option<String>> {
     let Some(cwd) = agent_cwd(input) else {
         return Ok(None);
     };
-    let Some((p, name)) = session_at(&cwd, Some(TURN_HOOK_LOCK_WAIT)) else {
+    let Some((p, name)) = session_at(&cwd, Some(TURN_HOOK_LOCK_WAIT))? else {
         return Ok(None);
     };
     let s = p.session(&name)?;
@@ -173,7 +180,7 @@ pub fn session_start(input: &Value) -> Result<Option<String>> {
 
 pub fn prompt(input: &Value) -> Result<()> {
     if let Some(cwd) = agent_cwd(input) {
-        if let Some((mut p, name)) = session_at(&cwd, Some(TURN_HOOK_LOCK_WAIT)) {
+        if let Some((mut p, name)) = session_at(&cwd, Some(TURN_HOOK_LOCK_WAIT))? {
             p.mark_active(&name)?;
         }
     }

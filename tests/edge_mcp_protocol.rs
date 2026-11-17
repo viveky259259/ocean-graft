@@ -62,7 +62,10 @@ fn parse_stdout(raw: &str) -> Vec<Value> {
         let v: Value = serde_json::from_str(line)
             .unwrap_or_else(|e| panic!("stdout carried a non-JSON line ({e}): {line:?}"));
         assert_eq!(v["jsonrpc"], "2.0", "not JSON-RPC 2.0: {line}");
-        assert!(v.is_object(), "every stdout line must be one message object: {line}");
+        assert!(
+            v.is_object(),
+            "every stdout line must be one message object: {line}"
+        );
         out.push(v);
     }
     assert!(
@@ -139,7 +142,12 @@ fn run_lines(env: &Env, lines: &[String]) -> Run {
         input.push_str(l);
         input.push('\n');
     }
-    run_bytes_in(env, &env.repo(), input.into_bytes(), Duration::from_secs(60))
+    run_bytes_in(
+        env,
+        &env.repo(),
+        input.into_bytes(),
+        Duration::from_secs(60),
+    )
 }
 
 fn req(id: Value, method: &str, params: Value) -> String {
@@ -163,7 +171,9 @@ fn call_line(id: Value, tool: &str, args: Value) -> String {
 fn tool_outcome(resp: &Value) -> (bool, Value) {
     assert!(resp.get("error").is_none(), "expected a result, got {resp}");
     let result = &resp["result"];
-    let content = result["content"].as_array().unwrap_or_else(|| panic!("no content: {resp}"));
+    let content = result["content"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no content: {resp}"));
     assert_eq!(content.len(), 1, "{resp}");
     assert_eq!(content[0]["type"], "text", "{resp}");
     let text = content[0]["text"].as_str().expect("text is a string");
@@ -171,12 +181,16 @@ fn tool_outcome(resp: &Value) -> (bool, Value) {
         .as_bool()
         .unwrap_or_else(|| panic!("isError must be a boolean: {resp}"));
     if is_error {
-        assert!(!text.trim().is_empty(), "an error must say something: {resp}");
+        assert!(
+            !text.trim().is_empty(),
+            "an error must say something: {resp}"
+        );
         (true, Value::String(text.to_string()))
     } else {
         (
             false,
-            serde_json::from_str(text).unwrap_or_else(|e| panic!("tool text is not JSON ({e}): {text}")),
+            serde_json::from_str(text)
+                .unwrap_or_else(|e| panic!("tool text is not JSON ({e}): {text}")),
         )
     }
 }
@@ -195,7 +209,9 @@ fn expect_tool_error(resp: &Value, needle: &str) -> String {
 fn expect_rpc_error(resp: &Value, code: i64) {
     assert_eq!(resp["error"]["code"], code, "{resp}");
     assert!(
-        resp["error"]["message"].as_str().is_some_and(|m| !m.is_empty()),
+        resp["error"]["message"]
+            .as_str()
+            .is_some_and(|m| !m.is_empty()),
         "error needs a message: {resp}"
     );
     assert!(resp.get("result").is_none(), "{resp}");
@@ -235,7 +251,13 @@ fn initialized(mcp: &mut Mcp) {
 #[test]
 fn initialize_echoes_every_known_revision_and_reports_capabilities() {
     let env = Env::new(5101);
-    let known = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"];
+    let known = [
+        "2024-11-05",
+        "2025-03-26",
+        "2025-06-18",
+        "2025-11-25",
+        "2026-07-28",
+    ];
     let lines: Vec<String> = known
         .iter()
         .enumerate()
@@ -256,9 +278,14 @@ fn initialize_echoes_every_known_revision_and_reports_capabilities() {
         assert_eq!(res["protocolVersion"], *v, "{r}");
         assert!(res["capabilities"]["tools"].is_object(), "{r}");
         assert_eq!(res["serverInfo"]["name"], "shoal");
-        assert!(res["serverInfo"]["version"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(res["serverInfo"]["version"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()));
         let instructions = res["instructions"].as_str().unwrap_or_default();
-        assert!(instructions.contains("fork"), "instructions should orient Claude: {r}");
+        assert!(
+            instructions.contains("fork"),
+            "instructions should orient Claude: {r}"
+        );
         assert!(r.get("error").is_none());
     }
 }
@@ -268,7 +295,11 @@ fn initialize_with_unknown_missing_or_malformed_revision() {
     let env = Env::new(5102);
     let lines = vec![
         // Unknown but well-formed revision: echoed back (documented behaviour).
-        req(json!(1), "initialize", json!({"protocolVersion": "2099-01-01", "capabilities": {}})),
+        req(
+            json!(1),
+            "initialize",
+            json!({"protocolVersion": "2099-01-01", "capabilities": {}}),
+        ),
         // No params at all.
         req_np(json!(2), "initialize"),
         // params null.
@@ -284,7 +315,10 @@ fn initialize_with_unknown_missing_or_malformed_revision() {
     ];
     let run = run_lines(&env, &lines);
     assert!(run.status.success());
-    assert_eq!(run.one(&json!(1))["result"]["protocolVersion"], "2099-01-01");
+    assert_eq!(
+        run.one(&json!(1))["result"]["protocolVersion"],
+        "2099-01-01"
+    );
     for id in 2..=7 {
         let r = run.one(&json!(id));
         assert_eq!(
@@ -304,18 +338,38 @@ fn initialize_twice_and_tools_before_initialize_still_answer() {
         // No handshake first: tools/list and ping still work.
         req_np(json!(1), "tools/list"),
         req_np(json!(2), "ping"),
-        req(json!(3), "initialize", json!({"protocolVersion": "2025-03-26"})),
-        req(json!(4), "initialize", json!({"protocolVersion": "2026-07-28"})),
+        req(
+            json!(3),
+            "initialize",
+            json!({"protocolVersion": "2025-03-26"}),
+        ),
+        req(
+            json!(4),
+            "initialize",
+            json!({"protocolVersion": "2026-07-28"}),
+        ),
         notif("notifications/initialized", json!({})),
         req_np(json!(5), "ping"),
     ];
     let run = run_lines(&env, &lines);
     assert!(run.status.success());
     assert_eq!(run.messages.len(), 5, "{:?}", run.messages);
-    assert_eq!(run.one(&json!(1))["result"]["tools"].as_array().unwrap().len(), 8);
+    assert_eq!(
+        run.one(&json!(1))["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .len(),
+        8
+    );
     assert_eq!(run.one(&json!(2))["result"], json!({}));
-    assert_eq!(run.one(&json!(3))["result"]["protocolVersion"], "2025-03-26");
-    assert_eq!(run.one(&json!(4))["result"]["protocolVersion"], "2026-07-28");
+    assert_eq!(
+        run.one(&json!(3))["result"]["protocolVersion"],
+        "2025-03-26"
+    );
+    assert_eq!(
+        run.one(&json!(4))["result"]["protocolVersion"],
+        "2026-07-28"
+    );
     assert_eq!(run.one(&json!(5))["result"], json!({}));
 }
 
@@ -344,7 +398,12 @@ fn notifications_get_no_reply_and_do_not_execute_tools() {
     ];
     let run = run_lines(&env, &lines);
     assert!(run.status.success());
-    assert_eq!(run.messages.len(), 1, "only the ping is answered: {:?}", run.messages);
+    assert_eq!(
+        run.messages.len(),
+        1,
+        "only the ping is answered: {:?}",
+        run.messages
+    );
     assert_eq!(run.one(&json!("last"))["result"], json!({}));
     assert_no_project(&env);
 }
@@ -393,7 +452,11 @@ fn ids_of_every_json_type_are_echoed_exactly() {
     assert!(zeros.iter().any(|r| r["result"] == json!({})));
     assert!(zeros.iter().any(|r| r["result"]["content"].is_array()));
     // Raw text check: the big integer id is written verbatim.
-    assert!(run.raw_stdout.contains("\"id\":9007199254740993"), "{}", run.raw_stdout);
+    assert!(
+        run.raw_stdout.contains("\"id\":9007199254740993"),
+        "{}",
+        run.raw_stdout
+    );
     assert!(run.raw_stdout.contains(&format!("\"id\":{}", u64::MAX)));
 }
 
@@ -437,18 +500,23 @@ fn batches_answer_each_request_once_and_skip_notifications() {
     // Responses may come back one per line or as one array line; shoal writes
     // one per line. Either way every request is answered exactly once.
     assert_eq!(run.one(&json!(1))["result"], json!({}));
-    assert_eq!(run.one(&json!(2))["result"]["tools"].as_array().unwrap().len(), 8);
-    assert!(run.by_id(&json!(3)).is_empty(), "a client response is never answered");
+    assert_eq!(
+        run.one(&json!(2))["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .len(),
+        8
+    );
+    assert!(
+        run.by_id(&json!(3)).is_empty(),
+        "a client response is never answered"
+    );
     let (is_err, v) = tool_outcome(run.one(&json!(4)));
     assert!(!is_err);
     assert_eq!(v["initialized"], false);
     expect_rpc_error(run.one(&json!(5)), -32601);
     // 42, "string" and null are invalid requests: one -32600 each, id null.
-    let invalid: Vec<&Value> = run
-        .messages
-        .iter()
-        .filter(|m| m["id"].is_null())
-        .collect();
+    let invalid: Vec<&Value> = run.messages.iter().filter(|m| m["id"].is_null()).collect();
     assert_eq!(invalid.len(), 3, "{:?}", run.messages);
     for m in invalid {
         expect_rpc_error(m, -32600);
@@ -472,7 +540,12 @@ fn empty_batch_and_batch_of_only_notifications() {
     let run = run_lines(&env, &lines);
     assert!(run.status.success());
     let nulls: Vec<&Value> = run.messages.iter().filter(|m| m["id"].is_null()).collect();
-    assert_eq!(nulls.len(), 2, "one error per empty batch: {:?}", run.messages);
+    assert_eq!(
+        nulls.len(),
+        2,
+        "one error per empty batch: {:?}",
+        run.messages
+    );
     for m in nulls {
         expect_rpc_error(m, -32600);
     }
@@ -513,11 +586,13 @@ fn deeply_nested_json_is_a_parse_error_not_a_crash() {
     let env = Env::new(5110);
     let deep = "[".repeat(200_000);
     let deep_obj = format!("{}{}", "{\"a\":".repeat(50_000), "1");
-    let run = run_lines(
-        &env,
-        &[deep, deep_obj, req_np(json!(1), "ping")],
+    let run = run_lines(&env, &[deep, deep_obj, req_np(json!(1), "ping")]);
+    assert!(
+        run.status.success(),
+        "server crashed: {:?}\n{}",
+        run.status,
+        run.stderr
     );
-    assert!(run.status.success(), "server crashed: {:?}\n{}", run.status, run.stderr);
     let errs: Vec<&Value> = run.messages.iter().filter(|m| m["id"].is_null()).collect();
     assert_eq!(errs.len(), 2, "{:?}", run.messages);
     for e in errs {
@@ -538,7 +613,12 @@ fn blank_lines_whitespace_and_crlf_are_tolerated() {
     input.extend_from_slice(b"\n\n");
     let run = run_bytes_in(&env, &env.repo(), input, Duration::from_secs(30));
     assert!(run.status.success());
-    assert_eq!(run.messages.len(), 2, "blank lines must not be answered: {:?}", run.messages);
+    assert_eq!(
+        run.messages.len(),
+        2,
+        "blank lines must not be answered: {:?}",
+        run.messages
+    );
     assert_eq!(run.one(&json!(1))["result"], json!({}));
     assert_eq!(run.one(&json!(2))["result"], json!({}));
 }
@@ -546,14 +626,29 @@ fn blank_lines_whitespace_and_crlf_are_tolerated() {
 #[test]
 fn last_line_without_a_trailing_newline_is_still_answered() {
     let env = Env::new(5112);
-    let input = format!("{}\n{}", req_np(json!(1), "ping"), req_np(json!(2), "tools/list"));
-    let run = run_bytes_in(&env, &env.repo(), input.into_bytes(), Duration::from_secs(30));
+    let input = format!(
+        "{}\n{}",
+        req_np(json!(1), "ping"),
+        req_np(json!(2), "tools/list")
+    );
+    let run = run_bytes_in(
+        &env,
+        &env.repo(),
+        input.into_bytes(),
+        Duration::from_secs(30),
+    );
     assert!(run.status.success());
     assert_eq!(run.one(&json!(1))["result"], json!({}));
-    assert_eq!(run.one(&json!(2))["result"]["tools"].as_array().unwrap().len(), 8);
+    assert_eq!(
+        run.one(&json!(2))["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .len(),
+        8
+    );
 }
 
-// BUG: a stdin line that is not valid UTF-8 makes `serve` treat the read
+// Fixed bug: a stdin line that is not valid UTF-8 makes `serve` treat the read
 // error as end-of-input (`Err(err) => break` in mcp::serve), so the server
 // stops reading and exits: every later request goes unanswered and Claude
 // Code loses all shoal tools for the rest of the session. A malformed line
@@ -571,7 +666,9 @@ fn invalid_utf8_line_is_a_parse_error_and_the_server_keeps_going() {
     let run = run_bytes_in(&env, &env.repo(), input, Duration::from_secs(30));
     assert_eq!(run.one(&json!(1))["result"], json!({}));
     assert!(
-        run.messages.iter().any(|m| m["id"].is_null() && m["error"]["code"] == -32700),
+        run.messages
+            .iter()
+            .any(|m| m["id"].is_null() && m["error"]["code"] == -32700),
         "expected a parse error for the invalid UTF-8 line: {:?}\nstderr: {}",
         run.messages,
         run.stderr
@@ -600,9 +697,17 @@ fn very_large_request_line_is_handled() {
     assert_eq!(run.one(&json!(1))["result"], json!({}));
     assert_eq!(run.one(&json!(2))["result"], json!({}));
     // The parse error message must not echo 4 MiB back.
-    let err = run.messages.iter().find(|m| m["id"].is_null()).expect("parse error");
+    let err = run
+        .messages
+        .iter()
+        .find(|m| m["id"].is_null())
+        .expect("parse error");
     expect_rpc_error(err, -32700);
-    assert!(err.to_string().len() < 10_000, "parse error is huge: {} bytes", err.to_string().len());
+    assert!(
+        err.to_string().len() < 10_000,
+        "parse error is huge: {} bytes",
+        err.to_string().len()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -625,7 +730,8 @@ fn requests_without_method_and_client_responses() {
         json!({"jsonrpc": "2.0", "id": 11, "result": null}).to_string(),
         json!({"jsonrpc": "2.0", "id": 12, "error": {"code": -1, "message": "no"}}).to_string(),
         json!({"jsonrpc": "2.0", "id": "r", "result": {"roots": []}}).to_string(),
-        json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "x"}}).to_string(),
+        json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "x"}})
+            .to_string(),
         req_np(json!("end"), "ping"),
     ];
     let run = run_lines(&env, &lines);
@@ -634,13 +740,17 @@ fn requests_without_method_and_client_responses() {
         expect_rpc_error(run.one(&id), -32600);
     }
     for id in [json!(10), json!(11), json!(12), json!("r")] {
-        assert!(run.by_id(&id).is_empty(), "response {id} must not be answered: {:?}", run.messages);
+        assert!(
+            run.by_id(&id).is_empty(),
+            "response {id} must not be answered: {:?}",
+            run.messages
+        );
     }
     assert_eq!(run.one(&json!("end"))["result"], json!({}));
     assert_eq!(run.messages.len(), 6, "{:?}", run.messages);
 }
 
-// BUG: an invalid request with no id (for example the JSON-RPC 2.0 spec's own
+// Fixed bug: an invalid request with no id (for example the JSON-RPC 2.0 spec's own
 // example `{"jsonrpc":"2.0","method":1,"params":"bar"}`) gets no reply at all;
 // mcp::handle returns None for any id-less object without a string method.
 // JSON-RPC 2.0 requires an Invalid Request error (-32600) with id null, as
@@ -656,7 +766,12 @@ fn invalid_request_without_id_gets_an_error_with_null_id() {
     assert!(run.status.success());
     assert_eq!(run.one(&json!("end"))["result"], json!({}));
     let errs: Vec<&Value> = run.messages.iter().filter(|m| m["id"].is_null()).collect();
-    assert_eq!(errs.len(), 1, "expected one -32600 with id null: {:?}", run.messages);
+    assert_eq!(
+        errs.len(),
+        1,
+        "expected one -32600 with id null: {:?}",
+        run.messages
+    );
     expect_rpc_error(errs[0], -32600);
 }
 
@@ -718,13 +833,25 @@ fn tools_list_matches_the_documented_tools_and_schemas() {
     assert!(run.status.success());
     let r1 = run.one(&json!(1));
     let r2 = run.one(&json!(2));
-    assert_eq!(r1["result"], r2["result"], "a cursor must not change the list");
+    assert_eq!(
+        r1["result"], r2["result"],
+        "a cursor must not change the list"
+    );
     assert!(r1["result"].get("nextCursor").is_none_or(Value::is_null));
     let tools = r1["result"]["tools"].as_array().unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     assert_eq!(
         names,
-        ["status", "fork", "checkpoint", "rewind", "conflicts", "land", "preview", "discard"]
+        [
+            "status",
+            "fork",
+            "checkpoint",
+            "rewind",
+            "conflicts",
+            "land",
+            "preview",
+            "discard"
+        ]
     );
     let expect_props: &[(&str, &[&str])] = &[
         ("status", &[]),
@@ -748,10 +875,19 @@ fn tools_list_matches_the_documented_tools_and_schemas() {
         for p in *extra {
             assert!(props.contains_key(*p), "{tool} lacks {p}");
         }
-        assert_eq!(props.len(), 3 + extra.len(), "{tool} has unexpected properties: {props:?}");
+        assert_eq!(
+            props.len(),
+            3 + extra.len(),
+            "{tool} has unexpected properties: {props:?}"
+        );
         for (k, v) in props {
-            let ty = v["type"].as_str().unwrap_or_else(|| panic!("{tool}.{k} has no type"));
-            assert!(["string", "integer", "boolean"].contains(&ty), "{tool}.{k}: {ty}");
+            let ty = v["type"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{tool}.{k} has no type"));
+            assert!(
+                ["string", "integer", "boolean"].contains(&ty),
+                "{tool}.{k}: {ty}"
+            );
         }
         let required: Vec<&str> = schema["required"]
             .as_array()
@@ -777,6 +913,68 @@ fn tools_list_matches_the_documented_tools_and_schemas() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn tools_call_accepts_meta_and_extra_params_fields() {
+    let env = Env::new(5127);
+    let lines = vec![
+        req(
+            json!(1),
+            "tools/call",
+            json!({"name": "status", "arguments": {}, "_meta": {"progressToken": "p1"}}),
+        ),
+        req(
+            json!(2),
+            "tools/call",
+            json!({"name": "status", "arguments": null}),
+        ),
+        req(
+            json!(3),
+            "tools/call",
+            json!({"name": "status", "somethingNew": [1]}),
+        ),
+    ];
+    let run = run_lines(&env, &lines);
+    assert!(run.status.success());
+    for id in 1..=3 {
+        let (is_err, v) = tool_outcome(run.one(&json!(id)));
+        assert!(!is_err, "id {id}: {v}");
+        assert_eq!(v["initialized"], false);
+    }
+}
+
+#[test]
+fn an_idle_server_does_not_hold_the_project_lock() {
+    let env = Env::new(5128);
+    env.init("clone");
+    let mut mcp = env.mcp();
+    initialized(&mut mcp);
+    let (is_err, _) = mcp.call(1, "status", json!({}));
+    assert!(!is_err);
+    // While the server sits idle (and between its calls), other processes
+    // can change the project straight away.
+    let t = Instant::now();
+    let r = env.api("fork", json!({"name": "from-cli"})).unwrap();
+    assert_eq!(r["sessions"][0]["name"], "from-cli");
+    assert!(
+        t.elapsed() < Duration::from_secs(10),
+        "fork waited {:?}",
+        t.elapsed()
+    );
+    // And the server sees the change on its next call.
+    let (is_err, st) = mcp.call(2, "status", json!({}));
+    assert!(!is_err);
+    assert_eq!(st["sessions"][0]["name"], "from-cli", "{st}");
+    let (is_err, cp) = mcp.call(
+        3,
+        "checkpoint",
+        json!({"session": "from-cli", "label": "c1"}),
+    );
+    assert!(!is_err, "{cp}");
+    let out = env.shoal(&["ls"]);
+    assert!(out.contains("from-cli"), "{out}");
+    assert!(mcp.close().success());
+}
+
+#[test]
 fn tools_call_framing_errors_are_invalid_params() {
     let env = Env::new(5119);
     let lines = vec![
@@ -784,7 +982,11 @@ fn tools_call_framing_errors_are_invalid_params() {
         req(json!(2), "tools/call", Value::Null),
         req(json!(3), "tools/call", json!({})),
         req(json!(4), "tools/call", json!({"name": 5})),
-        req(json!(5), "tools/call", json!({"name": null, "arguments": {}})),
+        req(
+            json!(5),
+            "tools/call",
+            json!({"name": null, "arguments": {}}),
+        ),
         req(json!(6), "tools/call", json!(["status"])),
         req(json!(7), "tools/call", json!({"arguments": {}})),
         req(json!(8), "tools/call", json!({"name": {"tool": "status"}})),
@@ -823,7 +1025,6 @@ fn tools_call_bad_arguments_are_in_band_errors_and_create_nothing() {
         ("fork", json!({"count": 0}), "count"),
         ("fork", json!({"count": 9}), "count"),
         ("fork", json!({"count": u64::MAX}), "count"),
-        ("fork", json!({"name": 5}), "name"),
         ("fork", json!({"from": ["main"]}), "from"),
         ("fork", json!({"from": "main", "at": "cp1"}), "at"),
         ("fork", json!({"path": 1}), "path"),
@@ -854,7 +1055,9 @@ fn tools_call_bad_arguments_are_in_band_errors_and_create_nothing() {
         );
     }
     // Unknown-tool errors list the real tools so Claude can recover.
-    let unknown = run.one(&json!(0))["result"]["content"][0]["text"].as_str().unwrap();
+    let unknown = run.one(&json!(0))["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
     assert!(unknown.contains("status") && unknown.contains("fork") && unknown.contains("discard"));
     // None of the rejected calls may have auto-initialised the project.
     assert_no_project(&env);
@@ -870,38 +1073,74 @@ fn tools_needing_a_project_explain_how_to_get_one() {
         call_line(json!(2), "status", Value::Null),
         req(json!(3), "tools/call", json!({"name": "status"})), // no arguments key
         call_line(json!(4), "checkpoint", json!({"session": "a"})),
-        call_line(json!(5), "rewind", json!({"session": "a", "label": "latest"})),
+        call_line(
+            json!(5),
+            "rewind",
+            json!({"session": "a", "label": "latest"}),
+        ),
         call_line(json!(6), "conflicts", json!({})),
         call_line(json!(7), "land", json!({"session": "a"})),
         call_line(json!(8), "preview", json!({"session": "a"})),
         call_line(json!(9), "discard", json!({"session": "a"})),
-        call_line(json!(10), "status", json!({"project": "/definitely/not/here"})),
-        call_line(json!(11), "checkpoint", json!({"path": "/definitely/not/here"})),
-        call_line(json!(12), "fork", json!({"project": outside.to_str().unwrap()})),
+        call_line(
+            json!(10),
+            "status",
+            json!({"project": "/definitely/not/here"}),
+        ),
+        call_line(
+            json!(11),
+            "checkpoint",
+            json!({"path": "/definitely/not/here"}),
+        ),
+        call_line(
+            json!(12),
+            "fork",
+            json!({"project": outside.to_str().unwrap()}),
+        ),
         call_line(json!(13), "fork", json!({"from": "someone", "name": "x"})),
     ];
     let run = run_lines(&env, &lines);
     assert!(run.status.success());
     for id in [1, 2, 3] {
         let (is_err, v) = tool_outcome(run.one(&json!(id)));
-        assert!(!is_err, "status without a project is a report, not an error: {v}");
+        assert!(
+            !is_err,
+            "status without a project is a report, not an error: {v}"
+        );
         assert_eq!(v["initialized"], false);
         assert!(v["next"].as_str().unwrap().contains("fork"), "{v}");
     }
     for id in [4, 5, 6, 7, 8, 9] {
         expect_tool_error(run.one(&json!(id)), "fork");
     }
-    let (is_err, v) = tool_outcome(run.one(&json!(10)));
-    assert!(!is_err);
-    assert_eq!(v["initialized"], false);
-    assert!(v["message"].as_str().unwrap().contains("does not exist"), "{v}");
+    // A project argument that names nothing is a bad argument, not "no
+    // project yet" (which would tell Claude its sessions are gone).
+    expect_tool_error(run.one(&json!(10)), "does not exist");
     expect_tool_error(run.one(&json!(11)), "does not exist");
     expect_tool_error(run.one(&json!(12)), "git");
     expect_tool_error(run.one(&json!(13)), "fork");
     assert_no_project(&env);
 }
 
-// BUG: status turns every error from locating the project into
+// Fixed bug: fork validates `name` only after it has located (and, from main,
+// auto-initialised) the project: `fork {"name": 5}` in a fresh repository
+// clones it, runs the setup command and builds the template, then fails with
+// "name must be a string". A call rejected for a malformed argument should
+// have no side effects; with a slow setup (npm ci) it costs minutes.
+#[test]
+fn fork_with_a_malformed_name_has_no_side_effects() {
+    let env = Env::new(5126);
+    write_config(
+        &env,
+        "setup = \"mkdir -p deps; touch deps/SETUP-RAN\"\nbackend = \"clone\"\nport_base = 5126\n",
+    );
+    let run = run_lines(&env, &[call_line(json!(1), "fork", json!({"name": 5}))]);
+    assert!(run.status.success());
+    expect_tool_error(run.one(&json!(1)), "name");
+    assert_no_project(&env);
+}
+
+// Fixed bug: status turns every error from locating the project into
 // {"initialized": false, "next": "call fork to create the first session"},
 // including malformed arguments (`path: 1`, `project: false`) and a path that
 // does not exist. In a repository that already has a shoal project and
@@ -944,25 +1183,69 @@ fn tool_errors_with_a_project_name_the_fix() {
     let lines = vec![
         call_line(json!(1), "checkpoint", json!({"session": "missing"})),
         call_line(json!(2), "checkpoint", json!({})),
-        call_line(json!(3), "checkpoint", json!({"path": env.repo().to_str().unwrap()})),
-        call_line(json!(4), "rewind", json!({"session": "alpha", "label": "never-made"})),
+        call_line(
+            json!(3),
+            "checkpoint",
+            json!({"path": env.repo().to_str().unwrap()}),
+        ),
+        call_line(
+            json!(4),
+            "rewind",
+            json!({"session": "alpha", "label": "never-made"}),
+        ),
         call_line(json!(5), "fork", json!({"from": "missing"})),
-        call_line(json!(6), "fork", json!({"from": "alpha", "at": "never-made"})),
+        call_line(
+            json!(6),
+            "fork",
+            json!({"from": "alpha", "at": "never-made"}),
+        ),
         call_line(json!(7), "land", json!({"session": "alpha", "test": ""})),
         call_line(json!(8), "preview", json!({"session": "alpha"})),
         call_line(json!(9), "status", json!({"path": format!("{alpha}/src")})),
-        call_line(json!(10), "rewind", json!({"session": "alpha", "label": ""})),
+        call_line(
+            json!(10),
+            "rewind",
+            json!({"session": "alpha", "label": ""}),
+        ),
         call_line(json!(11), "checkpoint", json!({"session": ""})),
         // Argument types that are only checked once the project is open.
-        call_line(json!(20), "checkpoint", json!({"session": "alpha", "label": true})),
+        call_line(
+            json!(20),
+            "checkpoint",
+            json!({"session": "alpha", "label": true}),
+        ),
         call_line(json!(21), "checkpoint", json!({"session": 7})),
-        call_line(json!(22), "preview", json!({"session": "alpha", "stop": "yes"})),
-        call_line(json!(23), "discard", json!({"session": "alpha", "keep_work": "false"})),
+        call_line(
+            json!(22),
+            "preview",
+            json!({"session": "alpha", "stop": "yes"}),
+        ),
+        call_line(
+            json!(23),
+            "discard",
+            json!({"session": "alpha", "keep_work": "false"}),
+        ),
         call_line(json!(24), "discard", json!({"session": {"name": "alpha"}})),
-        call_line(json!(25), "land", json!({"session": "alpha", "timeout_secs": "10"})),
-        call_line(json!(26), "land", json!({"session": "alpha", "timeout_secs": -5})),
-        call_line(json!(27), "land", json!({"session": "alpha", "commit_message": 5})),
-        call_line(json!(28), "land", json!({"session": "alpha", "into": false})),
+        call_line(
+            json!(25),
+            "land",
+            json!({"session": "alpha", "timeout_secs": "10"}),
+        ),
+        call_line(
+            json!(26),
+            "land",
+            json!({"session": "alpha", "timeout_secs": -5}),
+        ),
+        call_line(
+            json!(27),
+            "land",
+            json!({"session": "alpha", "commit_message": 5}),
+        ),
+        call_line(
+            json!(28),
+            "land",
+            json!({"session": "alpha", "into": false}),
+        ),
         call_line(json!(29), "rewind", json!({"session": "alpha", "label": 3})),
     ];
     let run = run_lines(&env, &lines);
@@ -981,8 +1264,14 @@ fn tool_errors_with_a_project_name_the_fix() {
     let (is_err, st) = tool_outcome(run.one(&json!(9)));
     assert!(!is_err, "{st}");
     assert_eq!(st["current_session"], "alpha", "{st}");
-    assert!(tool_outcome(run.one(&json!(10))).0, "an empty label must be an error");
-    assert!(tool_outcome(run.one(&json!(11))).0, "an empty session must be an error");
+    assert!(
+        tool_outcome(run.one(&json!(10))).0,
+        "an empty label must be an error"
+    );
+    assert!(
+        tool_outcome(run.one(&json!(11))).0,
+        "an empty session must be an error"
+    );
     for (id, needle) in [
         (20, "label"),
         (21, "session"),
@@ -1036,11 +1325,26 @@ fn stdout_stays_pure_when_fork_auto_initialises_with_a_noisy_setup() {
         );
         assert!(!is_err, "[{backend}] {land}");
         assert_eq!(land["status"], "landed", "[{backend}] {land}");
+        // A dev server that prints to stdout, behind the gateway.
+        let (is_err, pv) = mcp.call(
+            4,
+            "preview",
+            json!({"session": "noisy", "command": "echo PREVIEW-NOISE; exec sleep 30"}),
+        );
+        assert!(!is_err, "[{backend}] {pv}");
+        assert_eq!(
+            pv["url"],
+            format!("http://localhost:{port}"),
+            "[{backend}] {pv}"
+        );
         let (is_err, st) = mcp.call(3, "status", json!({}));
         assert!(!is_err);
         assert_eq!(st["backend"], backend);
         // Nothing else may be on stdout (next_message panics on non-JSON).
-        assert!(mcp.next_message(Duration::from_millis(300)).is_none(), "[{backend}] stray output");
+        assert!(
+            mcp.next_message(Duration::from_millis(300)).is_none(),
+            "[{backend}] stray output"
+        );
         assert!(mcp.close().success());
         assert_eq!(read(env.repo().join("feature.txt")), "x\n");
     }
@@ -1060,7 +1364,11 @@ fn setup_that_reads_stdin_cannot_steal_protocol_bytes() {
         // Write the fork and the following requests in one go, so they are
         // sitting in the pipe while setup runs.
         let lines = vec![
-            req(json!(0), "initialize", json!({"protocolVersion": "2025-06-18"})),
+            req(
+                json!(0),
+                "initialize",
+                json!({"protocolVersion": "2025-06-18"}),
+            ),
             call_line(json!(1), "fork", json!({"name": "s"})),
             req_np(json!(2), "ping"),
             req_np(json!(3), "tools/list"),
@@ -1071,15 +1379,65 @@ fn setup_that_reads_stdin_cannot_steal_protocol_bytes() {
         let (is_err, v) = tool_outcome(run.one(&json!(1)));
         assert!(!is_err, "[{backend}] {v}");
         let path = PathBuf::from(v["sessions"][0]["path"].as_str().unwrap());
-        assert_eq!(read(path.join("deps/stdin.txt")), "", "[{backend}] setup read protocol bytes");
+        assert_eq!(
+            read(path.join("deps/stdin.txt")),
+            "",
+            "[{backend}] setup read protocol bytes"
+        );
         assert_eq!(run.one(&json!(2))["result"], json!({}));
-        assert_eq!(run.one(&json!(3))["result"]["tools"].as_array().unwrap().len(), 8);
+        assert_eq!(
+            run.one(&json!(3))["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .len(),
+            8
+        );
         // status may run before or after the fork; either way it is a report.
         assert!(!tool_outcome(run.one(&json!(4))).0);
         assert!(!run.raw_stdout.contains("PARTIAL"), "[{backend}]");
         assert!(!run.raw_stdout.contains("after-cat"), "[{backend}]");
         assert_eq!(run.messages.len(), 5, "[{backend}] {:?}", run.messages);
     }
+}
+
+// Fixed bug: services started by a long-lived `shoal mcp` process are its
+// children, and nothing ever waits on them. When preview stop (or rewind,
+// discard) sends SIGTERM, the dev server dies but stays a zombie of the MCP
+// server, `kill(-pgid, 0)` keeps succeeding, and stop_all reports "process
+// group N did not stop" (isError) after waiting ~5 s. Through the CLI the
+// short-lived shoal process exits, so init reaps the child and this never
+// shows. Seen with `ps`: `[sleep] <defunct>` whose parent is `shoal mcp`.
+#[test]
+fn services_started_through_mcp_can_be_stopped_through_mcp() {
+    let env = Env::new(5144);
+    env.init("clone");
+    env.api("fork", json!({"name": "web"})).unwrap();
+    let mut mcp = env.mcp();
+    initialized(&mut mcp);
+    let (is_err, pv) = mcp.call(
+        1,
+        "preview",
+        json!({"session": "web", "command": "exec sleep 30"}),
+    );
+    assert!(!is_err, "{pv}");
+    // Stopping it in the same server process must work.
+    let (is_err, stopped) = mcp.call(2, "preview", json!({"session": "web", "stop": true}));
+    assert!(!is_err, "preview stop failed: {stopped}");
+    assert_eq!(stopped["stopped"], 1, "{stopped}");
+    // Start again, then checkpoint and rewind, which stop and restart it.
+    let (is_err, pv) = mcp.call(
+        3,
+        "preview",
+        json!({"session": "web", "command": "exec sleep 30"}),
+    );
+    assert!(!is_err, "{pv}");
+    let (is_err, cp) = mcp.call(4, "checkpoint", json!({"session": "web", "label": "c"}));
+    assert!(!is_err, "{cp}");
+    let (is_err, rw) = mcp.call(5, "rewind", json!({"session": "web", "label": "c"}));
+    assert!(!is_err, "rewind with a running preview failed: {rw}");
+    let (is_err, d) = mcp.call(6, "discard", json!({"session": "web"}));
+    assert!(!is_err, "discard with a running preview failed: {d}");
+    assert!(mcp.close().success());
 }
 
 // ---------------------------------------------------------------------------
@@ -1117,14 +1475,21 @@ fn slow_land_does_not_block_status_and_ids_match_out_of_order() {
             got.push(m);
         }
         let ids: Vec<Value> = order.iter().map(|(id, _)| id.clone()).collect();
-        assert_eq!(ids.last().unwrap(), "land", "[{backend}] land must answer last: {order:?}");
+        assert_eq!(
+            ids.last().unwrap(),
+            "land",
+            "[{backend}] land must answer last: {order:?}"
+        );
         let status_at = order.iter().find(|(id, _)| id == &json!(11)).unwrap().1;
         let land_at = order.iter().find(|(id, _)| id == "land").unwrap().1;
         assert!(
             status_at < Duration::from_millis(1900),
             "[{backend}] status waited for land's tests: {order:?}"
         );
-        assert!(land_at >= Duration::from_secs(2), "[{backend}] tests did not run? {order:?}");
+        assert!(
+            land_at >= Duration::from_secs(2),
+            "[{backend}] tests did not run? {order:?}"
+        );
         let status = got.iter().find(|m| m["id"] == 11).unwrap();
         let (is_err, st) = tool_outcome(status);
         assert!(!is_err, "{st}");
@@ -1155,7 +1520,12 @@ fn many_concurrent_calls_get_exactly_one_well_formed_answer_each() {
         input.push_str(&line);
         input.push('\n');
     }
-    let run = run_bytes_in(&env, &env.repo(), input.into_bytes(), Duration::from_secs(60));
+    let run = run_bytes_in(
+        &env,
+        &env.repo(),
+        input.into_bytes(),
+        Duration::from_secs(60),
+    );
     assert!(run.status.success());
     assert_eq!(run.messages.len(), n, "{:?}", run.messages);
     for i in 0..n {
@@ -1179,7 +1549,11 @@ fn concurrent_forks_auto_initialise_once_and_get_unique_names() {
     );
     // Six forks with the same name, all in flight at once, before any
     // project exists: one init, six distinct sessions.
-    let mut lines = vec![req(json!(0), "initialize", json!({"protocolVersion": "2025-06-18"}))];
+    let mut lines = vec![req(
+        json!(0),
+        "initialize",
+        json!({"protocolVersion": "2025-06-18"}),
+    )];
     for i in 1..=6 {
         lines.push(call_line(json!(i), "fork", json!({"name": "same"})));
     }
@@ -1225,7 +1599,11 @@ fn closing_stdin_with_a_call_in_flight_answers_it_then_exits_zero() {
     let path = PathBuf::from(forked["sessions"][0]["path"].as_str().unwrap());
     fs::write(path.join("bye.txt"), "bye\n").unwrap();
     let lines = vec![
-        req(json!(0), "initialize", json!({"protocolVersion": "2026-07-28"})),
+        req(
+            json!(0),
+            "initialize",
+            json!({"protocolVersion": "2026-07-28"}),
+        ),
         notif("notifications/initialized", json!({})),
         call_line(
             json!(7),
@@ -1237,14 +1615,19 @@ fn closing_stdin_with_a_call_in_flight_answers_it_then_exits_zero() {
     // run_lines closes stdin straight after writing.
     let run = run_lines(&env, &lines);
     assert_eq!(run.status.code(), Some(0), "stderr: {}", run.stderr);
-    assert!(run.elapsed >= Duration::from_secs(2), "exited before the land finished");
+    assert!(
+        run.elapsed >= Duration::from_secs(2),
+        "exited before the land finished"
+    );
     let (is_err, land) = tool_outcome(run.one(&json!(7)));
     assert!(!is_err, "{land}");
     assert_eq!(land["status"], "landed", "{land}");
     assert!(!tool_outcome(run.one(&json!(8))).0);
     assert_eq!(read(env.repo().join("bye.txt")), "bye\n");
     // The landed branch is recorded and no lock is left behind: a new call works.
-    assert!(env.git(&env.repo(), &["branch", "--list", "shoal/bye"]).contains("shoal/bye"));
+    assert!(env
+        .git(&env.repo(), &["branch", "--list", "shoal/bye"])
+        .contains("shoal/bye"));
     let st = env.api("status", json!({})).unwrap();
     assert_eq!(st["initialized"], true);
 }
@@ -1255,7 +1638,11 @@ fn closing_stdin_with_nothing_in_flight_exits_zero_promptly() {
     let run = run_bytes_in(&env, &env.repo(), Vec::new(), Duration::from_secs(10));
     assert_eq!(run.status.code(), Some(0));
     assert!(run.messages.is_empty());
-    assert!(run.elapsed < Duration::from_secs(5), "took {:?}", run.elapsed);
+    assert!(
+        run.elapsed < Duration::from_secs(5),
+        "took {:?}",
+        run.elapsed
+    );
     // Only a notification, then EOF.
     let run = run_lines(&env, &[notif("notifications/initialized", json!({}))]);
     assert_eq!(run.status.code(), Some(0));
@@ -1269,7 +1656,10 @@ fn closing_stdin_during_auto_initialising_fork_leaves_a_consistent_project() {
         &env,
         "setup = \"sleep 2; mkdir -p deps; echo ready > deps/ok\"\nbackend = \"clone\"\nport_base = 5182\n",
     );
-    let run = run_lines(&env, &[call_line(json!(1), "fork", json!({"name": "late"}))]);
+    let run = run_lines(
+        &env,
+        &[call_line(json!(1), "fork", json!({"name": "late"}))],
+    );
     assert_eq!(run.status.code(), Some(0), "{}", run.stderr);
     let (is_err, v) = tool_outcome(run.one(&json!(1)));
     assert!(!is_err, "{v}");
@@ -1288,7 +1678,9 @@ fn very_large_status_result_arrives_intact_on_one_line() {
     let env = Env::new(5183);
     env.init("clone");
     for _ in 0..3 {
-        let r = env.api("fork", json!({"name": "bulk", "count": 8})).unwrap();
+        let r = env
+            .api("fork", json!({"name": "bulk", "count": 8}))
+            .unwrap();
         assert_eq!(r["sessions"].as_array().unwrap().len(), 8, "{r}");
         assert!(r.get("error").is_none_or(Value::is_null), "{r}");
     }
@@ -1322,7 +1714,12 @@ fn very_large_status_result_arrives_intact_on_one_line() {
     // conflicts on the same big project is also delivered whole.
     let (is_err, c) = mcp.call(2, "conflicts", json!({}));
     assert!(!is_err, "{c}");
-    assert_eq!(c["changed"].as_array().unwrap().len(), 24, "{}", c.to_string().len());
+    assert_eq!(
+        c["changed"].as_array().unwrap().len(),
+        24,
+        "{}",
+        c.to_string().len()
+    );
     assert!(mcp.next_message(Duration::from_millis(200)).is_none());
     assert!(mcp.close().success());
 }

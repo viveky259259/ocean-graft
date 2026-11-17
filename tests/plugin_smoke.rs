@@ -10,7 +10,9 @@ fn harness_drives_api_mcp_and_hooks() {
     env.init("clone");
     let forked = env.api("fork", json!({"name": "a"})).unwrap();
     let path = forked["sessions"][0]["path"].as_str().unwrap().to_string();
-    assert!(std::path::Path::new(&path).join("deps/installed.txt").exists());
+    assert!(std::path::Path::new(&path)
+        .join("deps/installed.txt")
+        .exists());
 
     let mut mcp = env.mcp();
     let init = mcp.initialize();
@@ -18,10 +20,22 @@ fn harness_drives_api_mcp_and_hooks() {
     let (err, status) = mcp.call(1, "status", json!({}));
     assert!(!err, "{status}");
     assert_eq!(status["sessions"][0]["name"], "a");
-    assert!(mcp.next_message(Duration::from_millis(200)).is_none(), "no stray output");
+    assert!(
+        mcp.next_message(Duration::from_millis(200)).is_none(),
+        "no stray output"
+    );
     assert!(mcp.close().success());
 
-    let r = env.hook("worktree-create", &json!({"name": "from-hook"}), &env.repo(), None);
+    let r = env.hook(
+        "worktree-create",
+        &json!({"name": "from-hook"}),
+        &env.repo(),
+        None,
+    );
     assert_eq!(r.code, 0, "{}", r.stderr);
-    assert!(r.last_line().ends_with("/sessions/from-hook"), "{}", r.stdout);
+    assert!(
+        r.last_line().ends_with("/sessions/from-hook"),
+        "{}",
+        r.stdout
+    );
 }

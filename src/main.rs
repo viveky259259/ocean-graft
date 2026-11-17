@@ -232,8 +232,12 @@ struct InitArgs {
     #[arg(long, value_enum)]
     backend: Option<Backend>,
     /// First port handed to sessions; each session gets a block of ten
-    #[arg(long, default_value_t = 4100)]
+    #[arg(long, default_value_t = 4100, value_parser = clap::value_parser!(u16).range(1..=i64::from(shoal_port_max())))]
     port_base: u16,
+}
+
+const fn shoal_port_max() -> u16 {
+    config::PORT_BASE_MAX
 }
 
 fn main() {
