@@ -57,6 +57,8 @@ pub struct Report {
     pub quiet_pairs: usize,
     pub sessions_resnapshotted: usize,
     pub pairs_merged: usize,
+    /// Sessions left out because they could not be read, with the reason.
+    pub skipped: Vec<(String, String)>,
 }
 
 fn fnv(bytes: &[u8], mut hash: u64) -> u64 {
@@ -250,9 +252,15 @@ pub fn check(p: &Project) -> Result<Report> {
         .unwrap_or_default();
 
     // 1. Fingerprint every session; snapshot only the ones that changed.
+    // A broken session (directory gone, unmountable) is reported, not
+    // allowed to hide the overlaps between the others.
     let mut sessions = Vec::new();
+    let mut skipped = Vec::new();
     for (name, s) in &p.state.sessions {
-        sessions.push((name.clone(), p.ensure_ready(name)?, s.base_commit.clone()));
+        match p.ensure_ready(name) {
+            Ok(path) => sessions.push((name.clone(), path, s.base_commit.clone())),
+            Err(err) => skipped.push((name.clone(), format!("{err:#}"))),
+        }
     }
     let entries = parallel(
         &sessions,
@@ -272,7 +280,13 @@ pub fn check(p: &Project) -> Result<Report> {
     let mut current: BTreeMap<String, SessionEntry> = BTreeMap::new();
     let mut resnapshotted = 0;
     for ((name, _, _), entry) in sessions.iter().zip(entries) {
-        let (entry, fresh) = entry?;
+        let (entry, fresh) = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                skipped.push((name.clone(), format!("{err:#}")));
+                continue;
+            }
+        };
         resnapshotted += usize::from(fresh);
         current.insert(name.clone(), entry);
     }
@@ -355,6 +369,7 @@ pub fn check(p: &Project) -> Result<Report> {
         quiet_pairs,
         sessions_resnapshotted: resnapshotted,
         pairs_merged: todo.len(),
+        skipped,
     })
 }
 

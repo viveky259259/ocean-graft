@@ -2061,7 +2061,7 @@ fn unknown_events_are_rejected_and_hooks_json_matches() {
             "{claude_event} runs {cmd:?}"
         );
         // The wrapper, pointed at this build, runs the event.
-        let wrapper = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin/bin/shoal-plugin");
+        let wrapper = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin/libexec/shoal-plugin");
         let mut c = env.command(wrapper.to_str().unwrap(), &repo);
         c.args(["hook", shoal_event])
             .env("SHOAL_BIN", BIN)

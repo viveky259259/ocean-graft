@@ -100,24 +100,49 @@ pub fn process_alive(pid: u32) -> bool {
 
 /// Wait for `job.slots` slots and hold them until the returned value is dropped.
 /// `on_wait` is called once, with the queue's state, if the job has to wait.
-pub fn acquire(job: &Job, mut on_wait: impl FnMut(&Status)) -> Result<Held> {
+pub fn acquire(job: &Job, on_wait: impl FnMut(&Status)) -> Result<Held> {
+    acquire_until(job, None, on_wait)
+}
+
+/// Like `acquire`, but give up with an error at `deadline`.
+pub fn acquire_until(
+    job: &Job,
+    deadline: Option<Instant>,
+    mut on_wait: impl FnMut(&Status),
+) -> Result<Held> {
+    let too_late = || deadline.is_some_and(|d| Instant::now() >= d);
     let dir = dir()?;
     let total = slot_count()?;
     let want = job.slots.clamp(1, total);
-    let waiting_file = dir.join("waiting").join(format!("{}.json", job.pid));
+    // One process (the MCP server) can queue several jobs at once.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let waiting_file = dir.join("waiting").join(format!("{}-{n}.json", job.pid));
     std::fs::write(&waiting_file, serde_json::to_vec(job)?)?;
 
     let result = (|| -> Result<Held> {
         let room = open_lock(dir.join("room.lock"))?;
         let mut announced = false;
-        // Blocking: waiters line up here.
+        // Waiters line up here (polling when there is a deadline).
+        let flags = if deadline.is_some() {
+            libc::LOCK_EX | libc::LOCK_NB
+        } else {
+            libc::LOCK_EX
+        };
         loop {
-            if unsafe { libc::flock(room.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            if unsafe { libc::flock(room.as_raw_fd(), flags) } == 0 {
                 break;
             }
             let err = std::io::Error::last_os_error();
-            if err.raw_os_error() != Some(libc::EINTR) {
-                return Err(err).context("could not join the queue");
+            match err.raw_os_error() {
+                Some(libc::EINTR) => {}
+                Some(libc::EWOULDBLOCK) => {
+                    if too_late() {
+                        bail!("gave up waiting for a queue slot (time limit reached)");
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                _ => return Err(err).context("could not join the queue"),
             }
         }
         let mut locks: Vec<(usize, File)> = Vec::new();
@@ -137,6 +162,9 @@ pub fn acquire(job: &Job, mut on_wait: impl FnMut(&Status)) -> Result<Held> {
             }
             if locks.len() == want {
                 break;
+            }
+            if too_late() {
+                bail!("gave up waiting for a queue slot (time limit reached)");
             }
             if !announced && start.elapsed() > Duration::from_millis(50) {
                 announced = true;

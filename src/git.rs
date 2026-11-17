@@ -7,7 +7,12 @@ use std::process::Command;
 
 pub fn command(dir: &Path) -> Command {
     let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(dir).env("GIT_TERMINAL_PROMPT", "0");
+    // GIT_OPTIONAL_LOCKS=0: shoal's own `git status` calls must not take
+    // index.lock and make an agent's concurrent `git commit` fail.
+    cmd.arg("-C")
+        .arg(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0");
     cmd
 }
 

@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "shoal": {
-      "command": "${CLAUDE_PLUGIN_ROOT}/bin/shoal-plugin",
+      "command": "${CLAUDE_PLUGIN_ROOT}/libexec/shoal-plugin",
       "args": ["mcp"]
     }
   }

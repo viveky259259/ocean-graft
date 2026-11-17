@@ -48,8 +48,24 @@ pub fn group_alive(pgid: i32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// Whether process group `pgid`, started at `start`, is still ours and
+/// alive. If its leader still exists but started at another time, the pid
+/// was reused by an unrelated process: not ours, never to be signalled. (If
+/// the leader is gone, the remaining members are ours: a pid is never
+/// handed out while a process group of that id exists.)
+pub fn owned_group_alive(pgid: i32, start: Option<&str>) -> bool {
+    if let (Some(start), Some(now)) = (start, sys::process_start(pgid)) {
+        if now != start {
+            return false;
+        }
+    }
+    group_alive(pgid)
+}
+
 pub fn gateway_running(service: &Service) -> bool {
-    service.gateway.is_some_and(group_alive)
+    service
+        .gateway
+        .is_some_and(|g| owned_group_alive(g, service.gateway_start.as_deref()))
 }
 
 /// A longer label for listings: idle on-demand services wake on request.
@@ -110,12 +126,14 @@ pub fn start_gateway(p: &Project, session: &Session, service: &mut Service) -> R
         );
     }
     service.gateway = Some(child.id() as i32);
+    service.gateway_start = sys::process_start(child.id() as i32);
     Ok(())
 }
 
 pub fn stop_gateway(service: &mut Service) {
+    let start = service.gateway_start.take();
     if let Some(g) = service.gateway.take() {
-        if group_alive(g) {
+        if owned_group_alive(g, start.as_deref()) {
             unsafe { libc::kill(-g, libc::SIGTERM) };
             wait_for(&[g], Duration::from_secs(3));
             if group_alive(g) {
@@ -128,7 +146,7 @@ pub fn stop_gateway(service: &mut Service) {
 
 pub fn state(service: &Service) -> State {
     match service.pid {
-        Some(pgid) if group_alive(pgid) => State::Running,
+        Some(pgid) if owned_group_alive(pgid, service.pid_start.as_deref()) => State::Running,
         Some(_) => State::Exited,
         None if service.stopped_for_idle => State::StoppedIdle,
         None => State::Stopped,
@@ -206,6 +224,7 @@ pub fn start(p: &Project, session: &Session, service: &mut Service) -> Result<()
         );
     }
     service.pid = Some(child.id() as i32);
+    service.pid_start = sys::process_start(child.id() as i32);
     service.started_at = sys::now();
     service.stopped_for_idle = false;
     Ok(())
@@ -223,7 +242,14 @@ fn wait_for(groups: &[i32], within: Duration) {
 /// matters because real dev servers take a second or two to shut down.
 /// Returns the memory each service was using (KB), in the same order.
 pub fn stop_all(services: Vec<&mut Service>) -> Result<Vec<u64>> {
-    let groups: Vec<i32> = services.iter().filter_map(|s| s.pid).collect();
+    // Only groups that are still ours: a stale pid may belong to anyone now.
+    let groups: Vec<i32> = services
+        .iter()
+        .filter_map(|s| {
+            s.pid
+                .filter(|g| owned_group_alive(*g, s.pid_start.as_deref()))
+        })
+        .collect();
     let rss: Vec<u64> = services
         .iter()
         .map(|s| s.pid.map(group_rss_kb).unwrap_or(0))
@@ -245,6 +271,7 @@ pub fn stop_all(services: Vec<&mut Service>) -> Result<Vec<u64>> {
     }
     for service in services {
         service.pid = None;
+        service.pid_start = None;
     }
     Ok(rss)
 }
@@ -417,6 +444,8 @@ pub fn serve(
         stopped_for_idle: false,
         internal_port: None,
         gateway: existing.as_ref().and_then(|e| e.gateway),
+        pid_start: None,
+        gateway_start: existing.as_ref().and_then(|e| e.gateway_start.clone()),
     };
     if on_demand {
         svc.internal_port = match existing.as_ref().and_then(|e| e.internal_port) {

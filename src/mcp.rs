@@ -10,9 +10,10 @@ use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::sync::{Arc, Mutex};
 
-/// Revisions this server is known to speak. The tools-only subset used here
-/// is the same in all of them, so a client asking for another revision gets
-/// its own revision echoed back.
+/// Revisions this server speaks. The tools-only subset used here is the
+/// same in all of them. A client asking for another revision is answered
+/// with the newest of these, as the protocol requires; the client decides
+/// whether it can use it.
 pub const KNOWN_PROTOCOLS: &[&str] = &[
     "2024-11-05",
     "2025-03-26",
@@ -73,15 +74,15 @@ pub fn handle(msg: &Value, on_call: &mut dyn FnMut(Value, String, Value)) -> Opt
             let asked = params
                 .get("protocolVersion")
                 .and_then(Value::as_str)
+                .filter(|v| !v.is_empty())
                 .unwrap_or(FALLBACK_PROTOCOL);
-            let version = if asked.is_empty() {
-                FALLBACK_PROTOCOL
-            } else {
+            let version = if KNOWN_PROTOCOLS.contains(&asked) {
                 asked
+            } else {
+                let newest = KNOWN_PROTOCOLS.last().copied().unwrap_or(FALLBACK_PROTOCOL);
+                eprintln!("shoal mcp: client asked for protocol {asked:?}, which shoal does not know; offering {newest}");
+                newest
             };
-            if !KNOWN_PROTOCOLS.contains(&version) {
-                eprintln!("shoal mcp: client asked for protocol {version}, which shoal has not been tested with; answering in kind");
-            }
             Some(result(
                 id,
                 json!({
@@ -201,8 +202,15 @@ mod tests {
     }
 
     #[test]
-    fn initialize_echoes_the_requested_revision() {
-        for v in KNOWN_PROTOCOLS.iter().chain(["2099-01-01"].iter()) {
+    fn initialize_echoes_a_known_revision_and_offers_the_newest_otherwise() {
+        let (r, _) = run(
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2099-01-01"}}),
+        );
+        assert_eq!(
+            r.unwrap()["result"]["protocolVersion"],
+            *KNOWN_PROTOCOLS.last().unwrap()
+        );
+        for v in KNOWN_PROTOCOLS {
             let (r, _) = run(
                 json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":v,"capabilities":{},"clientInfo":{"name":"t","version":"0"}}}),
             );

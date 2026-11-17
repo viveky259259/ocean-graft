@@ -1274,8 +1274,16 @@ fn failed_refresh_keeps_the_previous_generation_and_recovers_after_a_fix() {
 
         write(env.repo().join("deps.lock"), "broken\n");
         commit_all(&env, "break deps");
-        let err = fork(&env).expect_err("setup fails on the new commit");
-        assert!(err.contains("setup"), "[{backend}] {err}");
+        // A failing refresh does not block work: the fork starts from the
+        // last good template and says why.
+        let fallback = fork_ok(&env);
+        let why = fallback["refresh_error"].as_str().unwrap_or_default();
+        assert!(why.contains("setup"), "[{backend}] {fallback}");
+        assert_eq!(fallback["sessions"][0]["generation"], 1, "[{backend}]");
+        let fallback_name = fallback["sessions"][0]["name"]
+            .as_str()
+            .unwrap()
+            .to_string();
         let pd = env.project_dir();
         assert_eq!(generations(&env), 1, "[{backend}]");
         assert!(
@@ -1294,10 +1302,17 @@ fn failed_refresh_keeps_the_previous_generation_and_recovers_after_a_fix() {
         let st = status(&env);
         assert_eq!(
             st["sessions"].as_array().unwrap().len(),
-            1,
-            "[{backend}] no extra session: {st}"
+            2,
+            "[{backend}] the earlier session and the fallback: {st}"
         );
         assert_eq!(st["template"]["behind_source"], true);
+        call(
+            &env,
+            &env.repo(),
+            "discard",
+            json!({"session": fallback_name, "keep_work": false}),
+        )
+        .unwrap();
         assert_eq!(
             read(spath(&a).join("work.txt")),
             "in progress\n",
@@ -1364,11 +1379,22 @@ fn tracked_branch_that_disappears_is_a_clear_error_and_existing_sessions_survive
     commit_all(&env, "toml");
     let a = fork_ok(&env);
     env.git(&env.repo(), &["branch", "-m", "main", "trunk"]);
-    let err = fork(&env).expect_err("main is gone");
-    assert!(err.contains("main"), "{err}");
+    // The refresh fails and says why; the fork still works from the last
+    // good template.
+    let r = fork_ok(&env);
+    let why = r["refresh_error"].as_str().unwrap_or_default();
+    assert!(why.contains("main"), "{r}");
+    let fallback = r["sessions"][0]["name"].as_str().unwrap().to_string();
     let st = status(&env);
     assert_eq!(st["initialized"], true);
-    assert_eq!(st["sessions"].as_array().unwrap().len(), 1, "{st}");
+    assert_eq!(st["sessions"].as_array().unwrap().len(), 2, "{st}");
+    call(
+        &env,
+        &env.repo(),
+        "discard",
+        json!({"session": fallback, "keep_work": false}),
+    )
+    .unwrap();
     assert!(spath(&a).join("deps/installed.txt").exists());
     env.git(&env.repo(), &["branch", "-m", "trunk", "main"]);
     let r = fork_ok(&env);

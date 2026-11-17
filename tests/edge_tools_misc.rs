@@ -668,7 +668,7 @@ fn conflicts_with_zero_and_one_session_has_the_full_shape() {
     let v = ok(env.api("conflicts", json!({})), "conflicts");
     assert_eq!(
         v,
-        json!({"changed": [], "pairs": [], "pairs_without_shared_files": 0})
+        json!({"changed": [], "pairs": [], "pairs_without_shared_files": 0, "skipped": []})
     );
     let (a, _, _) = fork(&env, "a");
     fs::write(a.join("src/app.txt"), "x\n").unwrap();
@@ -1789,15 +1789,27 @@ fn discard_a_session_whose_directory_is_missing() {
     let (a, _, _) = fork(&env, "a");
     fork(&env, "b");
     fs::remove_dir_all(&a).unwrap();
-    // Saving is impossible: the error says why, and nothing is removed.
-    let e = err(env.api("discard", json!({"session": "a"})), "discard keep");
-    assert!(e.contains("missing"), "{e}");
-    assert_eq!(session_names(&env).len(), 2);
-    // keep_work=false still cleans it up.
-    ok(
-        env.api("discard", json!({"session": "a", "keep_work": false})),
-        "discard force",
+    // status points at the fix for the broken session and still reports b.
+    let st = ok(env.api("status", json!({})), "status with a broken session");
+    let broken = st["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "a")
+        .unwrap()
+        .clone();
+    assert!(
+        broken["error"]
+            .as_str()
+            .unwrap()
+            .contains("keep_work: false"),
+        "{broken}"
     );
+    // Nothing is left to save: discard (even keeping work) clears the record
+    // and says so.
+    let v = ok(env.api("discard", json!({"session": "a"})), "discard keep");
+    assert_eq!(v["already_gone"], true, "{v}");
+    assert!(v["saved"].is_null(), "{v}");
     assert_eq!(session_names(&env), vec!["b".to_string()]);
     let v = ok(env.api("status", json!({})), "status after cleanup");
     assert_eq!(v["sessions"].as_array().unwrap().len(), 1);

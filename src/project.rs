@@ -89,6 +89,13 @@ pub struct Service {
     /// The gateway's process group, for on-demand services.
     #[serde(default)]
     pub gateway: Option<i32>,
+    /// When the process `pid` (and `gateway`) started, as the OS reports it.
+    /// A pid can be reused after a reboot or a long time; a mismatch means
+    /// the process is no longer ours and must never be signalled.
+    #[serde(default)]
+    pub pid_start: Option<String>,
+    #[serde(default)]
+    pub gateway_start: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -107,6 +114,11 @@ pub struct Session {
     /// Last time shoal ran something in the session (exec, run, serve, touch...).
     #[serde(default)]
     pub last_active: u64,
+    /// Made by the WorktreeCreate hook. Claude Code does not send
+    /// WorktreeRemove for subagent worktrees, so shoal removes these itself
+    /// (saving their work) once they have been idle for a long time.
+    #[serde(default)]
+    pub worktree: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -329,17 +341,79 @@ impl Project {
         if state.version != STATE_VERSION {
             bail!("project state version {} is not supported", state.version);
         }
-        Ok(Project {
+        let project = Project {
             dir,
             state,
             _lock: lock,
-        })
+        };
+        project.recover_interrupted_rewinds();
+        Ok(project)
     }
 
+    /// A clone-backend rewind copies the checkpoint to restore-<name>-<pid>,
+    /// then swaps it in, moving the old session to trash-<name>-<pid>, all
+    /// under the project lock. Holding the lock now means no rewind is
+    /// running, so these are left by one that was killed: a restore copy is
+    /// discarded; a trash directory is put back if the session directory is
+    /// missing, and otherwise the swap finished and it is garbage.
+    fn recover_interrupted_rewinds(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let file = entry.file_name().to_string_lossy().into_owned();
+            if let Some(rest) = file.strip_prefix("restore-") {
+                // A checkpoint copy that never got swapped in.
+                if rest
+                    .rsplit_once('-')
+                    .is_some_and(|(_, pid)| pid.parse::<u32>().is_ok())
+                {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+                continue;
+            }
+            let Some(rest) = file.strip_prefix("trash-") else {
+                continue;
+            };
+            let Some((name, pid)) = rest.rsplit_once('-') else {
+                continue;
+            };
+            if pid.parse::<u32>().is_err() || !self.state.sessions.contains_key(name) {
+                continue;
+            }
+            let session = self.session_path(name);
+            let result = if session.symlink_metadata().is_err() {
+                eprintln!("shoal: restoring session {name} after an interrupted rewind");
+                std::fs::rename(entry.path(), &session)
+            } else {
+                std::fs::remove_dir_all(entry.path())
+            };
+            if let Err(err) = result {
+                eprintln!(
+                    "shoal: could not clean up {}: {err}",
+                    entry.path().display()
+                );
+            }
+        }
+    }
+
+    /// Replace state.json atomically and durably: write a temporary file,
+    /// fsync it, rename it over the old one, fsync the directory. A crash or
+    /// power loss leaves either the old state or the new one, never an empty
+    /// file.
     pub fn save(&self) -> Result<()> {
+        use std::io::Write;
         let tmp = self.dir.join("state.json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&self.state)?)?;
+        {
+            let mut f =
+                File::create(&tmp).with_context(|| format!("could not write {}", tmp.display()))?;
+            f.write_all(&serde_json::to_vec_pretty(&self.state)?)?;
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp, self.dir.join("state.json"))?;
+        if let Ok(dir) = File::open(&self.dir) {
+            let _ = dir.sync_all();
+        }
         Ok(())
     }
 
@@ -403,13 +477,28 @@ impl Project {
     /// The first free port of port_base, port_base + 10, ... (each session
     /// has ten: its own and nine for extra services).
     pub fn next_port(&self) -> Result<u16> {
-        let used: HashSet<u16> = self.state.sessions.values().map(|s| s.port).collect();
+        let mut used: HashSet<u16> = self.state.sessions.values().map(|s| s.port).collect();
+        // Sessions of other projects on this machine own their blocks too.
+        // Read without their locks: a slightly stale view only costs a skip.
+        for dir in all_projects().unwrap_or_default() {
+            if dir == self.dir {
+                continue;
+            }
+            if let Some(state) = std::fs::read(dir.join("state.json"))
+                .ok()
+                .and_then(|raw| serde_json::from_slice::<State>(&raw).ok())
+            {
+                used.extend(state.sessions.values().map(|s| s.port));
+            }
+        }
+        // And a port something else already listens on is no use either.
+        let busy = |port: u16| std::net::TcpListener::bind(("127.0.0.1", port)).is_err();
         let base = u32::from(self.state.port_base);
         (0u32..)
             .map(|k| base + k * 10)
             .take_while(|port| *port + 9 <= u32::from(u16::MAX))
             .map(|port| port as u16)
-            .find(|port| !used.contains(port))
+            .find(|port| !used.contains(port) && !busy(*port))
             .with_context(|| {
                 format!(
                     "no free ports left above port_base {} ({} sessions); remove sessions or lower port_base",
@@ -432,7 +521,10 @@ impl Project {
             }
             Backend::Clone => {
                 if !path.is_dir() {
-                    bail!("session directory {} is missing", path.display());
+                    bail!(
+                        "session directory {} is missing; discard the session with keep_work: false to clear its record",
+                        path.display()
+                    );
                 }
             }
         }

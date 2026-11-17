@@ -316,3 +316,30 @@ pub fn human_age(created_at: u64) -> String {
         _ => format!("{}d ago", secs / 86400),
     }
 }
+
+/// When process `pid` started, in a form only meant for comparison, or None
+/// if there is no such process.
+pub fn process_start(pid: i32) -> Option<String> {
+    if pid <= 0 {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Field 22 (starttime) comes after the command name, which is in
+        // parentheses and may itself contain spaces or parentheses.
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let rest = &stat[stat.rfind(')')? + 1..];
+        rest.split_whitespace().nth(19).map(str::to_string)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let out = Command::new("ps")
+            .args(["-o", "lstart=", "-p", &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!text.is_empty()).then_some(text)
+    }
+}

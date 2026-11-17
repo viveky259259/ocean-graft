@@ -92,7 +92,7 @@ enum Cmd {
     Mcp,
     /// Handle a Claude Code hook event, reading its JSON from stdin
     Hook {
-        #[arg(value_parser = clap::builder::PossibleValuesParser::new(hook::EVENTS))]
+        /// worktree-create, worktree-remove, stop, session-start or prompt
         event: String,
     },
     /// List sessions
@@ -243,8 +243,12 @@ const fn shoal_port_max() -> u16 {
 fn main() {
     // Exit quietly when the reader goes away (`shoal ls | head`), like other CLIs,
     // instead of panicking on a broken pipe.
-    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let cli = Cli::parse();
+    // The MCP server must survive its client closing the pipe: a write
+    // error then ends the server cleanly after in-flight calls finish.
+    if !matches!(cli.command, Cmd::Mcp) {
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    }
     match run(cli) {
         Ok(code) => std::process::exit(code),
         Err(err) => {
@@ -348,7 +352,11 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Rewind { name, label } => cmd_rewind(&mut p, &name, &label)?,
         Cmd::Import { names, all } => cmd_import(&p, names, all)?,
         Cmd::Conflicts => cmd_conflicts(&p)?,
-        Cmd::Refresh => cmd_refresh(&mut p)?,
+        Cmd::Refresh => {
+            let dir = p.dir.clone();
+            drop(p); // refresh takes the lock itself, only when it must
+            cmd_refresh(&dir)?;
+        }
         Cmd::Rm { name, force } => cmd_rm(&mut p, &name, force)?,
         Cmd::Up => cmd_up(&p)?,
         Cmd::Down => cmd_down(&mut p)?,
@@ -388,8 +396,9 @@ fn cmd_init(args: InitArgs) -> Result<()> {
     Ok(())
 }
 
-fn cmd_refresh(p: &mut Project) -> Result<()> {
-    let r = ops::refresh(p)?;
+fn cmd_refresh(dir: &std::path::Path) -> Result<()> {
+    let r = ops::refresh(dir)?;
+    let p = Project::open(dir.to_path_buf())?;
     if r.up_to_date {
         println!(
             "Template g{} is already at {} ({})",
@@ -1267,8 +1276,15 @@ fn cmd_gc(p: &mut Project) -> Result<()> {
             continue;
         };
         for entry in entries.flatten() {
-            let rel = format!("{parent}/{}", entry.file_name().to_string_lossy());
-            if !keep.contains(&rel) {
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            let rel = format!("{parent}/{file_name}");
+            // A generation newer than the latest is being built by a refresh
+            // that runs without the project lock: not garbage.
+            let building = file_name
+                .strip_prefix('g')
+                .and_then(|n| n.parse::<u32>().ok())
+                .is_some_and(|n| n > latest_id);
+            if !keep.contains(&rel) && !building {
                 freed += sys::disk_usage(&entry.path());
                 std::fs::remove_dir_all(entry.path())?;
                 println!("Removed {rel}");

@@ -20,7 +20,7 @@ directory, if it is inside a session).
 | Unsure where you are, or about to change anything | `status` |
 | Two or more plausible approaches | `fork` with `count` set to the number of approaches, one approach per session; run the tests in each; keep the best and `discard` the rest |
 | About to run a migration, a large refactor, a dependency upgrade, or anything you might regret | `checkpoint` with a descriptive `label` first |
-| Something went wrong | `rewind` to your checkpoint, or `label: "latest"`. Checkpoints named `turn-N` are taken at the end of each turn automatically |
+| Something went wrong | `rewind` to your checkpoint, or `label: "latest"`. When `status` says `auto_checkpoints: true`, checkpoints named `turn-N` are taken at the end of each turn; otherwise checkpoint yourself before risky steps. A rewind saves what it replaces as `pre-rewind-N` (`saved_as`), so it can be undone |
 | Work is done and should reach the user | `land`. Pass `commit_message` if there are uncommitted changes |
 | The user should see the change running | `preview`, then give the user the URL |
 | Several sessions in progress | `conflicts` before landing any of them |
@@ -33,6 +33,8 @@ directory, if it is inside a session).
 - After `land`, read `status` in the result:
   - **`conflicts`**: merge the target into the session, resolve, commit, and land again. The session was left unchanged.
   - **`tests_failed`**: fix the failures, or `rewind` to the `pre-land-N` checkpoint named in the result.
-  - **`target_blocked`**: the user has uncommitted edits in the way. Tell them; the work is safe on branch `shoal/<name>`.
-- `discard` keeps work by default: it commits leftovers as WIP and saves the branch in the source repository. Pass `keep_work: false` only when the session's work is worthless.
+  - **`target_blocked`**: the user has uncommitted edits, or untracked or ignored files (listed in `files`), in the way. Tell them; the work is safe on the branch named in the message.
+  - **`nothing_to_land`**: the target already has these changes.
+- `discard` keeps work by default: it commits leftovers as WIP and saves the branch (plus any other branches and stashes) in the source repository. Pass `keep_work: false` only when the session's work is worthless.
+- If `fork` returns `refresh_error`, the session started from an older template; tell the user why (often a failing setup on the latest commit).
 - Subagents started with worktree isolation get their own session automatically. Inside a session, a subagent's session is a fork of yours, including your uncommitted work.

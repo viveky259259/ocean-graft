@@ -84,19 +84,35 @@ pub fn worktree_create(input: &Value) -> Result<PathBuf> {
                 .filter(|d| d.is_dir())
                 .unwrap_or(cwd);
             let dir = ops::ensure_project(&repo)?;
-            let mut p = Project::open(dir)?;
-            let r = ops::refresh(&mut p)?;
-            if !r.up_to_date {
-                ops::progress(format!(
+            match ops::refresh(&dir) {
+                Ok(r) if !r.up_to_date => ops::progress(format!(
                     "template refreshed to {}",
                     crate::git::short(&r.to)
-                ));
+                )),
+                Ok(_) => {}
+                // Never block worktree isolation on a broken refresh.
+                Err(err) => ops::progress(format!(
+                    "could not refresh the template ({err:#}); using the last good one"
+                )),
             }
-            (p, Origin::Template)
+            (Project::open(dir)?, Origin::Template)
         }
     };
+    let keep = match &origin {
+        Origin::Session(parent) => Some(parent.clone()),
+        _ => None,
+    };
+    for gone in ops::sweep_worktrees(&mut p, ops::worktree_idle_limit(), 3, keep.as_deref()) {
+        ops::progress(format!(
+            "removed idle worktree session {gone} (its work is saved on a shoal/ branch)"
+        ));
+    }
     let name = ops::unique_name(&p, &ops::sanitize_name(raw));
     let info = ops::create_session(&mut p, &name, &origin)?;
+    if let Some(s) = p.state.sessions.get_mut(&name) {
+        s.worktree = true;
+        p.save()?;
+    }
     ops::progress(format!(
         "session {} ready in {} ms on branch {}",
         info.name, info.ready_ms, info.branch
@@ -108,7 +124,10 @@ pub fn worktree_remove(input: &Value) -> Result<()> {
     let path = field(input, "worktree_path").context("no worktree_path in the hook input")?;
     let path = Path::new(path);
     if path.symlink_metadata().is_err() {
-        return Ok(()); // already gone
+        // Already gone. If it was a shoal session, clear its record too, so
+        // status does not keep reporting a broken session.
+        forget_missing_session(path);
+        return Ok(());
     }
     let Some((mut p, name)) = session_at(path, None)? else {
         if path.symlink_metadata().is_err() {
@@ -137,6 +156,38 @@ pub fn worktree_remove(input: &Value) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn forget_missing_session(path: &Path) {
+    let (Some(name), Some(sessions)) = (path.file_name(), path.parent()) else {
+        return;
+    };
+    let Ok(sessions) = sessions.canonicalize() else {
+        return;
+    };
+    let Some(dir) = sessions.parent() else {
+        return;
+    };
+    let Ok(projects) =
+        crate::project::shoal_home().and_then(|h| Ok(h.join("projects").canonicalize()?))
+    else {
+        return;
+    };
+    if sessions.file_name() != Some(std::ffi::OsStr::new("sessions"))
+        || dir.parent() != Some(projects.as_path())
+        || !dir.join("state.json").exists()
+    {
+        return;
+    }
+    let name = name.to_string_lossy().into_owned();
+    if let Ok(mut p) = Project::open(dir.to_path_buf()) {
+        if p.state.sessions.contains_key(&name) && p.session_path(&name).symlink_metadata().is_err()
+        {
+            if let Err(err) = ops::remove(&mut p, &name, true, false) {
+                ops::progress(format!("could not clear the record of {name}: {err:#}"));
+            }
+        }
+    }
 }
 
 /// End of a turn (Stop, SubagentStop): checkpoint the session if it changed.
@@ -170,8 +221,14 @@ pub fn session_start(input: &Value) -> Result<Option<String>> {
         return Ok(None);
     };
     let s = p.session(&name)?;
+    // Only promise automatic checkpoints where the Stop hook takes them.
+    let checkpoints = if ops::checkpoints_are_cheap(&p) {
+        "A checkpoint is taken automatically at the end of each turn that changed something; use the shoal rewind tool to undo"
+    } else {
+        "Checkpoints are NOT taken automatically here (this filesystem cannot copy cheaply); call the shoal checkpoint tool yourself before risky steps, and rewind to undo"
+    };
     Ok(Some(format!(
-        "You are working in shoal session \"{name}\" (branch {}, port {}), an isolated copy-on-write copy of {} with dependencies installed. Your changes stay here until you land them with the shoal land tool. A checkpoint is taken at the end of each turn; use the shoal rewind tool to undo, fork to try alternatives, and preview to show the user the running app.",
+        "You are working in shoal session \"{name}\" (branch {}, port {}), an isolated copy-on-write copy of {} with dependencies installed. Your changes stay here until you land them with the shoal land tool. {checkpoints}; fork to try alternatives, and preview to show the user the running app.",
         s.branch,
         s.port,
         p.state.source.display()
@@ -243,7 +300,8 @@ pub fn run(event: &str) -> i32 {
                 "shoal hook: unknown event {other:?}; events: {}",
                 EVENTS.join(", ")
             );
-            2
+            // 1, not 2: exit 2 would block a prompt or a stop in Claude Code.
+            1
         }
     }
 }

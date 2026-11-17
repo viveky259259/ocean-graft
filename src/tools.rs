@@ -60,7 +60,7 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": "rewind",
-            "description": "Restore a session to a checkpoint, discarding everything since. label=\"latest\" picks the newest. Checkpoints named turn-N are taken automatically at the end of each of your turns. Services in the session are restarted.",
+            "description": "Restore a session to a checkpoint. The state being replaced is first saved as checkpoint pre-rewind-N (named in the result as saved_as), so a rewind can itself be undone. label=\"latest\" picks the newest checkpoint other than those pre-rewind ones. Checkpoints named turn-N are taken automatically at the end of each turn when status reports auto_checkpoints: true. Services in the session are restarted.",
             "inputSchema": schema(json!({
                 "label": {"type": "string", "description": "Checkpoint label, or \"latest\"."}
             }), &["label"]),
@@ -77,7 +77,7 @@ pub fn definitions() -> Vec<Value> {
                 "commit_message": {"type": "string", "description": "Commit uncommitted work with this message first."},
                 "test": {"type": "string", "description": "Test command; default from shoal.toml or detected. Empty string skips tests."},
                 "into": {"type": "string", "description": "Target branch (default: the branch the project tracks)."},
-                "timeout_secs": {"type": "integer", "minimum": 1, "description": "Test time limit (default 1800)."}
+                "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 1500, "description": "Time limit for the whole land, including waiting for a test slot and the tests (default 1200, at most 1500 so the call always answers before Claude Code's 30-minute tool limit)."}
             }), &[]),
         }),
         json!({
@@ -232,6 +232,7 @@ fn conflicts_json(report: &conflicts::Report) -> Value {
             "conflict": !pair.conflicts.is_empty(), "conflicting_files": pair.conflicts,
         })).collect::<Vec<_>>(),
         "pairs_without_shared_files": report.quiet_pairs,
+        "skipped": report.skipped.iter().map(|(n, e)| json!({"session": n, "error": e})).collect::<Vec<_>>(),
     })
 }
 
@@ -295,6 +296,9 @@ fn status(args: &Value) -> Result<Value> {
         "source": p.state.source,
         "branch": p.state.branch,
         "backend": p.state.backend.name(),
+        // Whether the Stop hook checkpoints every changing turn. When false,
+        // checkpoint before risky steps yourself.
+        "auto_checkpoints": ops::checkpoints_are_cheap(&p),
         "template": {
             "generation": latest.id,
             "commit": git::short(&latest.commit),
@@ -320,13 +324,27 @@ fn fork(args: &Value) -> Result<Value> {
         bail!("at needs from to name a session: checkpoints belong to sessions");
     }
     let dir = project_dir(args, from_main)?;
-    let mut p = Project::open(dir)?;
+    // Refresh before taking the project lock: it runs setup without it. A
+    // failed refresh (a broken commit, a failing install) must not stop work:
+    // fork from the last good template and say why.
     let mut refreshed = None;
-    let origin = if from_main {
-        let r = ops::refresh(&mut p)?;
-        if !r.up_to_date {
-            refreshed = Some(r);
+    let mut refresh_error = None;
+    if from_main {
+        match ops::refresh(&dir) {
+            Ok(r) if !r.up_to_date => refreshed = Some(r),
+            Ok(_) => {}
+            Err(err) => {
+                ops::progress(format!(
+                    "could not refresh the template ({err:#}); using the last good one"
+                ));
+                refresh_error = Some(format!(
+                    "{err:#}; the session starts from the last good template, which is behind the source branch"
+                ));
+            }
         }
+    }
+    let mut p = Project::open(dir)?;
+    let origin = if from_main {
         Origin::Template
     } else {
         if !p.state.sessions.contains_key(&from) {
@@ -357,13 +375,15 @@ fn fork(args: &Value) -> Result<Value> {
             Ok(info) => created.push(info),
             Err(err) if !created.is_empty() => {
                 // Report what exists, so nothing is orphaned silently.
-                return Ok(json!({"sessions": created, "refreshed": refreshed,
-                    "error": format!("stopped after {} of {count}: {err:#}", created.len())}));
+                return Ok(
+                    json!({"sessions": created, "refreshed": refreshed, "refresh_error": refresh_error,
+                    "error": format!("stopped after {} of {count}: {err:#}", created.len())}),
+                );
             }
             Err(err) => return Err(err),
         }
     }
-    Ok(json!({"sessions": created, "refreshed": refreshed}))
+    Ok(json!({"sessions": created, "refreshed": refreshed, "refresh_error": refresh_error}))
 }
 
 fn checkpoint(args: &Value) -> Result<Value> {
@@ -404,7 +424,9 @@ fn land(args: &Value) -> Result<Value> {
             commit_message: opt_str(args, "commit_message")?,
             into: opt_str(args, "into")?,
             test_timeout: Duration::from_secs(
-                opt_u64(args, "timeout_secs")?.unwrap_or(1800).max(1),
+                opt_u64(args, "timeout_secs")?
+                    .unwrap_or(1200)
+                    .clamp(1, 1500),
             ),
         },
     )?;

@@ -138,7 +138,10 @@ pub fn init(o: InitOptions) -> Result<InitReport> {
         }
     };
     if branch == "HEAD" {
-        bail!("{} has a detached HEAD; pass --branch", source.display());
+        bail!(
+            "{} has a detached HEAD, and shoal sessions track a branch; check out a branch there (git switch <branch>), or run `shoal init --branch <branch>`",
+            source.display()
+        );
     }
     git::git_trim(
         &source,
@@ -384,12 +387,46 @@ fn touches_setup_inputs(changed: &[String], inputs: &[String]) -> bool {
     })
 }
 
-/// Build a new template generation if the source branch moved.
-pub fn refresh(p: &mut Project) -> Result<RefreshReport> {
+/// Serialises template refreshes of one project. Held across the slow build
+/// (fetch, copy, setup) instead of the project lock, so every other command
+/// keeps working while `npm ci` runs.
+fn refresh_lock(dir: &Path) -> Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("refresh.lock"))
+        .context("could not open the refresh lock")?;
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(file);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINTR) {
+            return Err(err).context("could not take the refresh lock");
+        }
+    }
+}
+
+/// Build a new template generation if the source branch moved. Takes the
+/// project lock only to read the state and to record the new generation;
+/// the build itself runs without it. Callers must not hold the project lock.
+pub fn refresh(dir: &Path) -> Result<RefreshReport> {
     let start = Instant::now();
-    let latest = p.latest().clone();
-    let branch = p.state.branch.clone();
-    let source_head = git::git_trim(&p.state.source, &["rev-parse", &branch])?;
+    let _refreshing = refresh_lock(dir)?;
+    let (latest, branch, backend, old_setup, old_inputs, source_head) = {
+        let p = Project::open(dir.to_path_buf())?;
+        let source_head = git::git_trim(&p.state.source, &["rev-parse", &p.state.branch])?;
+        (
+            p.latest().clone(),
+            p.state.branch.clone(),
+            p.state.backend,
+            p.state.setup.clone(),
+            p.state.setup_inputs.clone(),
+            source_head,
+        )
+    };
     if source_head == latest.commit {
         return Ok(RefreshReport {
             up_to_date: true,
@@ -401,38 +438,38 @@ pub fn refresh(p: &mut Project) -> Result<RefreshReport> {
             elapsed_ms: ms(start.elapsed()),
         });
     }
+    let abs = |rel: &str| dir.join(rel);
     let id = latest.id + 1;
-    let (rel, build) = match p.state.backend {
+    let (rel, build) = match backend {
         Backend::Overlay => {
             let rel = format!("layers/g{id}");
-            let build = p.dir.join("build");
-            let work = p.dir.join("build-work");
+            let build = dir.join("build");
+            let work = dir.join("build-work");
             if sys::is_mounted(&build) {
                 sys::unmount(&build)?;
             }
-            for dir in [p.abs(&rel), work.clone()] {
-                if dir.exists() {
-                    std::fs::remove_dir_all(&dir)?;
+            for d in [abs(&rel), work.clone()] {
+                if d.exists() {
+                    std::fs::remove_dir_all(&d)?;
                 }
-                std::fs::create_dir_all(&dir)?;
+                std::fs::create_dir_all(&d)?;
             }
             std::fs::create_dir_all(&build)?;
-            let lowers: Vec<PathBuf> = latest.layers.iter().map(|l| p.abs(l)).collect();
+            let lowers: Vec<PathBuf> = latest.layers.iter().map(|l| abs(l)).collect();
             let lowers: Vec<&Path> = lowers.iter().map(PathBuf::as_path).collect();
-            sys::mount_overlay(&lowers, &p.abs(&rel), &work, &build)?;
+            sys::mount_overlay(&lowers, &abs(&rel), &work, &build)?;
             (rel, build)
         }
         Backend::Clone => {
             let rel = format!("templates/g{id}");
-            let dir = p.abs(&rel);
-            if dir.exists() {
-                std::fs::remove_dir_all(&dir)?;
+            let d = abs(&rel);
+            if d.exists() {
+                std::fs::remove_dir_all(&d)?;
             }
-            sys::clone_tree(&p.abs(&latest.layers[0]), &dir)?;
-            (rel.clone(), dir)
+            sys::clone_tree(&abs(&latest.layers[0]), &d)?;
+            (rel, d)
         }
     };
-    let (old_setup, old_inputs) = (p.state.setup.clone(), p.state.setup_inputs.clone());
     let result = (|| -> Result<(usize, bool, Option<String>, Vec<String>)> {
         git::git(&build, &["fetch", "-q", "origin", &branch])?;
         git::git(&build, &["reset", "-q", "--hard", "FETCH_HEAD"])?;
@@ -466,22 +503,23 @@ pub fn refresh(p: &mut Project) -> Result<RefreshReport> {
         git::git(&build, &["status", "--porcelain"])?;
         Ok((changed.len(), ran, setup, inputs))
     })();
-    if p.state.backend == Backend::Overlay {
+    if backend == Backend::Overlay {
         sys::unmount(&build)?;
-        std::fs::remove_dir_all(p.dir.join("build-work"))?;
+        std::fs::remove_dir_all(dir.join("build-work"))?;
         std::fs::remove_dir(&build)?;
     }
     let (changed, ran, setup, inputs) = match result {
         Ok(r) => r,
         Err(err) => {
-            let _ = std::fs::remove_dir_all(p.abs(&rel));
+            let _ = std::fs::remove_dir_all(abs(&rel));
             return Err(err);
         }
     };
     let mut layers = vec![rel];
-    if p.state.backend == Backend::Overlay {
+    if backend == Backend::Overlay {
         layers.extend(latest.layers.iter().cloned());
     }
+    let mut p = Project::open(dir.to_path_buf())?;
     p.state.setup = setup;
     p.state.setup_inputs = inputs;
     p.state.generations.push(Generation {
@@ -593,6 +631,9 @@ pub struct SessionInfo {
     pub ready_ms: u64,
 }
 
+/// generation, base commit, lowers, parent, from_checkpoint
+type Built = (u32, String, Vec<String>, Option<String>, Option<String>);
+
 pub fn create_session(p: &mut Project, name: &str, origin: &Origin) -> Result<SessionInfo> {
     validate_name("session", name)?;
     if project::RESERVED_SESSION_NAMES.contains(&name) {
@@ -621,77 +662,93 @@ pub fn create_session(p: &mut Project, name: &str, origin: &Origin) -> Result<Se
             layer = format!("{stem}+{i}");
             i += 1;
         }
-        sys::clone_tree(src, &p.abs(&layer))?;
+        if let Err(err) = sys::clone_tree(src, &p.abs(&layer)) {
+            let _ = std::fs::remove_dir_all(p.abs(&layer));
+            return Err(err);
+        }
         Ok(layer)
     };
-    let (generation, base_commit, lowers, parent, from_checkpoint) = match origin {
-        Origin::Template => {
-            let g = p.latest().clone();
-            let lowers = match p.state.backend {
-                Backend::Overlay => g.layers.clone(),
-                Backend::Clone => {
-                    sys::clone_tree(&p.abs(&g.layers[0]), &path)?;
-                    Vec::new()
-                }
-            };
-            (g.id, g.commit, lowers, None, None)
-        }
-        Origin::Session(parent) => {
-            let ps = p.session(parent)?.clone();
-            let parent_path = p.ensure_ready(parent)?;
-            sys::sync();
-            let lowers = match p.state.backend {
-                Backend::Overlay => {
-                    // Freeze the parent's changes into a layer both sessions sit on.
-                    let layer = fork_layer(p, parent, &p.volume_dir(parent).join("upper"))?;
-                    let mut lowers = vec![layer];
-                    lowers.extend(ps.lowers.iter().cloned());
-                    lowers
-                }
-                Backend::Clone => {
-                    sys::clone_tree(&parent_path, &path)?;
-                    Vec::new()
-                }
-            };
-            (
-                ps.generation,
-                ps.base_commit,
-                lowers,
-                Some(parent.clone()),
-                None,
-            )
-        }
-        Origin::Checkpoint { session, label } => {
-            let ps = p.session(session)?.clone();
-            if !p
-                .state
-                .checkpoints
-                .iter()
-                .any(|c| &c.session == session && &c.label == label)
-            {
-                bail!("{session} has no checkpoint named {label}");
+    let built = (|| -> Result<Built> {
+        Ok(match origin {
+            Origin::Template => {
+                let g = p.latest().clone();
+                let lowers = match p.state.backend {
+                    Backend::Overlay => g.layers.clone(),
+                    Backend::Clone => {
+                        sys::clone_tree(&p.abs(&g.layers[0]), &path)?;
+                        Vec::new()
+                    }
+                };
+                (g.id, g.commit, lowers, None, None)
             }
-            let saved = p.checkpoint_dir(session, label);
-            let lowers = match p.state.backend {
-                Backend::Overlay => {
-                    // A copy, so pruning the checkpoint later cannot break the fork.
-                    let layer = fork_layer(p, session, &saved)?;
-                    let mut lowers = vec![layer];
-                    lowers.extend(ps.lowers.iter().cloned());
-                    lowers
+            Origin::Session(parent) => {
+                let ps = p.session(parent)?.clone();
+                let parent_path = p.ensure_ready(parent)?;
+                sys::sync();
+                let lowers = match p.state.backend {
+                    Backend::Overlay => {
+                        // Freeze the parent's changes into a layer both sessions sit on.
+                        let layer = fork_layer(p, parent, &p.volume_dir(parent).join("upper"))?;
+                        let mut lowers = vec![layer];
+                        lowers.extend(ps.lowers.iter().cloned());
+                        lowers
+                    }
+                    Backend::Clone => {
+                        sys::clone_tree(&parent_path, &path)?;
+                        Vec::new()
+                    }
+                };
+                (
+                    ps.generation,
+                    ps.base_commit,
+                    lowers,
+                    Some(parent.clone()),
+                    None,
+                )
+            }
+            Origin::Checkpoint { session, label } => {
+                let ps = p.session(session)?.clone();
+                if !p
+                    .state
+                    .checkpoints
+                    .iter()
+                    .any(|c| &c.session == session && &c.label == label)
+                {
+                    bail!("{session} has no checkpoint named {label}");
                 }
-                Backend::Clone => {
-                    sys::clone_tree(&saved, &path)?;
-                    Vec::new()
-                }
-            };
-            (
-                ps.generation,
-                ps.base_commit,
-                lowers,
-                Some(session.clone()),
-                Some(label.clone()),
-            )
+                let saved = p.checkpoint_dir(session, label);
+                let lowers = match p.state.backend {
+                    Backend::Overlay => {
+                        // A copy, so pruning the checkpoint later cannot break the fork.
+                        let layer = fork_layer(p, session, &saved)?;
+                        let mut lowers = vec![layer];
+                        lowers.extend(ps.lowers.iter().cloned());
+                        lowers
+                    }
+                    Backend::Clone => {
+                        sys::clone_tree(&saved, &path)?;
+                        Vec::new()
+                    }
+                };
+                (
+                    ps.generation,
+                    ps.base_commit,
+                    lowers,
+                    Some(session.clone()),
+                    Some(label.clone()),
+                )
+            }
+        })
+    })();
+    let (generation, base_commit, lowers, parent, from_checkpoint) = match built {
+        Ok(b) => b,
+        Err(err) => {
+            // The directory did not exist before (checked above): a failed
+            // or partial copy must not be left to block the name.
+            if !sys::is_mounted(&path) {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+            return Err(err);
         }
     };
     let session = Session {
@@ -705,6 +762,7 @@ pub fn create_session(p: &mut Project, name: &str, origin: &Origin) -> Result<Se
         lowers,
         services: Vec::new(),
         last_active: sys::now(),
+        worktree: false,
     };
     let created = (|| -> Result<Duration> {
         if p.state.backend == Backend::Overlay {
@@ -734,6 +792,30 @@ pub fn create_session(p: &mut Project, name: &str, origin: &Origin) -> Result<Se
         from_checkpoint,
         ready_ms: ms(ready),
     })
+}
+
+/// A per-session lock held by `land` for its whole run (commit, rebase,
+/// tests, fast-forward), so rewind and remove cannot change the session
+/// underneath it. They only try it, so nothing ever waits on it while
+/// holding the project lock.
+fn session_lock_file(project_dir: &Path, name: &str) -> Result<std::fs::File> {
+    let dir = project_dir.join("locks");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(format!("{name}.lock")))
+        .context("could not open the session lock")
+}
+
+fn try_session_lock(project_dir: &Path, name: &str, what: &str) -> Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let file = session_lock_file(project_dir, name)?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        bail!("{name} is being landed right now; {what} it after the land finishes");
+    }
+    Ok(file)
 }
 
 // ---------------------------------------------------------------------------
@@ -921,7 +1003,12 @@ fn prune_auto(p: &mut Project, name: &str) -> Result<Vec<String>> {
 pub struct RewindInfo {
     pub session: String,
     pub label: String,
+    /// A checkpoint of the state just before the rewind, when it differed
+    /// from the target, so the rewind itself can be undone.
+    pub saved_as: Option<String>,
     pub head: String,
+    /// Services that could not be restarted (the rewind itself succeeded).
+    pub restart_errors: Vec<String>,
     pub restarted_services: Vec<String>,
     pub elapsed_ms: u64,
 }
@@ -934,7 +1021,9 @@ pub fn rewind(p: &mut Project, name: &str, label: &str) -> Result<RewindInfo> {
             .checkpoints
             .iter()
             .rev() // checkpoints are appended in the order they are taken
-            .find(|c| c.session == name)
+            // A rewind's own safety checkpoint is how to undo it, not where
+            // "latest" should go: rewinding to latest twice must not bounce.
+            .find(|c| c.session == name && !c.label.starts_with("pre-rewind-"))
             .map(|c| c.label.clone())
             .with_context(|| format!("{name} has no checkpoints"))?
     } else {
@@ -969,6 +1058,7 @@ pub fn rewind(p: &mut Project, name: &str, label: &str) -> Result<RewindInfo> {
         .filter(|svc| services::state(svc) == services::State::Running)
         .map(|svc| svc.name.clone())
         .collect();
+    let _busy = try_session_lock(&p.dir, name, "rewind")?;
     let saved = p.checkpoint_dir(name, &label);
     if !saved.is_dir() {
         bail!(
@@ -976,6 +1066,22 @@ pub fn rewind(p: &mut Project, name: &str, label: &str) -> Result<RewindInfo> {
             saved.display()
         );
     }
+    // Nothing lost: if the session has changed since that checkpoint, keep
+    // its current state as a checkpoint first, so the rewind can be undone.
+    let target_fp = p
+        .state
+        .checkpoints
+        .iter()
+        .find(|c| c.session == name && c.label == label)
+        .and_then(|c| c.fingerprint.clone());
+    let path_now = p.ensure_ready(name)?;
+    let now_fp = conflicts::fingerprint_with_ignored(&path_now).ok();
+    let saved_as = if target_fp.is_some() && target_fp == now_fp {
+        None
+    } else {
+        let safety = next_label(p, name, "pre-rewind-");
+        checkpoint(p, name, Some(&safety), false)?.label
+    };
     services::stop_session(p, name, None, false, true)?;
     let start = Instant::now();
     let path = p.session_path(name);
@@ -1021,28 +1127,49 @@ pub fn rewind(p: &mut Project, name: &str, label: &str) -> Result<RewindInfo> {
             }
         }
         Backend::Clone => {
-            let trash = p.dir.join(format!("trash-{name}-{}", std::process::id()));
-            if trash.exists() {
-                std::fs::remove_dir_all(&trash)?;
+            // Copy into a staging directory first (the session is untouched
+            // while the slow copy runs), then swap with two renames. If the
+            // process dies at any point, Project::open puts things right:
+            // restore-* is always discarded; trash-* is restored when the
+            // session directory is missing and discarded otherwise.
+            let pid = std::process::id();
+            let staging = p.dir.join(format!("restore-{name}-{pid}"));
+            let trash = p.dir.join(format!("trash-{name}-{pid}"));
+            for d in [&staging, &trash] {
+                if d.symlink_metadata().is_ok() {
+                    std::fs::remove_dir_all(d)?;
+                }
+            }
+            if let Err(err) = sys::clone_tree(&saved, &staging) {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(err.context(format!(
+                    "could not rewind {name} to {label}; the session is unchanged"
+                )));
             }
             std::fs::rename(&path, &trash)?;
-            if let Err(err) = sys::clone_tree(&saved, &path) {
-                let _ = std::fs::remove_dir_all(&path);
+            if let Err(err) = std::fs::rename(&staging, &path) {
                 std::fs::rename(&trash, &path)?;
-                return Err(err);
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(err)
+                    .context("could not swap the checkpoint in; the session is unchanged");
             }
             std::fs::remove_dir_all(&trash)?;
         }
     }
     let elapsed = start.elapsed();
     let head = git::head(&path)?;
+    // The rewind is done; a service that will not start again is reported,
+    // not turned into a failure of the whole call.
     let mut restarted = Vec::new();
+    let mut restart_errors = Vec::new();
     let session = p.session(name)?.clone();
     for (i, svc) in session.services.iter().enumerate() {
         if restart.contains(&svc.name) {
             let mut svc = svc.clone();
-            services::start(p, &session, &mut svc)?;
-            restarted.push(svc.name.clone());
+            match services::start(p, &session, &mut svc) {
+                Ok(()) => restarted.push(svc.name.clone()),
+                Err(err) => restart_errors.push(format!("{}: {err:#}", svc.name)),
+            }
             p.state
                 .sessions
                 .get_mut(name)
@@ -1054,6 +1181,8 @@ pub fn rewind(p: &mut Project, name: &str, label: &str) -> Result<RewindInfo> {
     Ok(RewindInfo {
         session: name.to_string(),
         label,
+        saved_as,
+        restart_errors,
         head,
         restarted_services: restarted,
         elapsed_ms: ms(elapsed),
@@ -1064,9 +1193,9 @@ pub fn rewind(p: &mut Project, name: &str, label: &str) -> Result<RewindInfo> {
 // Getting work out
 // ---------------------------------------------------------------------------
 
-/// Commit with the repository's identity, or a shoal identity if none is set.
-fn commit_all(dir: &Path, message: &str) -> Result<()> {
-    git::git(dir, &["add", "-A"])?;
+/// A git command in `dir` with the repository's identity, or shoal's when
+/// none is configured (so commits and rebases never fail for want of one).
+fn git_with_identity(dir: &Path) -> Command {
     let has_identity = git::git_trim(dir, &["config", "user.email"])
         .map(|e| !e.is_empty())
         .unwrap_or(false);
@@ -1074,6 +1203,12 @@ fn commit_all(dir: &Path, message: &str) -> Result<()> {
     if !has_identity {
         cmd.args(["-c", "user.name=shoal", "-c", "user.email=shoal@localhost"]);
     }
+    cmd
+}
+
+fn commit_all(dir: &Path, message: &str) -> Result<()> {
+    git::git(dir, &["add", "-A"])?;
+    let mut cmd = git_with_identity(dir);
     cmd.args(["commit", "-q", "--no-verify", "-m", message]);
     sys::output(&mut cmd)?;
     Ok(())
@@ -1093,6 +1228,11 @@ pub struct ImportInfo {
 /// own commits). The fetch is never forced, so git itself refuses to move a
 /// branch anywhere but forward.
 pub(crate) fn save_branch(source: &Path, session: &Path, name: &str) -> Result<String> {
+    save_rev(source, session, "HEAD", name)
+}
+
+/// `rev` of the session saved as `shoal/<name>` (or `-2`, `-3`...).
+fn save_rev(source: &Path, session: &Path, rev: &str, name: &str) -> Result<String> {
     let mut last_err = None;
     for i in 1..=50 {
         let branch = if i == 1 {
@@ -1107,7 +1247,7 @@ pub(crate) fn save_branch(source: &Path, session: &Path, name: &str) -> Result<S
                 "-q",
                 "--no-tags",
                 &session.to_string_lossy(),
-                &format!("HEAD:refs/heads/{branch}"),
+                &format!("{rev}:refs/heads/{branch}"),
             ],
         );
         match fetched {
@@ -1163,20 +1303,92 @@ pub fn import(p: &Project, name: &str) -> Result<ImportInfo> {
 pub struct SaveInfo {
     pub committed_wip: bool,
     pub import: ImportInfo,
+    /// Other branches and stashes in the session, saved as their own
+    /// branches in the source repository.
+    pub extra_branches: Vec<String>,
 }
 
-/// Make sure nothing in the session is lost: commit uncommitted work as WIP
-/// and import the branch into the source repository.
+/// A rebase, merge, cherry-pick or revert the session is in the middle of.
+fn operation_in_progress(path: &Path) -> Option<&'static str> {
+    let git_path = |p: &str| -> Option<PathBuf> {
+        let rel = git::git_trim(path, &["rev-parse", "--git-path", p]).ok()?;
+        let full = if Path::new(&rel).is_absolute() {
+            PathBuf::from(rel)
+        } else {
+            path.join(rel)
+        };
+        full.symlink_metadata().is_ok().then_some(full)
+    };
+    [
+        ("rebase-merge", "a rebase"),
+        ("rebase-apply", "a rebase"),
+        ("MERGE_HEAD", "a merge"),
+        ("CHERRY_PICK_HEAD", "a cherry-pick"),
+        ("REVERT_HEAD", "a revert"),
+    ]
+    .into_iter()
+    .find(|(file, _)| git_path(file).is_some())
+    .map(|(_, what)| what)
+}
+
+/// Make sure nothing in the session is lost: commit uncommitted work as WIP,
+/// import the branch into the source repository, and save any other local
+/// branches and stashes too. Ignored files (dependencies, build output) are
+/// not saved: they are reproducible by design.
 pub fn save_work(p: &Project, name: &str) -> Result<SaveInfo> {
     let path = p.ensure_ready(name)?;
+    if let Some(what) = operation_in_progress(&path) {
+        bail!(
+            "{name} is in the middle of {what}; finish it or abort it (for example `git rebase --abort` in {}) before removing the session",
+            path.display()
+        );
+    }
     let mut committed_wip = false;
     if !git::status_lines(&path)?.is_empty() {
         commit_all(&path, &format!("WIP: work saved from shoal session {name}"))?;
         committed_wip = true;
     }
+    let import = import(p, name)?;
+    let mut extra_branches = Vec::new();
+    let own = format!("shoal/{name}");
+    let branches = git::git(
+        &path,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short) %(objectname)",
+            "refs/heads/",
+        ],
+    )?;
+    let mut extras: Vec<(String, String)> = branches
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .filter(|(b, _)| *b != own)
+        .map(|(b, h)| (sanitize_name(&format!("{name}--{b}")), h.to_string()))
+        .collect();
+    let stashes = git::git(&path, &["stash", "list", "--format=%H"]).unwrap_or_default();
+    for (i, h) in stashes.lines().enumerate() {
+        extras.push((
+            with_suffix(&sanitize_name(name), &format!("--stash-{i}")),
+            h.to_string(),
+        ));
+    }
+    for (branch_name, commit) in extras {
+        // Already in the source repository (the template's own branches):
+        // nothing to save.
+        if git::git(
+            &p.state.source,
+            &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+        )
+        .is_ok()
+        {
+            continue;
+        }
+        extra_branches.push(save_rev(&p.state.source, &path, &commit, &branch_name)?);
+    }
     Ok(SaveInfo {
         committed_wip,
-        import: import(p, name)?,
+        import,
+        extra_branches,
     })
 }
 
@@ -1184,14 +1396,27 @@ pub fn save_work(p: &Project, name: &str) -> Result<SaveInfo> {
 pub struct RemoveInfo {
     pub session: String,
     pub saved: Option<SaveInfo>,
+    /// The session's files were already gone; only its record was cleared.
+    pub already_gone: bool,
 }
 
 /// Remove a session. Without `force`, refuse if it holds work that is not in
 /// the source repository. With `save`, save that work first instead.
 pub fn remove(p: &mut Project, name: &str, force: bool, save: bool) -> Result<RemoveInfo> {
     let s = p.session(name)?.clone();
+    let _busy = try_session_lock(&p.dir, name, "remove")?;
     let mut saved = None;
-    if save {
+    // A session whose files are already gone (deleted by hand, a crash) has
+    // nothing left to save; removing it just clears the record.
+    let already_gone = match p.state.backend {
+        Backend::Clone => !p.session_path(name).is_dir(),
+        Backend::Overlay => !p.volume_dir(name).join("upper").is_dir(),
+    };
+    if already_gone {
+        progress(format!(
+            "{name}'s directory is already gone; clearing its record"
+        ));
+    } else if save {
         saved = Some(save_work(p, name)?);
     } else if !force {
         let path = p.ensure_ready(name)?;
@@ -1213,23 +1438,70 @@ pub fn remove(p: &mut Project, name: &str, force: bool, save: bool) -> Result<Re
         }
     }
     services::stop_session(p, name, None, false, false)?;
+    // Forget the session first, then delete its files: a crash in between
+    // leaves a stray directory (skipped by name allocation, reported on
+    // reuse), never a record pointing at a half-deleted session.
+    p.state.checkpoints.retain(|c| c.session != name);
+    p.state.sessions.remove(name);
+    p.save()?;
+    conflicts::forget(&p.dir, name);
     p.destroy_volume(name)?;
     let checkpoints = p.dir.join("checkpoints").join(name);
     if checkpoints.exists() {
         std::fs::remove_dir_all(&checkpoints)?;
     }
-    p.state.checkpoints.retain(|c| c.session != name);
-    p.state.sessions.remove(name);
-    p.save()?;
-    conflicts::forget(&p.dir, name);
-    let _ = git::git(
-        &p.dir.join("hub.git"),
-        &["update-ref", "-d", &format!("refs/snapshots/{name}")],
-    );
     Ok(RemoveInfo {
         session: name.to_string(),
         saved,
+        already_gone,
     })
+}
+
+/// How long a worktree session may sit idle before `sweep_worktrees`
+/// removes it (its work saved first). SHOAL_WORKTREE_IDLE_HOURS overrides.
+pub fn worktree_idle_limit() -> u64 {
+    std::env::var("SHOAL_WORKTREE_IDLE_HOURS")
+        .ok()
+        .and_then(|h| h.trim().parse::<f64>().ok())
+        .filter(|h| *h >= 0.0)
+        .map(|h| (h * 3600.0) as u64)
+        .unwrap_or(72 * 3600)
+}
+
+/// Remove worktree sessions (made for subagents, which Claude Code never
+/// removes) that have been idle longer than `max_idle_secs` and run no
+/// services. Their work is saved to the source repository first; a session
+/// that cannot be saved is left alone. At most `limit` per call, so a sweep
+/// never makes one worktree creation slow.
+pub fn sweep_worktrees(
+    p: &mut Project,
+    max_idle_secs: u64,
+    limit: usize,
+    keep: Option<&str>,
+) -> Vec<String> {
+    let now = sys::now();
+    let stale: Vec<String> = p
+        .state
+        .sessions
+        .values()
+        .filter(|s| s.worktree && Some(s.name.as_str()) != keep)
+        .filter(|s| {
+            !s.services
+                .iter()
+                .any(|svc| services::state(svc) == services::State::Running)
+        })
+        .filter(|s| now.saturating_sub(services::last_activity(p, s)) > max_idle_secs)
+        .map(|s| s.name.clone())
+        .take(limit)
+        .collect();
+    let mut removed = Vec::new();
+    for name in stale {
+        match remove(p, &name, false, true) {
+            Ok(_) => removed.push(name),
+            Err(err) => progress(format!("left idle session {name} in place: {err:#}")),
+        }
+    }
+    removed
 }
 
 // ---------------------------------------------------------------------------
@@ -1286,7 +1558,7 @@ fn run_tests(
     path: &Path,
     port: u16,
     command: &str,
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<TestRun> {
     let job = queue::Job {
         pid: std::process::id(),
@@ -1300,7 +1572,7 @@ fn run_tests(
         queued_at: sys::now(),
         started_at: None,
     };
-    let _slot = queue::acquire(&job, |status| {
+    let _slot = queue::acquire_until(&job, Some(deadline), |status| {
         progress(format!(
             "waiting for a queue slot to run tests ({} of {} busy)",
             status.busy, status.slots
@@ -1332,7 +1604,7 @@ fn run_tests(
         if let Some(status) = child.try_wait()? {
             break Some(status);
         }
-        if start.elapsed() >= timeout {
+        if Instant::now() >= deadline {
             timed_out = true;
             unsafe { libc::kill(-pgid, libc::SIGKILL) };
             let _ = child.wait();
@@ -1381,6 +1653,14 @@ fn land_lock(project_dir: &Path) -> Result<std::fs::File> {
 /// commit (optional), rebase onto the target, test, fast-forward. Never
 /// rewrites the target and never leaves the session mid-rebase.
 pub fn land(project_dir: &Path, name: &str, o: &LandOptions) -> Result<LandReport> {
+    // test_timeout bounds the whole land: queue waits, retries and tests.
+    let deadline = Instant::now() + o.test_timeout;
+    let _busy = {
+        let p = Project::open(project_dir.to_path_buf())?;
+        p.session(name)?;
+        try_session_lock(project_dir, name, "land")
+            .map_err(|_| anyhow::anyhow!("{name} is already being landed"))?
+    };
     let (path, source, target, port, test) = {
         let mut p = Project::open(project_dir.to_path_buf())?;
         let path = p.ensure_ready(name)?;
@@ -1454,14 +1734,20 @@ pub fn land(project_dir: &Path, name: &str, o: &LandOptions) -> Result<LandRepor
                 let cp = checkpoint(&mut p, name, Some(&label), false)?;
                 report.checkpoint = cp.label;
             }
-            let rebase = git::command(&path)
-                .args(["-c", "user.name=shoal", "-c", "user.email=shoal@localhost"])
+            let rebase = git_with_identity(&path)
                 .args(["rebase", "-q", &tip])
                 .stdin(Stdio::null())
                 .output()?;
             if !rebase.status.success() {
                 report.files = conflicted_files(&path);
                 let _ = git::git(&path, &["rebase", "--abort"]);
+                if report.files.is_empty() {
+                    // Not a conflict: say what git said.
+                    bail!(
+                        "rebasing {name} onto {target} failed; the session is unchanged: {}",
+                        String::from_utf8_lossy(&rebase.stderr).trim()
+                    );
+                }
                 report.status = "conflicts";
                 report.message = format!(
                     "rebasing onto {target} conflicts; the session is unchanged. Resolve by merging {target} into the session (git fetch {} {target} && git merge FETCH_HEAD), fix the files, commit, and land again",
@@ -1481,7 +1767,18 @@ pub fn land(project_dir: &Path, name: &str, o: &LandOptions) -> Result<LandRepor
         // 4. Tests, through the queue and without the project lock.
         if let Some(test) = &test {
             progress(format!("running `{test}` in {name}"));
-            let run = run_tests(project_dir, name, &path, port, test, o.test_timeout)?;
+            let run = match run_tests(project_dir, name, &path, port, test, deadline) {
+                Ok(run) => run,
+                Err(err) if Instant::now() >= deadline => TestRun {
+                    command: test.clone(),
+                    passed: false,
+                    exit_code: None,
+                    timed_out: true,
+                    duration_ms: 0,
+                    output_tail: format!("{err:#}"),
+                },
+                Err(err) => return Err(err),
+            };
             let passed = run.passed;
             report.tests = Some(run);
             if !passed {
@@ -1503,6 +1800,29 @@ pub fn land(project_dir: &Path, name: &str, o: &LandOptions) -> Result<LandRepor
         let checked_out = git::git_trim(&source, &["symbolic-ref", "-q", "HEAD"])
             .map(|r| r == target_ref)
             .unwrap_or(false);
+        if checked_out {
+            // git refuses to overwrite untracked files, but silently replaces
+            // ignored ones (.env, local config). Refuse for both.
+            let added = git::git(
+                &path,
+                &["diff", "--name-only", "-z", "--diff-filter=A", &tip, &head],
+            )?;
+            let in_the_way: Vec<String> = added
+                .split('\0')
+                .filter(|f| !f.is_empty())
+                .filter(|f| source.join(f).symlink_metadata().is_ok())
+                .map(str::to_string)
+                .collect();
+            if !in_the_way.is_empty() {
+                report.status = "target_blocked";
+                report.head = Some(head);
+                report.files = in_the_way;
+                report.message = format!(
+                    "landing would overwrite files in the source checkout that git does not track (ignored or untracked); move them aside and land again. The work is on branch {saved} in the source repository"
+                );
+                return Ok(report);
+            }
+        }
         let updated = if checked_out {
             git::git(&source, &["merge", "--ff-only", "-q", &head])
         } else {

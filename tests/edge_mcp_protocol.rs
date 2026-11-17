@@ -294,7 +294,7 @@ fn initialize_echoes_every_known_revision_and_reports_capabilities() {
 fn initialize_with_unknown_missing_or_malformed_revision() {
     let env = Env::new(5102);
     let lines = vec![
-        // Unknown but well-formed revision: echoed back (documented behaviour).
+        // Unknown but well-formed revision: answered with the newest known.
         req(
             json!(1),
             "initialize",
@@ -317,7 +317,7 @@ fn initialize_with_unknown_missing_or_malformed_revision() {
     assert!(run.status.success());
     assert_eq!(
         run.one(&json!(1))["result"]["protocolVersion"],
-        "2099-01-01"
+        "2026-07-28"
     );
     for id in 2..=7 {
         let r = run.one(&json!(id));

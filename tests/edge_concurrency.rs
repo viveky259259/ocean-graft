@@ -1231,7 +1231,15 @@ fn parallel_rewinds_and_checkpoints_keep_state_consistent() {
             assert!(r.is_ok(), "[{backend}] {r:?}");
         }
         let state = check_invariants(&env);
-        assert_eq!(state["checkpoints"].as_array().unwrap().len(), 9);
+        // 3 "one" + 6 new, plus one pre-rewind safety checkpoint for each
+        // rewind that replaced a changed state (all three did).
+        let all = state["checkpoints"].as_array().unwrap();
+        let safety = all
+            .iter()
+            .filter(|c| c["label"].as_str().unwrap().starts_with("pre-rewind-"))
+            .count();
+        assert_eq!(all.len() - safety, 9, "[{backend}] {all:?}");
+        assert_eq!(safety, 3, "[{backend}] {all:?}");
         for k in 1..=3 {
             let v = read(session_path(&env, &format!("r-{k}")).join("v.txt"));
             assert!(v == "one\n", "[{backend}] rewind result: {v:?}");

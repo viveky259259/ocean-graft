@@ -1,0 +1,39 @@
+#!/bin/sh
+# Runs the shoal binary for the plugin. Looks, in order, for $SHOAL_BIN, a
+# binary bundled next to this script for this platform (shoal-<os>-<arch>),
+# a development build in the repository, then shoal on PATH.
+#
+# Exit codes matter to Claude Code. Exit 2 from a hook blocks the prompt or
+# keeps Claude from stopping, so whatever the binary does (a version that
+# does not know the event, a crash), turn hooks always exit 0 and worktree
+# hooks exit 0 or 1.
+here=$(cd "$(dirname "$0")" && pwd)
+os=$(uname -s | tr '[:upper:]' '[:lower:]')
+arch=$(uname -m)
+bin=
+for candidate in "${SHOAL_BIN:-}" "$here/shoal-$os-$arch" "$here/../../target/release/shoal"; do
+  if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+    bin=$candidate
+    break
+  fi
+done
+if [ -z "$bin" ] && command -v shoal >/dev/null 2>&1; then
+  bin=shoal
+fi
+if [ -z "$bin" ]; then
+  echo "shoal plugin: the shoal binary was not found. Build it (cargo build --release in tools/shoal), put it on PATH, or set SHOAL_BIN." >&2
+fi
+case "$1 $2" in
+  "hook worktree-create" | "hook worktree-remove")
+    [ -n "$bin" ] || exit 1
+    "$bin" "$@" && exit 0
+    exit 1
+    ;;
+  hook*)
+    [ -n "$bin" ] || exit 0
+    "$bin" "$@"
+    exit 0
+    ;;
+esac
+[ -n "$bin" ] || exit 1
+exec "$bin" "$@"
