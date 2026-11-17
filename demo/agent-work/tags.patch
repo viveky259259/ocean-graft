@@ -1,0 +1,191 @@
+From cec41a426110e3469858f11bb4af5871facf38d2 Mon Sep 17 00:00:00 2001
+From: agent-tags <agent-tags@example.invalid>
+Date: Tue, 17 Nov 2026 07:09:38 +0000
+Subject: [PATCH] feat: add tags to notes
+
+---
+ src/app.ts       |  6 ++++--
+ src/server.ts    |  6 +++---
+ src/store.ts     | 22 ++++++++++++++++++----
+ src/views.ts     |  3 +++
+ test/app.test.ts | 36 ++++++++++++++++++++++++++++++++++++
+ 5 files changed, 64 insertions(+), 9 deletions(-)
+
+diff --git a/src/app.ts b/src/app.ts
+index c3f7ad2..8e40e97 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -21,7 +21,8 @@ export function createApp(store = new NoteStore()) {
+   app.get("/notes", (c) => {
+     const limit = intParam(c.req.query("limit"));
+     const offset = intParam(c.req.query("offset"));
+-    return c.json(store.list({ limit, offset }));
++    const tag = c.req.query("tag");
++    return c.json(store.list({ limit, offset, tag }));
+   });
+ 
+   app.get("/notes/:id", (c) => {
+@@ -30,10 +31,11 @@ export function createApp(store = new NoteStore()) {
+   });
+ 
+   app.post("/notes", async (c) => {
+-    const body = await c.req.json<{ title?: unknown; body?: unknown }>();
++    const body = await c.req.json<{ title?: unknown; body?: unknown; tags?: unknown }>();
+     const note = store.create({
+       title: String(body.title ?? "Untitled"),
+       body: body.body === undefined ? "" : String(body.body),
++      tags: Array.isArray(body.tags) ? body.tags.map(String) : [],
+     });
+     return c.json(note, 201);
+   });
+diff --git a/src/server.ts b/src/server.ts
+index ea9722d..59ecb29 100644
+--- a/src/server.ts
++++ b/src/server.ts
+@@ -4,9 +4,9 @@ import { NoteStore } from "./store.js";
+ 
+ const store = new NoteStore();
+ if (process.env.SEED !== "0") {
+-  store.create({ title: "Welcome", body: "This is a small notes service." });
+-  store.create({ title: "Groceries", body: "Oat milk, coffee, lemons" });
+-  store.create({ title: "Ideas", body: "Try running four agents at once" });
++  store.create({ title: "Welcome", body: "This is a small notes service.", tags: ["meta", "intro"] });
++  store.create({ title: "Groceries", body: "Oat milk, coffee, lemons", tags: ["shopping", "home"] });
++  store.create({ title: "Ideas", body: "Try running four agents at once", tags: ["ideas", "agents"] });
+ }
+ 
+ const port = Number(process.env.PORT ?? 3000);
+diff --git a/src/store.ts b/src/store.ts
+index cbf59c0..ba48e87 100644
+--- a/src/store.ts
++++ b/src/store.ts
+@@ -3,16 +3,19 @@ export interface Note {
+   title: string;
+   body: string;
+   createdAt: string;
++  tags: string[];
+ }
+ 
+ export interface NewNote {
+   title: string;
+   body?: string;
++  tags?: string[];
+ }
+ 
+ export interface ListOptions {
+   limit?: number;
+   offset?: number;
++  tag?: string;
+ }
+ 
+ export interface NotePage {
+@@ -22,6 +25,12 @@ export interface NotePage {
+ 
+ export const DEFAULT_LIMIT = 20;
+ 
++/** Trim, lower-case, drop empty strings and duplicates. */
++export function normalizeTags(tags: string[] = []): string[] {
++  const cleaned = tags.map((tag) => tag.trim().toLowerCase()).filter((tag) => tag !== "");
++  return [...new Set(cleaned)];
++}
++
+ export class NoteStore {
+   private notes: Note[] = [];
+   private nextId = 1;
+@@ -32,6 +41,7 @@ export class NoteStore {
+       title: input.title,
+       body: input.body ?? "",
+       createdAt: new Date().toISOString(),
++      tags: normalizeTags(input.tags),
+     };
+     this.notes.push(note);
+     return note;
+@@ -49,11 +59,15 @@ export class NoteStore {
+   }
+ 
+   /** Newest first. */
+-  list({ limit = DEFAULT_LIMIT, offset = 0 }: ListOptions = {}): NotePage {
+-    const newestFirst = [...this.notes].reverse();
++  list({ limit = DEFAULT_LIMIT, offset = 0, tag }: ListOptions = {}): NotePage {
++    const wanted = tag?.trim().toLowerCase();
++    const matching = wanted
++      ? this.notes.filter((note) => note.tags.includes(wanted))
++      : this.notes;
++    const newestFirst = [...matching].reverse();
+     return {
+-      items: newestFirst.slice(offset, offset + limit - 1),
+-      total: this.notes.length,
++      items: newestFirst.slice(offset, offset + limit),
++      total: matching.length,
+     };
+   }
+ }
+diff --git a/src/views.ts b/src/views.ts
+index 3b53202..6f25ff1 100644
+--- a/src/views.ts
++++ b/src/views.ts
+@@ -11,6 +11,7 @@ export function renderPage(notes: Note[], total: number): string {
+       <li>
+         <h2>${escape(note.title)}</h2>
+         <p>${escape(note.body)}</p>
++        <ul class="tags">${note.tags.map((tag) => `<li class="tag">${escape(tag)}</li>`).join("")}</ul>
+         <time>${note.createdAt.slice(0, 16).replace("T", " ")}</time>
+       </li>`,
+     )
+@@ -28,6 +29,8 @@ export function renderPage(notes: Note[], total: number): string {
+     li { border: 1px solid #dfe3ea; border-radius: 8px; padding: 12px 14px; }
+     h2 { font-size: 16px; margin: 0 0 4px; }
+     p { margin: 0 0 6px; color: #4a5263; }
++    ul.tags { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 6px; }
++    li.tag { border: 0; background: #eef1f6; color: #4a5263; font-size: 12px; padding: 0 8px; border-radius: 99px; }
+     time { font-size: 12px; color: #7b8496; }
+   </style>
+ </head>
+diff --git a/test/app.test.ts b/test/app.test.ts
+index 012b27e..6946594 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -42,4 +42,40 @@ describe("notes api", () => {
+     expect(html).toContain("Shown on the page");
+     expect(html).toContain("1 note");
+   });
++
++  it("normalizes tags and defaults to an empty array", async () => {
++    const app = createApp();
++    const tagged = await (await post(app, { title: "T", tags: [" Work ", "work", "", "  ", "Home"] })).json();
++    expect(tagged.tags).toEqual(["work", "home"]);
++    const plain = await (await post(app, { title: "P" })).json();
++    expect(plain.tags).toEqual([]);
++  });
++
++  it("filters by tag case-insensitively with a matching total", async () => {
++    const app = createApp();
++    await post(app, { title: "A", tags: ["work"] });
++    await post(app, { title: "B", tags: ["home"] });
++    await post(app, { title: "C", tags: ["Work", "home"] });
++    const page = await (await app.request("/notes?tag=WORK")).json();
++    expect(page.total).toBe(2);
++    expect(page.items.map((n: { title: string }) => n.title)).toEqual(["C", "A"]);
++    const none = await (await app.request("/notes?tag=missing")).json();
++    expect(none).toEqual({ items: [], total: 0 });
++  });
++
++  it("combines tag with limit and offset", async () => {
++    const app = createApp();
++    for (const title of ["A", "B", "C", "D"]) await post(app, { title, tags: ["x"] });
++    await post(app, { title: "Other", tags: ["y"] });
++    const page = await (await app.request("/notes?tag=x&limit=2&offset=1")).json();
++    expect(page.total).toBe(4);
++    expect(page.items.map((n: { title: string }) => n.title)).toEqual(["C", "B"]);
++  });
++
++  it("shows tags on the home page", async () => {
++    const app = createApp();
++    await post(app, { title: "Tagged", tags: ["Alpha"] });
++    const html = await (await app.request("/")).text();
++    expect(html).toContain("alpha");
++  });
+ });
+-- 
+2.43.0
+

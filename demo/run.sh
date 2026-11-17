@@ -6,6 +6,8 @@
 #
 # WORK_DIR defaults to ~/shoal-demo. The base repository is created at
 # WORK_DIR/notes-app; shoal keeps its data under SHOAL_HOME (~/.shoal).
+# SHOAL_BACKEND=clone or overlay picks the backend (default: overlay as root
+# on Linux, clone otherwise).
 # Needs: shoal on PATH (cargo build --release in tools/shoal), git, node 22.12+.
 set -euo pipefail
 
@@ -28,7 +30,7 @@ git add -A
 git -c user.name="Demo" -c user.email=demo@example.invalid commit -q -m "Initial notes app"
 
 echo "\$ shoal init --setup \"npm ci\""
-shoal init --setup "npm ci"
+shoal init ${SHOAL_BACKEND:+--backend "$SHOAL_BACKEND"} --setup "npm ci"
 
 for s in "${sessions[@]}"; do
   echo

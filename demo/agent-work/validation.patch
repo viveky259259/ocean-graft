@@ -1,0 +1,222 @@
+From 3db30dd4f84a6482bfed9eff0c580f5c826b4963 Mon Sep 17 00:00:00 2001
+From: agent-validation <agent-validation@example.invalid>
+Date: Tue, 17 Nov 2026 07:09:34 +0000
+Subject: [PATCH 1/2] feat: validate POST /notes body with zod
+
+---
+ package-lock.json | 12 +++++++++-
+ package.json      |  3 ++-
+ src/app.ts        | 26 +++++++++++++++++-----
+ test/app.test.ts  | 56 +++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 90 insertions(+), 7 deletions(-)
+
+diff --git a/package-lock.json b/package-lock.json
+index be3968c..16a546f 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -9,7 +9,8 @@
+       "version": "0.1.0",
+       "dependencies": {
+         "@hono/node-server": "2.1.6",
+-        "hono": "4.13.16"
++        "hono": "4.13.16",
++        "zod": "4.1.12"
+       },
+       "devDependencies": {
+         "@types/node": "22.20.5",
+@@ -1778,6 +1779,15 @@
+       "engines": {
+         "node": ">=20.11"
+       }
++    },
++    "node_modules/zod": {
++      "version": "4.1.12",
++      "resolved": "https://registry.npmjs.org/zod/-/zod-4.1.12.tgz",
++      "integrity": "sha512-JInaHOamG8pt5+Ey8kGmdcAcg3OL9reK8ltczgHTAwNhMys/6ThXHityHxVV2p3fkw/c+MAvBHFVYHFZDmjMCQ==",
++      "license": "MIT",
++      "funding": {
++        "url": "https://github.com/sponsors/colinhacks"
++      }
+     }
+   }
+ }
+diff --git a/package.json b/package.json
+index 68d18f6..9ffe200 100644
+--- a/package.json
++++ b/package.json
+@@ -12,7 +12,8 @@
+   },
+   "dependencies": {
+     "@hono/node-server": "2.1.6",
+-    "hono": "4.13.16"
++    "hono": "4.13.16",
++    "zod": "4.1.12"
+   },
+   "devDependencies": {
+     "@types/node": "22.20.5",
+diff --git a/src/app.ts b/src/app.ts
+index c3f7ad2..aa7b795 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1,7 +1,13 @@
+ import { Hono } from "hono";
++import { z } from "zod";
+ import { NoteStore } from "./store.js";
+ import { renderPage } from "./views.js";
+ 
++const newNoteSchema = z.object({
++  title: z.string().trim().min(1).max(120),
++  body: z.string().max(5000).default(""),
++});
++
+ function intParam(value: string | undefined): number | undefined {
+   if (value === undefined) return undefined;
+   const parsed = Number.parseInt(value, 10);
+@@ -30,11 +36,21 @@ export function createApp(store = new NoteStore()) {
+   });
+ 
+   app.post("/notes", async (c) => {
+-    const body = await c.req.json<{ title?: unknown; body?: unknown }>();
+-    const note = store.create({
+-      title: String(body.title ?? "Untitled"),
+-      body: body.body === undefined ? "" : String(body.body),
+-    });
++    let json: unknown;
++    try {
++      json = await c.req.json();
++    } catch {
++      return c.json({ error: "invalid JSON" }, 400);
++    }
++    const parsed = newNoteSchema.safeParse(json);
++    if (!parsed.success) {
++      const issues = parsed.error.issues.map((issue) => ({
++        path: issue.path.join("."),
++        message: issue.message,
++      }));
++      return c.json({ error: "invalid note", issues }, 400);
++    }
++    const note = store.create(parsed.data);
+     return c.json(note, 201);
+   });
+ 
+diff --git a/test/app.test.ts b/test/app.test.ts
+index 012b27e..3573889 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -42,4 +42,60 @@ describe("notes api", () => {
+     expect(html).toContain("Shown on the page");
+     expect(html).toContain("1 note");
+   });
++
++  describe("POST /notes validation", () => {
++    it("trims the title and defaults the body", async () => {
++      const app = createApp();
++      const res = await post(app, { title: "  Padded  " });
++      expect(res.status).toBe(201);
++      expect(await res.json()).toMatchObject({ title: "Padded", body: "" });
++    });
++
++    it("accepts limits exactly", async () => {
++      const app = createApp();
++      const res = await post(app, { title: "a".repeat(120), body: "b".repeat(5000) });
++      expect(res.status).toBe(201);
++    });
++
++    it("rejects a missing title", async () => {
++      const res = await post(createApp(), { body: "x" });
++      expect(res.status).toBe(400);
++      const json = await res.json();
++      expect(json.error).toBe("invalid note");
++      expect(json.issues).toHaveLength(1);
++      expect(json.issues[0].path).toBe("title");
++    });
++
++    it("rejects a blank or too long title", async () => {
++      const app = createApp();
++      for (const title of ["   ", "", "a".repeat(121)]) {
++        const res = await post(app, { title });
++        expect(res.status).toBe(400);
++        expect((await res.json()).issues[0].path).toBe("title");
++      }
++    });
++
++    it("rejects non-string fields, one issue per problem", async () => {
++      const res = await post(createApp(), { title: 5, body: 7 });
++      expect(res.status).toBe(400);
++      const json = await res.json();
++      expect(json.issues.map((i: { path: string }) => i.path)).toEqual(["title", "body"]);
++    });
++
++    it("rejects a body over 5000 characters", async () => {
++      const res = await post(createApp(), { title: "ok", body: "b".repeat(5001) });
++      expect(res.status).toBe(400);
++      expect((await res.json()).issues[0].path).toBe("body");
++    });
++
++    it("rejects invalid JSON", async () => {
++      const res = await createApp().request("/notes", {
++        method: "POST",
++        headers: { "content-type": "application/json" },
++        body: "{not json",
++      });
++      expect(res.status).toBe(400);
++      expect(await res.json()).toEqual({ error: "invalid JSON" });
++    });
++  });
+ });
+-- 
+2.43.0
+
+
+From 023da705f9202eaf9ef842bf575a3ea8449e24d9 Mon Sep 17 00:00:00 2001
+From: Demo <demo@example.invalid>
+Date: Tue, 17 Nov 2026 07:10:14 +0000
+Subject: [PATCH 2/2] chore: bump zod to 4.6.7 for GHSA advisory
+
+---
+ package-lock.json | 8 ++++----
+ package.json      | 2 +-
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/package-lock.json b/package-lock.json
+index 16a546f..1d297e7 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -10,7 +10,7 @@
+       "dependencies": {
+         "@hono/node-server": "2.1.6",
+         "hono": "4.13.16",
+-        "zod": "4.1.12"
++        "zod": "4.6.7"
+       },
+       "devDependencies": {
+         "@types/node": "22.20.5",
+@@ -1781,9 +1781,9 @@
+       }
+     },
+     "node_modules/zod": {
+-      "version": "4.1.12",
+-      "resolved": "https://registry.npmjs.org/zod/-/zod-4.1.12.tgz",
+-      "integrity": "sha512-JInaHOamG8pt5+Ey8kGmdcAcg3OL9reK8ltczgHTAwNhMys/6ThXHityHxVV2p3fkw/c+MAvBHFVYHFZDmjMCQ==",
++      "version": "4.6.7",
++      "resolved": "https://registry.npmjs.org/zod/-/zod-4.6.7.tgz",
++      "integrity": "sha512-g8W2D2kU6a8untc053fX1uVBKzM7yqAxW/3zwk83+6RyF2+SKOuV+c0wBDhUwzV1PaGapmZH+rmcUzPf+3CGwg==",
+       "license": "MIT",
+       "funding": {
+         "url": "https://github.com/sponsors/colinhacks"
+diff --git a/package.json b/package.json
+index 9ffe200..f2c4a10 100644
+--- a/package.json
++++ b/package.json
+@@ -13,7 +13,7 @@
+   "dependencies": {
+     "@hono/node-server": "2.1.6",
+     "hono": "4.13.16",
+-    "zod": "4.1.12"
++    "zod": "4.6.7"
+   },
+   "devDependencies": {
+     "@types/node": "22.20.5",
+-- 
+2.43.0
+

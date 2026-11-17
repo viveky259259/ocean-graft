@@ -1,0 +1,67 @@
+From 44e5db6e39737293f2a1fb759e01dd9bf1ed1cb4 Mon Sep 17 00:00:00 2001
+From: agent-fix-limit <agent-fix-limit@example.invalid>
+Date: Tue, 17 Nov 2026 07:09:30 +0000
+Subject: [PATCH] fix: off-by-one in note paging; ignore negative limit/offset
+
+---
+ src/app.ts       |  2 +-
+ src/store.ts     |  2 +-
+ test/app.test.ts | 16 ++++++++++++++++
+ 3 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/src/app.ts b/src/app.ts
+index c3f7ad2..2ed936e 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -5,7 +5,7 @@ import { renderPage } from "./views.js";
+ function intParam(value: string | undefined): number | undefined {
+   if (value === undefined) return undefined;
+   const parsed = Number.parseInt(value, 10);
+-  return Number.isNaN(parsed) ? undefined : parsed;
++  return Number.isNaN(parsed) || parsed < 0 ? undefined : parsed;
+ }
+ 
+ export function createApp(store = new NoteStore()) {
+diff --git a/src/store.ts b/src/store.ts
+index cbf59c0..fb2123d 100644
+--- a/src/store.ts
++++ b/src/store.ts
+@@ -52,7 +52,7 @@ export class NoteStore {
+   list({ limit = DEFAULT_LIMIT, offset = 0 }: ListOptions = {}): NotePage {
+     const newestFirst = [...this.notes].reverse();
+     return {
+-      items: newestFirst.slice(offset, offset + limit - 1),
++      items: newestFirst.slice(offset, offset + limit),
+       total: this.notes.length,
+     };
+   }
+diff --git a/test/app.test.ts b/test/app.test.ts
+index 012b27e..e92cd07 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -28,6 +28,22 @@ describe("notes api", () => {
+     expect(page.items.map((n: { title: string }) => n.title)).toEqual(["Newer", "Older"]);
+   });
+ 
++  it("honours limit and pages without skipping notes", async () => {
++    const app = createApp();
++    for (let i = 1; i <= 7; i++) await post(app, { title: `n${i}` });
++    const titles = async (qs: string) =>
++      (await (await app.request(`/notes?${qs}`)).json()).items.map((n: { title: string }) => n.title);
++    expect(await titles("limit=5")).toEqual(["n7", "n6", "n5", "n4", "n3"]);
++    expect(await titles("limit=5&offset=5")).toEqual(["n2", "n1"]);
++  });
++
++  it("ignores negative limit and offset", async () => {
++    const app = createApp();
++    for (let i = 1; i <= 3; i++) await post(app, { title: `n${i}` });
++    const page = await (await app.request("/notes?limit=-1&offset=-2")).json();
++    expect(page.items.map((n: { title: string }) => n.title)).toEqual(["n3", "n2", "n1"]);
++  });
++
+   it("deletes a note", async () => {
+     const app = createApp();
+     const note = await (await post(app, { title: "Temporary" })).json();
+-- 
+2.43.0
+

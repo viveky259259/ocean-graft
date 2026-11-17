@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Scale test for shoal: what grows when one machine runs many sessions?
 
-Run from the base repository of an initialised project (see run.sh), as root
-on Linux with the overlay backend:
+Run from the base repository of an initialised project (see run.sh). Works on
+Linux (overlay or clone backend) and macOS (clone backend):
 
     python3 scale.py --sessions 100 --out scale.json
 
@@ -10,7 +10,7 @@ It creates N extra sessions named sNNN, gives each a small edit (every fifth
 session edits the same tracked file, so there are real conflicts), and
 measures:
   - session creation time as the count grows
-  - disk used by the whole project
+  - disk the filesystem allocated for the sessions
   - `shoal ls` and `shoal conflicts` wall time at N sessions
   - page cache: reading node_modules in 10 sessions vs in 1
   - throughput of the test suite run in 1, 4, 8 and 16 sessions at once
@@ -21,11 +21,13 @@ import argparse
 import json
 import os
 import re
+import shutil
 import statistics
 import subprocess
 import sys
 import time
 
+IS_MAC = sys.platform == "darwin"
 EDIT_TARGETS = ["README.md", "src/app.ts", "src/store.ts", "src/views.ts", "test/app.test.ts"]
 
 
@@ -43,6 +45,12 @@ def timed(fn, *a, **kw):
 
 
 def cached_kb():
+    """Memory holding file contents (Linux page cache, macOS file-backed pages)."""
+    if IS_MAC:
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
+        page = int(re.search(r"page size of (\d+) bytes", out).group(1))
+        m = re.search(r"File-backed pages:\s+(\d+)", out)
+        return int(m.group(1)) * page // 1024 if m else 0
     with open("/proc/meminfo") as f:
         for line in f:
             if line.startswith("Cached:"):
@@ -51,9 +59,16 @@ def cached_kb():
 
 
 def drop_caches():
+    """Empty the file cache. Returns False when that is not permitted."""
     os.sync()
-    with open("/proc/sys/vm/drop_caches", "w") as f:
-        f.write("3\n")
+    if IS_MAC:
+        return subprocess.run(["sudo", "-n", "purge"], capture_output=True).returncode == 0
+    try:
+        with open("/proc/sys/vm/drop_caches", "w") as f:
+            f.write("3\n")
+        return True
+    except OSError:
+        return False
 
 
 def read_tree(path):
@@ -71,30 +86,27 @@ def read_tree(path):
 
 def tree_rss_kb(pid):
     """Resident memory of a process and all its descendants."""
-    children = {}
-    for entry in os.listdir("/proc"):
-        if entry.isdigit():
-            try:
-                with open(f"/proc/{entry}/stat") as f:
-                    ppid = int(f.read().rsplit(")", 1)[1].split()[1])
-                children.setdefault(ppid, []).append(int(entry))
-            except (OSError, ValueError, IndexError):
-                pass
+    out = subprocess.run(["ps", "axo", "pid=,ppid=,rss="], capture_output=True, text=True).stdout
+    children, rss = {}, {}
+    for line in out.splitlines():
+        try:
+            p, pp, r = (int(x) for x in line.split())
+        except ValueError:
+            continue
+        children.setdefault(pp, []).append(p)
+        rss[p] = r
     total, stack = 0, [pid]
     while stack:
         p = stack.pop()
-        try:
-            with open(f"/proc/{p}/status") as f:
-                m = re.search(r"VmRSS:\s+(\d+)", f.read())
-                total += int(m.group(1)) if m else 0
-        except OSError:
-            pass
+        total += rss.get(p, 0)
         stack.extend(children.get(p, []))
     return total
 
 
 def wait_until_idle(path, timeout=15):
     """Wait until no process has its working directory inside `path`."""
+    if not os.path.isdir("/proc"):
+        return  # macOS: the clone backend never unmounts, so nothing can be busy
     deadline = time.time() + timeout
     while time.time() < deadline:
         busy = False
@@ -119,7 +131,9 @@ def main():
     args = ap.parse_args()
     n = args.sessions
     names = [f"s{i:03d}" for i in range(1, n + 1)]
-    results = {"sessions": n}
+    results = {"sessions": n, "platform": sys.platform, "cpus": os.cpu_count()}
+    home = os.environ.get("SHOAL_HOME") or os.path.expanduser("~/.shoal")
+    used_before = shutil.disk_usage(home).used
 
     # 1. Creation time as the count grows.
     create = []
@@ -149,7 +163,11 @@ def main():
             f.write(f"scratch notes for {name}\n")
 
     info = sh("shoal", "info")
-    results["project_disk"] = re.search(r"whole project: (.+)", info).group(1)
+    # du-style total; on APFS it counts cloned blocks as if they were copies.
+    results["project_disk_du"] = re.search(r"whole project: (.+)", info).group(1)
+    # What the filesystem actually allocated for the N sessions and their edits.
+    os.sync()
+    results["volume_used_by_sessions_mb"] = round((shutil.disk_usage(home).used - used_before) / 1e6, 1)
 
     # 3. Commands whose cost grows with the number of sessions.
     ms, out = timed(sh, "shoal", "ls")
@@ -160,18 +178,23 @@ def main():
     results["clean_overlap_pairs"] = out.count("merge cleanly")
 
     # 4. Page cache: one copy of node_modules in memory however many sessions read it.
-    drop_caches()
-    base = cached_kb()
-    read_tree(os.path.join(paths[names[0]], "node_modules"))
-    one = cached_kb() - base
-    for name in names[1:10]:
-        read_tree(os.path.join(paths[name], "node_modules"))
-    ten = cached_kb() - base
-    results["page_cache_mb"] = {"after_1_session": round(one / 1024), "after_10_sessions": round(ten / 1024)}
+    if drop_caches():
+        base = cached_kb()
+        read_tree(os.path.join(paths[names[0]], "node_modules"))
+        one = cached_kb() - base
+        readers = names[:10]
+        for name in readers[1:]:
+            read_tree(os.path.join(paths[name], "node_modules"))
+        many = cached_kb() - base
+        results["page_cache_mb"] = {"after_1_session": round(one / 1024),
+                                    f"after_{len(readers)}_sessions": round(many / 1024)}
+    else:
+        results["page_cache_mb"] = "skipped: cannot drop caches"
 
     # 5. Throughput: the test suite in k sessions at once (CPU-bound).
     tput = {}
-    for k in (1, 4, 8, 16):
+    cpus = os.cpu_count() or 1
+    for k in (1, cpus, 2 * cpus, 4 * cpus):
         group = names[:k]
         t = time.perf_counter()
         procs = [subprocess.Popen(["shoal", "exec", g, "--", "npx", "vitest", "run"],
@@ -181,7 +204,6 @@ def main():
         tput[k] = {"wall_s": round(wall, 2), "runs_per_min": round(k / wall * 60, 1),
                    "all_passed": all(c == 0 for c in codes)}
     results["test_runs_in_parallel"] = tput
-    results["cpus"] = os.cpu_count()
 
     # 6. Memory of one running dev server.
     server = subprocess.Popen(["shoal", "exec", names[0], "--", "npx", "tsx", "src/server.ts"],

@@ -1,0 +1,139 @@
+From bf2e2f2705794720bb90bdee383e6450a64d9eba Mon Sep 17 00:00:00 2001
+From: agent-search <agent-search@example.invalid>
+Date: Tue, 17 Nov 2026 07:09:32 +0000
+Subject: [PATCH] feat: add text search to /notes and the home page
+
+---
+ src/app.ts       |  8 +++++---
+ src/store.ts     | 18 ++++++++++++++----
+ src/views.ts     |  6 +++++-
+ test/app.test.ts | 30 ++++++++++++++++++++++++++++++
+ 4 files changed, 54 insertions(+), 8 deletions(-)
+
+diff --git a/src/app.ts b/src/app.ts
+index c3f7ad2..2068b90 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -14,14 +14,16 @@ export function createApp(store = new NoteStore()) {
+   app.get("/health", (c) => c.json({ ok: true }));
+ 
+   app.get("/", (c) => {
+-    const page = store.list();
+-    return c.html(renderPage(page.items, page.total));
++    const q = c.req.query("q") ?? "";
++    const page = store.list({ q });
++    return c.html(renderPage(page.items, page.total, q));
+   });
+ 
+   app.get("/notes", (c) => {
+     const limit = intParam(c.req.query("limit"));
+     const offset = intParam(c.req.query("offset"));
+-    return c.json(store.list({ limit, offset }));
++    const q = c.req.query("q");
++    return c.json(store.list({ limit, offset, q }));
+   });
+ 
+   app.get("/notes/:id", (c) => {
+diff --git a/src/store.ts b/src/store.ts
+index cbf59c0..a16b48e 100644
+--- a/src/store.ts
++++ b/src/store.ts
+@@ -13,6 +13,8 @@ export interface NewNote {
+ export interface ListOptions {
+   limit?: number;
+   offset?: number;
++  /** Case-insensitive substring matched against title and body. */
++  q?: string;
+ }
+ 
+ export interface NotePage {
+@@ -49,11 +51,19 @@ export class NoteStore {
+   }
+ 
+   /** Newest first. */
+-  list({ limit = DEFAULT_LIMIT, offset = 0 }: ListOptions = {}): NotePage {
+-    const newestFirst = [...this.notes].reverse();
++  list({ limit = DEFAULT_LIMIT, offset = 0, q }: ListOptions = {}): NotePage {
++    const needle = q?.trim().toLowerCase();
++    const matching = needle
++      ? this.notes.filter(
++          (note) =>
++            note.title.toLowerCase().includes(needle) ||
++            note.body.toLowerCase().includes(needle),
++        )
++      : this.notes;
++    const newestFirst = [...matching].reverse();
+     return {
+-      items: newestFirst.slice(offset, offset + limit - 1),
+-      total: this.notes.length,
++      items: newestFirst.slice(offset, offset + limit),
++      total: matching.length,
+     };
+   }
+ }
+diff --git a/src/views.ts b/src/views.ts
+index 3b53202..3bc9fef 100644
+--- a/src/views.ts
++++ b/src/views.ts
+@@ -3,7 +3,7 @@ import type { Note } from "./store.js";
+ const escape = (text: string) =>
+   text.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+ 
+-export function renderPage(notes: Note[], total: number): string {
++export function renderPage(notes: Note[], total: number, q = ""): string {
+   const session = process.env.SHOAL_SESSION ?? "local";
+   const items = notes
+     .map(
+@@ -33,6 +33,10 @@ export function renderPage(notes: Note[], total: number): string {
+ </head>
+ <body>
+   <header><h1>Notes</h1><span class="session">${escape(session)}</span></header>
++  <form method="get" action="/">
++    <input type="search" name="q" value="${escape(q)}" placeholder="Search notes">
++    <button type="submit">Search</button>
++  </form>
+   <p>${total} note${total === 1 ? "" : "s"}</p>
+   <ul>${items}</ul>
+ </body>
+diff --git a/test/app.test.ts b/test/app.test.ts
+index 012b27e..0e2590a 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -42,4 +42,34 @@ describe("notes api", () => {
+     expect(html).toContain("Shown on the page");
+     expect(html).toContain("1 note");
+   });
++
++  it("searches notes by title or body, case-insensitively", async () => {
++    const app = createApp();
++    await post(app, { title: "Groceries", body: "buy MILK" });
++    await post(app, { title: "Milk run", body: "" });
++    await post(app, { title: "Other", body: "nothing" });
++    const page = await (await app.request("/notes?q=milk")).json();
++    expect(page.total).toBe(2);
++    expect(page.items.map((n: { title: string }) => n.title)).toEqual(["Milk run", "Groceries"]);
++  });
++
++  it("combines search with limit and offset", async () => {
++    const app = createApp();
++    for (const title of ["a1", "b", "a2", "a3"]) await post(app, { title });
++    const page = await (await app.request("/notes?q=a&limit=1&offset=1")).json();
++    expect(page.total).toBe(3);
++    expect(page.items.map((n: { title: string }) => n.title)).toEqual(["a2"]);
++  });
++
++  it("filters the home page by q and keeps the search text", async () => {
++    const app = createApp();
++    await post(app, { title: "Apples" });
++    await post(app, { title: "Bananas" });
++    const html = await (await app.request("/?q=apple")).text();
++    expect(html).toContain("Apples");
++    expect(html).not.toContain("Bananas");
++    expect(html).toContain('name="q" value="apple"');
++    expect(html).toContain("1 note");
++    expect(await (await app.request("/")).text()).toContain('<form method="get"');
++  });
+ });
+-- 
+2.43.0
+

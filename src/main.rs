@@ -153,6 +153,9 @@ const DEFAULT_SETUP_INPUTS: &[&str] = &[
 ];
 
 fn main() {
+    // Exit quietly when the reader goes away (`shoal ls | head`), like other CLIs,
+    // instead of panicking on a broken pipe.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let cli = Cli::parse();
     match run(cli) {
         Ok(code) => std::process::exit(code),
