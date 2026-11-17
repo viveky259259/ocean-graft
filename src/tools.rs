@@ -72,7 +72,7 @@ pub fn definitions() -> Vec<Value> {
         }),
         json!({
             "name": "land",
-            "description": "Deliver a session's work to the user's branch safely: rebase onto the latest target, run the tests through the job queue, then fast-forward the target (never a force). Returns status: landed, nothing_to_land, uncommitted_changes (pass commit_message), conflicts (files listed; the session is left unchanged), tests_failed (output included; rewind to the pre-land checkpoint to undo the rebase), timed_out (timeout_secs ran out while waiting for a test slot or while tests ran; the tests did not fail), target_blocked (the user's uncommitted edits, or untracked or ignored files listed in files, are in the way) or target_moving. The session cannot be checkpointed, rewound, forked or discarded while it is being landed.",
+            "description": "Deliver a session's work to the user's branch safely: rebase onto the latest target, run the tests through the job queue, then fast-forward the target (never a force). Returns status: landed, nothing_to_land, uncommitted_changes (pass commit_message), conflicts (files listed; the session is left unchanged), tests_failed (output included; rewind to the pre-land checkpoint to undo the rebase), timed_out (timeout_secs ran out: waiting for the project, a test slot or another land, or while tests ran; the tests did not fail, and if checkpoint is set the session was already rebased, which rewinding to that checkpoint undoes), target_blocked (the user's uncommitted edits, or untracked or ignored files listed in files, are in the way) or target_moving. The session cannot be checkpointed, rewound, forked or discarded while it is being landed.",
             "inputSchema": schema(json!({
                 "commit_message": {"type": "string", "description": "Commit uncommitted work with this message first."},
                 "test": {"type": "string", "description": "Test command; default from shoal.toml or detected. Empty string skips tests."},
@@ -330,7 +330,7 @@ fn fork(args: &Value) -> Result<Value> {
     let mut refreshed = None;
     let mut refresh_error = None;
     if from_main {
-        match ops::refresh(&dir, false, None) {
+        match ops::refresh(&dir, false, ops::RefreshLimits::default()) {
             Ok(r) if !r.up_to_date => refreshed = Some(r),
             Ok(_) => {}
             Err(err) => {

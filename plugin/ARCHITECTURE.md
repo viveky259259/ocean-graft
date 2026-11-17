@@ -62,10 +62,13 @@ Rules that keep the integration correct:
    of the directory). Removal forgets a session before deleting its files.
    A rewind copies the checkpoint aside and swaps it in with renames; the
    next command to open the project repairs one that was killed halfway.
-   A session some process works in (Claude Code's shell) is instead
-   restored in place, file by file, so that process is not left in a
-   deleted directory and a busy overlay need not be unmounted; if that is
-   interrupted, the `pre-rewind-N` checkpoint is the way back. Setup and
+   A session some process works in (Claude Code's shell; the session's own
+   services are stopped first and do not count) is instead restored in
+   place, file by file, comparing contents, not just size and time, so that
+   process is not left in a deleted directory and a busy overlay need not
+   be unmounted; if that is interrupted, the `pre-rewind-N` checkpoint is
+   the way back. A rewind's safety checkpoint is dropped only when the
+   session is provably unchanged. Setup and
    test commands are killed with shoal if shoal itself is killed.
    Service process groups are only signalled while their leader's start
    time matches the one recorded, so a reused pid is never killed.
@@ -95,7 +98,7 @@ them. Errors set `isError` and say how to fix the problem.
 
 | Event | Handler | Behaviour |
 |---|---|---|
-| WorktreeCreate | `shoal hook worktree-create` | Creates a shoal session for `claude --worktree`, subagents with `isolation: worktree`, and background sessions. Inside an existing session it forks that session, so a subagent starts with the parent's uncommitted work; otherwise it starts from the latest template (auto-initialising the project on first use, and falling back to the last good template if a refresh fails). Prints the path as the last stdout line. Claude Code never sends WorktreeRemove for subagent or workflow worktrees (and sends no field that tells them apart), so hook-made sessions are swept by a background `shoal sweep` once idle for 72 hours (`SHOAL_WORKTREE_IDLE_HOURS`, 0 turns it off), their work saved first, unless a main session ran in them: SessionStart or UserPromptSubmit firing inside a session marks it interactive for good (they never fire for subagents). Sessions running a service and sessions any process is working in are never swept. A refresh here gets at most 600 s (hook timeout 900 s) before falling back to the last good template. |
+| WorktreeCreate | `shoal hook worktree-create` | Creates a shoal session for `claude --worktree`, subagents with `isolation: worktree`, and background sessions. Inside an existing session it forks that session, so a subagent starts with the parent's uncommitted work; otherwise it starts from the latest template (auto-initialising the project on first use, and falling back to the last good template if a refresh fails). Prints the path as the last stdout line. Claude Code never sends WorktreeRemove for subagent or workflow worktrees (and sends no field that tells them apart), so hook-made sessions are swept by a background `shoal sweep` once idle for 72 hours (`SHOAL_WORKTREE_IDLE_HOURS`, 0 turns it off), their work saved first, unless a main session ran in them: SessionStart, UserPromptSubmit or a main-session Stop (not SubagentStop) firing inside a session marks it interactive for good, through a marker file that needs no lock. Sessions running a service and sessions any process is working in are never swept; if the process list cannot be read, nothing is. The hook waits at most 60 s for another refresh and gives setup 600 s (hook timeout 900 s); past that it starts from the last good template and finishes the refresh in the background. First-time setup that is too slow for a hook goes on in the background too (the hook fails once, saying so). |
 | WorktreeRemove | `shoal hook worktree-remove` | Saves the session's work (WIP commit, import as `shoal/<name>`), then removes it. Refuses paths that are not shoal sessions. |
 | Stop, SubagentStop | `shoal hook stop` | Checkpoints the session the agent is in, when anything changed (ignored files included) and checkpoints are cheap (overlay, or copy-on-write clones). Keeps the 20 newest automatic checkpoints. `status` reports `auto_checkpoints`. |
 | SessionStart | `shoal hook session-start` | Inside a session, tells Claude which session, branch and port it has, whether checkpoints are automatic, and which tools exist. |

@@ -108,6 +108,10 @@ enum Cmd {
     /// List sessions
     #[command(alias = "list")]
     Ls,
+    /// Set up the project for a repository on first use (run by the plugin
+    /// in the background when that takes longer than a hook may wait)
+    #[command(hide = true)]
+    Prepare { repo: PathBuf },
     /// Remove idle subagent sessions, saving their work (run by the plugin)
     #[command(hide = true)]
     Sweep {
@@ -307,6 +311,11 @@ fn run(cli: Cli) -> Result<i32> {
             return Ok(0);
         }
         Cmd::Hook { event } => return Ok(hook::run(&event)),
+        Cmd::Prepare { repo } => {
+            let dir = ops::ensure_project(&repo)?;
+            ops::refresh(&dir, false, ops::RefreshLimits::default())?;
+            return Ok(0);
+        }
         // Started by shoal with its ports: bind at once, without the project
         // lock its starter may still hold.
         Cmd::Gateway {
@@ -323,7 +332,9 @@ fn run(cli: Cli) -> Result<i32> {
     };
     let mut p = Project::open(project::locate(cli.project.as_deref())?)?;
     match command {
-        Cmd::Init(_) | Cmd::Api { .. } | Cmd::Mcp | Cmd::Hook { .. } => unreachable!(),
+        Cmd::Init(_) | Cmd::Api { .. } | Cmd::Mcp | Cmd::Hook { .. } | Cmd::Prepare { .. } => {
+            unreachable!()
+        }
         Cmd::New { name, from, at } => cmd_new(&mut p, &name, from, at)?,
         Cmd::Fork { source, name, at } => cmd_new(&mut p, &name, Some(source), at)?,
         Cmd::Land {
@@ -432,6 +443,7 @@ fn cmd_init(args: InitArgs) -> Result<()> {
         copy: args.copy,
         backend: args.backend,
         port_base: args.port_base,
+        setup_deadline: None,
     })?;
     println!(
         "Template g1 ready: commit {}, {} on disk, {} backend, {} in total",
@@ -446,7 +458,7 @@ fn cmd_init(args: InitArgs) -> Result<()> {
 }
 
 fn cmd_refresh(dir: &std::path::Path) -> Result<()> {
-    let r = ops::refresh(dir, true, None)?;
+    let r = ops::refresh(dir, true, ops::RefreshLimits::default())?;
     let p = Project::open(dir.to_path_buf())?;
     if r.up_to_date {
         println!(

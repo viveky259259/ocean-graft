@@ -114,6 +114,8 @@ pub fn start_gateway(p: &Project, session: &Session, service: &mut Service) -> R
             "--to",
             &internal.to_string(),
         ])
+        // Never inside the session: it must not count as working in it.
+        .current_dir(&p.dir)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);

@@ -21,6 +21,10 @@ use std::time::Duration;
 /// hooks.json; past it, the session starts from the last good template.
 const WORKTREE_REFRESH_BUDGET: Duration = Duration::from_secs(600);
 
+/// How long a WorktreeCreate waits for a refresh another process is running
+/// before starting from the last good template.
+const REFRESH_LOCK_WAIT: Duration = Duration::from_secs(60);
+
 /// How long turn hooks wait for a busy project before skipping.
 const TURN_HOOK_LOCK_WAIT: Duration = Duration::from_secs(5);
 const MAX_INPUT: u64 = 4 * 1024 * 1024;
@@ -88,17 +92,47 @@ pub fn worktree_create(input: &Value) -> Result<PathBuf> {
                 .map(PathBuf::from)
                 .filter(|d| d.is_dir())
                 .unwrap_or(cwd);
-            let dir = ops::ensure_project(&repo)?;
-            match ops::refresh(&dir, false, Some(WORKTREE_REFRESH_BUDGET)) {
+            let dir = match ops::ensure_project_within(&repo, Some(WORKTREE_REFRESH_BUDGET)) {
+                Ok(dir) => dir,
+                Err(err) if err.downcast_ref::<ops::OverBudget>().is_some() => {
+                    // First use, and setup is slower than a hook may wait:
+                    // finish it in the background; the next worktree works.
+                    spawn_detached(&["prepare".as_ref(), repo.as_os_str()]);
+                    bail!(
+                        "the first-time setup of {} takes longer than a worktree may wait; it goes on in the background, so try again in a few minutes",
+                        repo.display()
+                    );
+                }
+                Err(err) => return Err(err),
+            };
+            let limits = ops::RefreshLimits {
+                lock_wait: Some(REFRESH_LOCK_WAIT),
+                setup: Some(WORKTREE_REFRESH_BUDGET),
+            };
+            match ops::refresh(&dir, false, limits) {
                 Ok(r) if !r.up_to_date => ops::progress(format!(
                     "template refreshed to {}",
                     crate::git::short(&r.to)
                 )),
                 Ok(_) => {}
-                // Never block worktree isolation on a broken refresh.
-                Err(err) => ops::progress(format!(
-                    "could not refresh the template ({err:#}); using the last good one"
-                )),
+                // Never block worktree isolation on a refresh.
+                Err(err) => {
+                    if matches!(
+                        err.downcast_ref::<ops::OverBudget>(),
+                        Some(ops::OverBudget::Setup)
+                    ) {
+                        // Too slow to wait for: finish it in the background,
+                        // so the following worktrees get the new template.
+                        spawn_detached(&[
+                            "--project".as_ref(),
+                            dir.as_os_str(),
+                            "refresh".as_ref(),
+                        ]);
+                    }
+                    ops::progress(format!(
+                        "could not refresh the template now ({err:#}); using the last good one"
+                    ));
+                }
             }
             (Project::open(dir)?, Origin::Template)
         }
@@ -127,17 +161,15 @@ pub fn worktree_create(input: &Value) -> Result<PathBuf> {
     Ok(info.path.canonicalize().unwrap_or(info.path))
 }
 
-/// Sweep idle subagent sessions in a detached process, so creating a
-/// worktree never waits for it. Best effort.
-fn start_background_sweep(dir: &Path, keep: &str) {
+/// Run `shoal <args>` detached (own session, no stdio, cwd /), for work a
+/// hook must not wait for. Best effort.
+fn spawn_detached(args: &[&std::ffi::OsStr]) {
     use std::os::unix::process::CommandExt;
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg("--project")
-        .arg(dir)
-        .args(["sweep", "--keep", keep])
+    cmd.args(args)
         // Not the hook's cwd: that may be a session, which this process
         // would then keep busy (an overlay could not be unmounted).
         .current_dir("/")
@@ -156,6 +188,18 @@ fn start_background_sweep(dir: &Path, keep: &str) {
             let _ = child.wait();
         });
     }
+}
+
+/// Sweep idle subagent sessions in a detached process, so creating a
+/// worktree never waits for it.
+fn start_background_sweep(dir: &Path, keep: &str) {
+    spawn_detached(&[
+        "--project".as_ref(),
+        dir.as_os_str(),
+        "sweep".as_ref(),
+        "--keep".as_ref(),
+        keep.as_ref(),
+    ]);
 }
 
 pub fn worktree_remove(input: &Value) -> Result<()> {
@@ -231,8 +275,36 @@ fn forget_missing_session(path: &Path) {
     }
 }
 
-/// SessionStart and UserPromptSubmit only fire for a main Claude Code
-/// session, so a session they fire in is one a person works in.
+/// SessionStart, UserPromptSubmit and Stop (not SubagentStop) only fire for
+/// a main Claude Code session, so a session they fire in is one a person
+/// works in, never to be swept. Recorded first as a marker file, which
+/// needs no project lock (a busy project must not make this miss), then in
+/// state when the lock is free.
+fn mark_interactive_at(cwd: &Path) {
+    let Ok(dir) = ops::project_for_path(cwd, false) else {
+        return;
+    };
+    let Ok(cwd) = cwd.canonicalize() else {
+        return;
+    };
+    let Some(name) = cwd
+        .strip_prefix(dir.join("sessions"))
+        .ok()
+        .and_then(|rest| rest.components().next())
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+    else {
+        return;
+    };
+    let marker = ops::interactive_marker(&dir, &name);
+    if marker.exists() {
+        return;
+    }
+    if let Some(parent) = marker.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&marker, b"");
+}
+
 fn mark_interactive(p: &mut Project, name: &str) -> Result<()> {
     if let Some(s) = p.state.sessions.get_mut(name) {
         if !s.interactive {
@@ -243,14 +315,29 @@ fn mark_interactive(p: &mut Project, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether a hook fired for the main session rather than a subagent.
+fn main_session_event(input: &Value) -> bool {
+    field(input, "agent_id").is_none()
+        && !matches!(field(input, "hook_event_name"), Some("SubagentStop"))
+}
+
 /// End of a turn (Stop, SubagentStop): checkpoint the session if it changed.
 pub fn stop(input: &Value) -> Result<()> {
     let Some(cwd) = agent_cwd(input) else {
         return Ok(());
     };
+    // A background session, or one that moved in with EnterWorktree, never
+    // fires SessionStart inside its worktree, but its Stop does.
+    let main = main_session_event(input);
+    if main {
+        mark_interactive_at(&cwd);
+    }
     let Some((mut p, name)) = session_at(&cwd, Some(TURN_HOOK_LOCK_WAIT))? else {
         return Ok(());
     };
+    if main {
+        mark_interactive(&mut p, &name)?;
+    }
     p.mark_active(&name)?;
     if !ops::checkpoints_are_cheap(&p) {
         return Ok(());
@@ -270,6 +357,7 @@ pub fn session_start(input: &Value) -> Result<Option<String>> {
     let Some(cwd) = agent_cwd(input) else {
         return Ok(None);
     };
+    mark_interactive_at(&cwd);
     let Some((mut p, name)) = session_at(&cwd, Some(TURN_HOOK_LOCK_WAIT))? else {
         return Ok(None);
     };
@@ -291,6 +379,7 @@ pub fn session_start(input: &Value) -> Result<Option<String>> {
 
 pub fn prompt(input: &Value) -> Result<()> {
     if let Some(cwd) = agent_cwd(input) {
+        mark_interactive_at(&cwd);
         if let Some((mut p, name)) = session_at(&cwd, Some(TURN_HOOK_LOCK_WAIT))? {
             mark_interactive(&mut p, &name)?;
             p.mark_active(&name)?;

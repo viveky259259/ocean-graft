@@ -328,3 +328,248 @@ fn setup_dies_with_shoal() {
     assert!(!alive(pid), "setup {pid} outlived shoal");
     let _: &Path = env.repo().as_path();
 }
+
+// ---------------------------------------------------------------------------
+// Round 5: in-place rewind fidelity, safety checkpoints, sweep marking
+// ---------------------------------------------------------------------------
+
+fn set_mtime(path: &Path, secs: i64) {
+    let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    let t = [
+        libc::timespec {
+            tv_sec: secs,
+            tv_nsec: 0,
+        },
+        libc::timespec {
+            tv_sec: secs,
+            tv_nsec: 0,
+        },
+    ];
+    assert_eq!(
+        unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), t.as_ptr(), 0) },
+        0
+    );
+}
+
+/// npm stamps every file with one fixed time: a file whose size, mtime and
+/// mode match the checkpoint but whose bytes differ must still be restored.
+#[test]
+fn in_place_rewind_compares_contents_not_just_metadata() {
+    for (i, backend) in backends().into_iter().enumerate() {
+        let env = Env::new(6150 + 4 * i as u16);
+        env.init(backend);
+        let s = fork(&env, "pkg");
+        let f = s.join("deps/foo/package.json");
+        fs::create_dir_all(f.parent().unwrap()).unwrap();
+        fs::write(&f, "{\"version\":\"1.0.0\"}\n").unwrap();
+        set_mtime(&f, 499162500);
+        env.api("checkpoint", json!({"session": "pkg", "label": "v1"}))
+            .unwrap();
+        fs::write(&f, "{\"version\":\"1.0.1\"}\n").unwrap(); // same size
+        set_mtime(&f, 499162500);
+        let mut shell = Command::new("sleep")
+            .arg("60")
+            .current_dir(&s)
+            .spawn()
+            .unwrap();
+        rewind(&env, "pkg", "v1");
+        let _ = shell.kill();
+        let _ = shell.wait();
+        assert_eq!(
+            fs::read_to_string(&f).unwrap(),
+            "{\"version\":\"1.0.0\"}\n",
+            "[{backend}]"
+        );
+        env.shoal(&["down"]);
+    }
+}
+
+/// An in-place overlay rewind does not copy untouched directories of the
+/// template up into the session's own layer.
+#[test]
+fn in_place_overlay_rewind_leaves_untouched_directories_alone() {
+    if !backends().contains(&"overlay") {
+        return;
+    }
+    let env = Env::new(6158);
+    env.init("overlay");
+    let s = fork(&env, "lean");
+    let upper = env.project_dir().join("volumes/lean/upper");
+    let count = |p: &Path| -> usize {
+        fn walk(p: &Path) -> usize {
+            fs::read_dir(p)
+                .map(|it| {
+                    it.flatten()
+                        .map(|e| {
+                            1 + if e.path().is_dir() {
+                                walk(&e.path())
+                            } else {
+                                0
+                            }
+                        })
+                        .sum()
+                })
+                .unwrap_or(0)
+        }
+        walk(p)
+    };
+    fs::write(s.join("one.txt"), "1\n").unwrap();
+    env.api("checkpoint", json!({"session": "lean", "label": "a"}))
+        .unwrap();
+    fs::write(s.join("one.txt"), "2\n").unwrap();
+    let before = count(&upper);
+    let mut shell = Command::new("sleep")
+        .arg("60")
+        .current_dir(&s)
+        .spawn()
+        .unwrap();
+    rewind(&env, "lean", "a");
+    let _ = shell.kill();
+    let _ = shell.wait();
+    assert_eq!(fs::read_to_string(s.join("one.txt")).unwrap(), "1\n");
+    let after = count(&upper);
+    assert!(
+        after <= before + 1,
+        "in-place rewind copied up {before} -> {after} entries"
+    );
+    assert!(!upper.join("src").exists(), "untouched src/ was copied up");
+    env.shoal(&["down"]);
+}
+
+/// The session's own running service is stopped before the decision, so it
+/// does not force the in-place path: a clone session is swapped (its
+/// directory is replaced) when nothing else works in it.
+#[test]
+fn a_running_service_does_not_force_an_in_place_rewind() {
+    use std::os::unix::fs::MetadataExt;
+    let env = Env::new(6164);
+    env.init("clone");
+    let s = fork(&env, "svc");
+    env.api("checkpoint", json!({"session": "svc", "label": "a"}))
+        .unwrap();
+    env.shoal(&["serve", "svc", "--", "sleep", "300"]);
+    let ino = fs::metadata(&s).unwrap().ino();
+    let r = rewind(&env, "svc", "a");
+    assert_eq!(r["restarted_services"], json!(["web"]), "{r}");
+    assert_ne!(
+        fs::metadata(&s).unwrap().ino(),
+        ino,
+        "rewound in place although only its own service ran in it"
+    );
+    env.shoal(&["down"]);
+}
+
+/// A swap rewind that fails after the swap (cleanup of the old tree fails)
+/// keeps its safety checkpoint: the session has changed, and that
+/// checkpoint is the only copy of what was there.
+#[test]
+fn a_swap_that_fails_after_swapping_keeps_the_safety_checkpoint() {
+    let env = Env::new(6168);
+    env.init("clone");
+    let s = fork(&env, "imm");
+    env.api("checkpoint", json!({"session": "imm", "label": "a"}))
+        .unwrap();
+    fs::write(s.join("work.txt"), "precious\n").unwrap();
+    let locked = s.join("locked.txt");
+    fs::write(&locked, "x\n").unwrap();
+    let chattr = Command::new("chattr").arg("+i").arg(&locked).status();
+    if !chattr.is_ok_and(|st| st.success()) {
+        eprintln!("skipping: chattr +i not available here");
+        return;
+    }
+    let r = env.api("rewind", json!({"session": "imm", "label": "a"}));
+    // Whatever the outcome, the pre-rewind state must survive.
+    let l = labels(&env, "imm");
+    let safety = l.iter().find(|x| x.starts_with("pre-rewind-")).cloned();
+    let _ = Command::new("chattr")
+        .arg("-i")
+        .args(
+            fs::read_dir(env.project_dir())
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("trash-"))
+                .map(|e| e.path().join("locked.txt")),
+        )
+        .status();
+    let _ = Command::new("chattr").arg("-i").arg(&locked).status();
+    let safety = safety.unwrap_or_else(|| panic!("safety checkpoint dropped: {r:?} {l:?}"));
+    let cp = env.project_dir().join("checkpoints/imm").join(&safety);
+    assert_eq!(
+        fs::read_to_string(cp.join("work.txt")).unwrap(),
+        "precious\n",
+        "{r:?}"
+    );
+    // Clean up anything immutable left behind so the temp dir can be removed.
+    for e in fs::read_dir(env.project_dir()).unwrap().flatten() {
+        let _ = Command::new("chattr")
+            .args(["-R", "-i"])
+            .arg(e.path())
+            .status();
+    }
+}
+
+/// A main session's Stop marks its session interactive (background
+/// sessions never fire SessionStart inside their worktree); a subagent's
+/// SubagentStop does not.
+#[test]
+fn main_stop_marks_a_session_interactive_but_subagent_stop_does_not() {
+    let env = Env::new(6174);
+    env.init("clone");
+    let wt = |name: &str| {
+        let r = env.hook(
+            "worktree-create",
+            &json!({"name": name, "cwd": env.repo(), "hook_event_name": "WorktreeCreate"}),
+            &env.repo(),
+            None,
+        );
+        assert_eq!(r.code, 0, "{}", r.stderr);
+        PathBuf::from(r.last_line())
+    };
+    let bg = wt("bg");
+    let sub = wt("sub");
+    let r = env.hook(
+        "stop",
+        &json!({"cwd": bg, "hook_event_name": "Stop"}),
+        &bg,
+        None,
+    );
+    assert_eq!(r.code, 0);
+    let r = env.hook(
+        "stop",
+        &json!({"cwd": sub, "hook_event_name": "SubagentStop", "agent_id": "a1"}),
+        &sub,
+        None,
+    );
+    assert_eq!(r.code, 0);
+    let st = env.state();
+    assert_eq!(st["sessions"]["bg"]["interactive"], json!(true), "{st}");
+    assert_eq!(st["sessions"]["sub"]["interactive"], json!(false), "{st}");
+    assert!(env.project_dir().join("locks/bg.interactive").exists());
+    assert!(!env.project_dir().join("locks/sub.interactive").exists());
+}
+
+/// A land that runs out of time on the land lock names its real target.
+#[test]
+fn timed_out_land_names_its_target() {
+    use std::os::unix::io::AsRawFd;
+    let env = Env::new(6178);
+    env.init("clone");
+    let s = fork(&env, "t");
+    fs::write(s.join("f.txt"), "x\n").unwrap();
+    let lock = fs::File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(env.project_dir().join("land.lock"))
+        .unwrap();
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let r = env
+        .api(
+            "land",
+            json!({"session": "t", "commit_message": "c", "test": "", "timeout_secs": 1}),
+        )
+        .unwrap();
+    assert_eq!(r["status"], "timed_out", "{r}");
+    assert_eq!(r["target"], "main", "{r}");
+    assert!(r["message"].as_str().unwrap().contains("main"), "{r}");
+}

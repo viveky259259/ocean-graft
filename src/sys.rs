@@ -388,50 +388,57 @@ pub fn process_start(pid: i32) -> Option<String> {
     }
 }
 
-/// The working directory of every process this user can see. On Linux
-/// from /proc; elsewhere one `lsof` run. When it cannot be determined the
-/// result holds "/", which counts every directory as in use.
-pub fn process_cwds() -> Vec<std::path::PathBuf> {
+/// The working directory of every process this user can see: on Linux
+/// from /proc, elsewhere from one `lsof` run. None when that cannot be
+/// determined; callers must then treat every directory as in use.
+pub fn process_cwds() -> Option<Vec<std::path::PathBuf>> {
     #[cfg(target_os = "linux")]
     {
-        let Ok(procs) = std::fs::read_dir("/proc") else {
-            return vec![std::path::PathBuf::from("/")];
-        };
-        procs
-            .flatten()
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .bytes()
-                    .all(|b| b.is_ascii_digit())
-            })
-            .filter_map(|e| std::fs::read_link(e.path().join("cwd")).ok())
-            .collect()
+        let procs = std::fs::read_dir("/proc").ok()?;
+        Some(
+            procs
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .bytes()
+                        .all(|b| b.is_ascii_digit())
+                })
+                .filter_map(|e| std::fs::read_link(e.path().join("cwd")).ok())
+                .collect(),
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let Ok(out) = Command::new("lsof")
+        let out = Command::new("lsof")
             .args(["-w", "-b", "-a", "-d", "cwd", "-Fn"])
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .output()
-        else {
-            return vec![std::path::PathBuf::from("/")];
-        };
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter_map(|l| l.strip_prefix('n'))
-            .map(std::path::PathBuf::from)
-            .collect()
+            .ok()?;
+        if !out.status.success() && out.stdout.is_empty() {
+            return None;
+        }
+        Some(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|l| l.strip_prefix('n'))
+                .map(std::path::PathBuf::from)
+                .collect(),
+        )
     }
 }
 
-/// Whether any process has its working directory at or under `dir`.
+/// Whether any process has its working directory at or under `dir`. When
+/// that cannot be determined, the answer is yes (fail safe).
 pub fn is_cwd_of_a_process(dir: &Path) -> bool {
     let Ok(dir) = dir.canonicalize() else {
         return false;
     };
-    process_cwds().iter().any(|cwd| cwd.starts_with(&dir))
+    match process_cwds() {
+        Some(cwds) => cwds.iter().any(|cwd| cwd.starts_with(&dir)),
+        None => true,
+    }
 }
 
 /// Process groups shoal started for setup and tests. If shoal is killed
@@ -489,22 +496,93 @@ impl Drop for OwnedGroup {
     }
 }
 
-/// Make the tree at `dst` the same as the one at `src`, in place: entries
-/// only in `dst` are removed, changed files (size, mtime, type or mode) are
-/// copied, symlinks recreated, and directory modes set. Used to restore a
-/// session that a process is working in, where swapping the directory
-/// would leave that process in a deleted one.
-pub fn sync_tree(src: &Path, dst: &Path) -> Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let remove = |p: &Path| -> Result<()> {
-        match p.symlink_metadata() {
-            Ok(m) if m.is_dir() => std::fs::remove_dir_all(p)?,
-            Ok(_) => std::fs::remove_file(p)?,
-            Err(_) => {}
-        }
-        Ok(())
+/// Delete a tree even where it holds read-only directories (which a
+/// normal user cannot empty without first making them writable).
+pub fn remove_tree(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = match path.symlink_metadata() {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
     };
-    // Entries that should not be there.
+    if !meta.is_dir() {
+        return std::fs::remove_file(path);
+    }
+    if std::fs::remove_dir_all(path).is_ok() {
+        return Ok(());
+    }
+    // Make every directory writable and searchable, then try again.
+    fn open_up(dir: &Path) {
+        if let Ok(m) = dir.symlink_metadata() {
+            if m.is_dir() {
+                let _ = std::fs::set_permissions(
+                    dir,
+                    std::fs::Permissions::from_mode(m.permissions().mode() | 0o700),
+                );
+                if let Ok(entries) = std::fs::read_dir(dir) {
+                    for e in entries.flatten() {
+                        open_up(&e.path());
+                    }
+                }
+            }
+        }
+    }
+    open_up(path);
+    std::fs::remove_dir_all(path)
+}
+
+/// Whether two regular files hold the same bytes.
+fn same_contents(a: &Path, b: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    let (mut fa, mut fb) = (std::fs::File::open(a)?, std::fs::File::open(b)?);
+    let (mut ba, mut bb) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
+    loop {
+        let na = fa.read(&mut ba)?;
+        let mut filled = 0;
+        while filled < na {
+            let n = fb.read(&mut bb[filled..na])?;
+            if n == 0 {
+                return Ok(false);
+            }
+            filled += n;
+        }
+        if na == 0 {
+            return Ok(fb.read(&mut bb[..1])? == 0);
+        }
+        if ba[..na] != bb[..na] {
+            return Ok(false);
+        }
+    }
+}
+
+/// Make the tree at `dst` the same as the one at `src`, in place: entries
+/// only in `dst` are removed, files whose contents or metadata differ are
+/// copied, symlinks recreated, and modes set where they differ. Used to
+/// restore a session that a process is working in, where swapping the
+/// directory would leave that process in a deleted one.
+///
+/// `identical(rel)` may report that the entry at relative path `rel` is
+/// known to be the same on both sides (for overlay sessions: neither layer
+/// on top of the shared lowers touches it); such entries, and whole
+/// directories, are skipped without reading them.
+pub fn sync_tree(src: &Path, dst: &Path, identical: &dyn Fn(&Path) -> bool) -> Result<()> {
+    sync_dir(src, dst, Path::new(""), identical)
+}
+
+fn sync_dir(src: &Path, dst: &Path, rel: &Path, identical: &dyn Fn(&Path) -> bool) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let set_mode = |p: &Path, mode: u32| -> std::io::Result<()> {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode))
+    };
+    // A read-only directory cannot be changed: open it up for the sync and
+    // give it its final mode at the end.
+    let dst_mode = dst.symlink_metadata()?.mode() & 0o7777;
+    if dst_mode & 0o300 != 0o300 {
+        set_mode(dst, dst_mode | 0o700)?;
+    }
+    let remove = |p: &Path| -> Result<()> {
+        remove_tree(p).with_context(|| format!("could not remove {}", p.display()))
+    };
     for entry in
         std::fs::read_dir(dst).with_context(|| format!("could not read {}", dst.display()))?
     {
@@ -519,16 +597,23 @@ pub fn sync_tree(src: &Path, dst: &Path) -> Result<()> {
         let entry = entry?;
         let from = entry.path();
         let to = dst.join(entry.file_name());
+        let child_rel = rel.join(entry.file_name());
         let meta = from.symlink_metadata()?;
         let existing = to.symlink_metadata().ok();
         let ft = meta.file_type();
+        if existing.is_some() && identical(&child_rel) {
+            continue;
+        }
         if ft.is_dir() {
             if !existing.as_ref().is_some_and(|m| m.is_dir()) {
                 remove(&to)?;
                 std::fs::create_dir(&to)?;
             }
-            sync_tree(&from, &to)?;
-            std::fs::set_permissions(&to, std::fs::Permissions::from_mode(meta.mode() & 0o7777))?;
+            sync_dir(&from, &to, &child_rel, identical)?;
+            let want = meta.mode() & 0o7777;
+            if to.symlink_metadata()?.mode() & 0o7777 != want {
+                set_mode(&to, want)?;
+            }
         } else if ft.is_symlink() {
             let target = std::fs::read_link(&from)?;
             let same = existing
@@ -540,25 +625,27 @@ pub fn sync_tree(src: &Path, dst: &Path) -> Result<()> {
                 std::os::unix::fs::symlink(&target, &to)?;
             }
         } else if ft.is_file() {
+            // Same size, time and mode is not proof: package managers stamp
+            // every file with one fixed time. Compare the bytes too.
             let same = existing.as_ref().is_some_and(|m| {
                 m.is_file()
                     && m.len() == meta.len()
                     && m.mtime() == meta.mtime()
                     && m.mtime_nsec() == meta.mtime_nsec()
                     && m.mode() == meta.mode()
-            });
+            }) && same_contents(&from, &to).unwrap_or(false);
             if !same {
                 remove(&to)?;
                 std::fs::copy(&from, &to)
                     .with_context(|| format!("could not copy {}", from.display()))?;
-                std::fs::set_permissions(
-                    &to,
-                    std::fs::Permissions::from_mode(meta.mode() & 0o7777),
-                )?;
+                set_mode(&to, meta.mode() & 0o7777)?;
                 set_mtime(&to, meta.mtime(), meta.mtime_nsec())?;
             }
         }
         // Sockets, FIFOs and devices are not part of a working tree.
+    }
+    if dst_mode & 0o300 != 0o300 {
+        set_mode(dst, dst_mode)?;
     }
     Ok(())
 }
