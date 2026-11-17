@@ -1,0 +1,22 @@
+#!/bin/sh
+# Runs the shoal binary for the plugin. Looks, in order, for $SHOAL_BIN, a
+# binary bundled next to this script for this platform (shoal-<os>-<arch>),
+# a development build in the repository, then shoal on PATH.
+here=$(cd "$(dirname "$0")" && pwd)
+os=$(uname -s | tr '[:upper:]' '[:lower:]')
+arch=$(uname -m)
+for candidate in "${SHOAL_BIN:-}" "$here/shoal-$os-$arch" "$here/../../target/release/shoal"; do
+  if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+    exec "$candidate" "$@"
+  fi
+done
+if command -v shoal >/dev/null 2>&1; then
+  exec shoal "$@"
+fi
+echo "shoal plugin: the shoal binary was not found. Build it (cargo build --release in tools/shoal), put it on PATH, or set SHOAL_BIN." >&2
+# Worktree hooks must fail loudly; turn hooks must never get in the way.
+case "$1 $2" in
+  "hook worktree-create" | "hook worktree-remove") exit 1 ;;
+  hook*) exit 0 ;;
+esac
+exit 1

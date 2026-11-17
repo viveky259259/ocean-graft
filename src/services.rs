@@ -313,3 +313,109 @@ pub fn human_secs(secs: u64) -> String {
         _ => format!("{}d", secs / 86400),
     }
 }
+
+/// Stop the running services of a session; returns how many stopped and the
+/// memory they were using (KB).
+pub fn stop_session(
+    p: &mut Project,
+    name: &str,
+    only: Option<&str>,
+    for_idle: bool,
+    keep_gateways: bool,
+) -> Result<(usize, u64)> {
+    let session = p
+        .state
+        .sessions
+        .get_mut(name)
+        .with_context(|| format!("no session named {name:?}"))?;
+    let mut running = Vec::new();
+    for svc in session.services.iter_mut() {
+        if only.is_some_and(|o| o != svc.name) {
+            continue;
+        }
+        if state(svc) == State::Running {
+            svc.stopped_for_idle = for_idle;
+            running.push(svc);
+        } else if svc.pid.is_some() {
+            svc.pid = None; // it had exited on its own
+        }
+    }
+    let count = running.len();
+    let kb = stop_all(running)?.iter().sum();
+    if !keep_gateways {
+        let session = p.state.sessions.get_mut(name).expect("session exists");
+        for svc in session.services.iter_mut() {
+            if only.is_none_or(|o| o == svc.name) {
+                stop_gateway(svc);
+            }
+        }
+    }
+    p.save()?;
+    Ok((count, kb))
+}
+
+/// Start (or restart) a named service in a session. With `on_demand`, the
+/// service gets a private port and a gateway owns the session's public port,
+/// waking the service on the first request after `reap` stopped it.
+pub fn serve(
+    p: &mut Project,
+    name: &str,
+    service: &str,
+    on_demand: bool,
+    command: Vec<String>,
+) -> Result<Service> {
+    crate::project::validate_name("service", service)?;
+    if command.is_empty() {
+        bail!("no command to run for {service}");
+    }
+    p.ensure_ready(name)?;
+    let session = p.session(name)?.clone();
+    let index = session.services.iter().position(|s| s.name == service);
+    if let Some(existing) = index.map(|i| &session.services[i]) {
+        if state(existing) == State::Running {
+            bail!(
+                "{service} is already running in {name} (process group {}); stop it first",
+                existing.pid.unwrap_or_default()
+            );
+        }
+    }
+    let slot = index.unwrap_or(session.services.len());
+    if slot >= 10 {
+        bail!("a session has ports for at most 10 services");
+    }
+    let existing = index.map(|i| session.services[i].clone());
+    let mut svc = Service {
+        name: service.to_string(),
+        command,
+        port: session.port + slot as u16,
+        pid: None,
+        started_at: 0,
+        stopped_for_idle: false,
+        internal_port: None,
+        gateway: existing.as_ref().and_then(|e| e.gateway),
+    };
+    if on_demand {
+        svc.internal_port = match existing.as_ref().and_then(|e| e.internal_port) {
+            Some(port) => Some(port),
+            None => Some(crate::gateway::free_port()?),
+        };
+    } else if let Some(mut old) = existing {
+        stop_gateway(&mut old); // switching back to a plain service
+        svc.gateway = None;
+    }
+    start(p, &session, &mut svc)?;
+    if on_demand && !gateway_running(&svc) {
+        if let Err(err) = start_gateway(p, &session, &mut svc) {
+            let _ = stop_all(vec![&mut svc]);
+            return Err(err);
+        }
+    }
+    let s = p.state.sessions.get_mut(name).expect("session exists");
+    match index {
+        Some(i) => s.services[i] = svc.clone(),
+        None => s.services.push(svc.clone()),
+    }
+    s.last_active = crate::sys::now();
+    p.save()?;
+    Ok(svc)
+}

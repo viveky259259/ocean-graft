@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "shoal": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/shoal-plugin",
+      "args": ["mcp"]
+    }
+  }
+}

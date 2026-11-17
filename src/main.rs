@@ -6,17 +6,22 @@
 //! branch and its installed dependencies, created in milliseconds and storing
 //! only what it changes.
 
+mod config;
 mod conflicts;
 mod gateway;
 mod git;
+mod hook;
+mod mcp;
+mod ops;
 mod project;
 mod queue;
 mod services;
 mod sys;
+mod tools;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use project::{validate_name, Backend, Checkpoint, Generation, Project, Service, Session, State};
+use project::{Backend, Project, Service, Session};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -46,9 +51,50 @@ enum Cmd {
         /// Fork this session instead, keeping its uncommitted and ignored files
         #[arg(long)]
         from: Option<String>,
+        /// With --from: start from one of that session's checkpoints
+        #[arg(long, requires = "from")]
+        at: Option<String>,
     },
     /// Fork a session, keeping its uncommitted and ignored files
-    Fork { source: String, name: String },
+    Fork {
+        source: String,
+        name: String,
+        /// Start from one of the source session's checkpoints instead
+        #[arg(long)]
+        at: Option<String>,
+    },
+    /// Land a session's work on the tracked branch: rebase, test, fast-forward
+    Land {
+        name: String,
+        /// Commit uncommitted work with this message first
+        #[arg(long, short)]
+        message: Option<String>,
+        /// Test command (default: shoal.toml or detected)
+        #[arg(long, conflicts_with = "no_test")]
+        test: Option<String>,
+        /// Skip tests
+        #[arg(long)]
+        no_test: bool,
+        /// Target branch (default: the branch the project tracks)
+        #[arg(long)]
+        into: Option<String>,
+        /// Test time limit in seconds
+        #[arg(long, default_value_t = 1800)]
+        timeout: u64,
+    },
+    /// Call a tool with JSON arguments and print its JSON result (what the MCP server does)
+    Api {
+        tool: String,
+        /// JSON object of arguments (default: {})
+        args: Option<String>,
+    },
+    /// Serve the tools over MCP on stdin/stdout (for Claude Code)
+    Mcp,
+    /// Handle a Claude Code hook event, reading its JSON from stdin
+    Hook {
+        #[arg(value_parser = clap::builder::PossibleValuesParser::new(hook::EVENTS))]
+        event: String,
+    },
     /// List sessions
     #[command(alias = "list")]
     Ls,
@@ -190,27 +236,6 @@ struct InitArgs {
     port_base: u16,
 }
 
-const DEFAULT_SETUP_INPUTS: &[&str] = &[
-    "package.json",
-    "package-lock.json",
-    "npm-shrinkwrap.json",
-    "yarn.lock",
-    "pnpm-lock.yaml",
-    "bun.lock",
-    "bun.lockb",
-    "Cargo.toml",
-    "Cargo.lock",
-    "go.mod",
-    "go.sum",
-    "requirements.txt",
-    "pyproject.toml",
-    "poetry.lock",
-    "uv.lock",
-    "Pipfile.lock",
-    "Gemfile.lock",
-    "composer.lock",
-];
-
 fn main() {
     // Exit quietly when the reader goes away (`shoal ls | head`), like other CLIs,
     // instead of panicking on a broken pipe.
@@ -240,13 +265,32 @@ fn run(cli: Cli) -> Result<i32> {
             cmd_reap(&idle, watch.as_deref())?;
             return Ok(0);
         }
+        Cmd::Api { tool, args } => return cmd_api(&tool, args.as_deref(), cli.project.as_deref()),
+        Cmd::Mcp => {
+            mcp::serve()?;
+            return Ok(0);
+        }
+        Cmd::Hook { event } => return Ok(hook::run(&event)),
         other => other,
     };
     let mut p = Project::open(project::locate(cli.project.as_deref())?)?;
     match command {
-        Cmd::Init(_) => unreachable!(),
-        Cmd::New { name, from } => cmd_new(&mut p, &name, from.as_deref())?,
-        Cmd::Fork { source, name } => cmd_new(&mut p, &name, Some(&source))?,
+        Cmd::Init(_) | Cmd::Api { .. } | Cmd::Mcp | Cmd::Hook { .. } => unreachable!(),
+        Cmd::New { name, from, at } => cmd_new(&mut p, &name, from, at)?,
+        Cmd::Fork { source, name, at } => cmd_new(&mut p, &name, Some(source), at)?,
+        Cmd::Land {
+            name,
+            message,
+            test,
+            no_test,
+            into,
+            timeout,
+        } => {
+            let dir = p.dir.clone();
+            p.session(&name)?;
+            drop(p);
+            return cmd_land(&dir, &name, message, test, no_test, into, timeout);
+        }
         Cmd::Ls => cmd_ls(&p)?,
         Cmd::Status { name } => cmd_status(&p, &name)?,
         Cmd::Path { name } => println!("{}", p.ensure_ready(&name)?.display()),
@@ -314,238 +358,56 @@ fn run(cli: Cli) -> Result<i32> {
 // init and refresh: building templates
 // ---------------------------------------------------------------------------
 
-fn run_setup(dir: &Path, setup: &str) -> Result<()> {
-    println!("Running setup in the template: {setup}");
-    let start = Instant::now();
-    let code = sys::interactive(
-        Command::new("sh")
-            .arg("-c")
-            .arg(setup)
-            .current_dir(dir)
-            .env("SHOAL_TEMPLATE", "1"),
-    )?;
-    if code != 0 {
-        bail!("setup command exited with status {code}");
-    }
-    println!("Setup finished in {}", sys::human_duration(start.elapsed()));
-    Ok(())
-}
-
 fn cmd_init(args: InitArgs) -> Result<()> {
-    let start = Instant::now();
     let repo = match args.repo {
         Some(repo) => repo,
         None => std::env::current_dir()?,
     };
-    let source = git::toplevel(&repo)?;
-    let branch = match args.branch {
-        Some(branch) => branch,
-        None => git::git_trim(&source, &["rev-parse", "--abbrev-ref", "HEAD"])?,
-    };
-    if branch == "HEAD" {
-        bail!("{} has a detached HEAD; pass --branch", source.display());
-    }
-    git::git_trim(
-        &source,
-        &["rev-parse", "--verify", &format!("{branch}^{{commit}}")],
-    )
-    .with_context(|| format!("branch {branch} has no commits"))?;
-    let backend = args.backend.unwrap_or_else(Backend::auto);
-    backend.check_supported()?;
-
-    let dir = project::project_dir_for(&source)?;
-    if dir.join("state.json").exists() {
-        bail!(
-            "{} already has a shoal project at {}",
-            source.display(),
-            dir.display()
-        );
-    }
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).context("could not clear a half-built project")?;
-    }
-    for sub in ["layers", "templates", "sessions", "volumes", "checkpoints"] {
-        std::fs::create_dir_all(dir.join(sub))?;
-    }
-    git::git(&dir, &["init", "--bare", "-q", "hub.git"])?;
-
-    let rel = match backend {
-        Backend::Overlay => "layers/g1",
-        Backend::Clone => "templates/g1",
-    };
-    let template = dir.join(rel);
-    println!("Cloning {} ({branch}) into the template", source.display());
-    sys::output(
-        Command::new("git")
-            .args(["clone", "-q", "--branch", &branch])
-            .arg(&source)
-            .arg(&template),
-    )?;
-    // Sessions share the template's packs; they must never repack them.
-    git::git(&template, &["config", "gc.auto", "0"])?;
-    git::git(&template, &["config", "maintenance.auto", "false"])?;
-
-    for item in &args.copy {
-        let rel_path = Path::new(item);
-        if rel_path.is_absolute() || rel_path.components().any(|c| c.as_os_str() == "..") {
-            bail!("--copy takes a path inside the repository: {item}");
-        }
-        let from = source.join(rel_path);
-        if from.symlink_metadata().is_err() {
-            println!("Skipping --copy {item}: not found in {}", source.display());
-            continue;
-        }
-        let to = template.join(rel_path);
-        if let Some(parent) = to.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        if to.symlink_metadata().is_ok() {
-            bail!("--copy {item}: the file is tracked by git, so it is already in the template");
-        }
-        sys::clone_tree(&from, &to)?;
-    }
-
-    let setup_inputs = if args.setup_inputs.is_empty() {
-        DEFAULT_SETUP_INPUTS.iter().map(|s| s.to_string()).collect()
-    } else {
-        args.setup_inputs
-    };
-    if let Some(setup) = &args.setup {
-        run_setup(&template, setup)?;
-    }
-    git::git(&template, &["status", "--porcelain"])?; // refresh the index's stat data
-    let commit = git::head(&template)?;
-
-    let mut state = State::new(
-        source.clone(),
-        branch,
-        backend,
-        args.setup,
-        setup_inputs,
-        args.port_base,
-    );
-    state.generations.push(Generation {
-        id: 1,
-        commit: commit.clone(),
-        created_at: sys::now(),
-        layers: vec![rel.to_string()],
-    });
-    let p = Project::create(dir, state)?;
+    let r = ops::init(ops::InitOptions {
+        repo,
+        branch: args.branch,
+        setup: args.setup,
+        setup_inputs: args.setup_inputs,
+        copy: args.copy,
+        backend: args.backend,
+        port_base: args.port_base,
+    })?;
     println!(
         "Template g1 ready: commit {}, {} on disk, {} backend, {} in total",
-        git::short(&commit),
-        sys::human_bytes(sys::disk_usage(&template)),
-        backend.name(),
-        sys::human_duration(start.elapsed())
+        git::short(&r.commit),
+        sys::human_bytes(r.template_bytes),
+        r.backend,
+        sys::human_duration(std::time::Duration::from_millis(r.elapsed_ms))
     );
-    println!("Project: {}", p.dir.display());
+    println!("Project: {}", r.project.display());
     println!("Next: shoal new <name>");
     Ok(())
 }
 
-fn touches_setup_inputs(changed: &[String], inputs: &[String]) -> bool {
-    changed.iter().any(|path| {
-        inputs
-            .iter()
-            .any(|input| path == input || path.ends_with(&format!("/{input}")))
-    })
-}
-
 fn cmd_refresh(p: &mut Project) -> Result<()> {
-    let start = Instant::now();
-    let latest = p.latest().clone();
-    let branch = p.state.branch.clone();
-    let source_head = git::git_trim(&p.state.source, &["rev-parse", &branch])?;
-    if source_head == latest.commit {
+    let r = ops::refresh(p)?;
+    if r.up_to_date {
         println!(
-            "Template g{} is already at {} ({branch})",
-            latest.id,
-            git::short(&source_head)
+            "Template g{} is already at {} ({})",
+            r.generation,
+            git::short(&r.to),
+            p.state.branch
         );
         return Ok(());
     }
-    let id = latest.id + 1;
-    let (rel, build) = match p.state.backend {
-        Backend::Overlay => {
-            let rel = format!("layers/g{id}");
-            let build = p.dir.join("build");
-            let work = p.dir.join("build-work");
-            for dir in [&p.abs(&rel), &build, &work] {
-                if dir.exists() && dir != &build {
-                    std::fs::remove_dir_all(dir)?;
-                }
-                std::fs::create_dir_all(dir)?;
-            }
-            let lowers: Vec<PathBuf> = latest.layers.iter().map(|l| p.abs(l)).collect();
-            let lowers: Vec<&Path> = lowers.iter().map(PathBuf::as_path).collect();
-            sys::mount_overlay(&lowers, &p.abs(&rel), &work, &build)?;
-            (rel, build)
-        }
-        Backend::Clone => {
-            let rel = format!("templates/g{id}");
-            let dir = p.abs(&rel);
-            if dir.exists() {
-                std::fs::remove_dir_all(&dir)?;
-            }
-            sys::clone_tree(&p.abs(&latest.layers[0]), &dir)?;
-            (rel.clone(), dir)
-        }
-    };
-
-    let result = (|| -> Result<(usize, bool)> {
-        git::git(&build, &["fetch", "-q", "origin", &branch])?;
-        git::git(&build, &["reset", "-q", "--hard", "FETCH_HEAD"])?;
-        let changed: Vec<String> = git::git(
-            &build,
-            &["diff", "--name-only", &latest.commit, &source_head],
-        )?
-        .lines()
-        .map(str::to_string)
-        .collect();
-        let mut ran = false;
-        if let Some(setup) = p.state.setup.clone() {
-            if touches_setup_inputs(&changed, &p.state.setup_inputs) {
-                run_setup(&build, &setup)?;
-                ran = true;
-            }
-        }
-        git::git(&build, &["status", "--porcelain"])?;
-        Ok((changed.len(), ran))
-    })();
-
-    if p.state.backend == Backend::Overlay {
-        sys::unmount(&build)?;
-        std::fs::remove_dir_all(p.dir.join("build-work"))?;
-        std::fs::remove_dir(&build)?;
-    }
-    let (changed, ran) = match result {
-        Ok(r) => r,
-        Err(err) => {
-            let _ = std::fs::remove_dir_all(p.abs(&rel));
-            return Err(err);
-        }
-    };
-
-    let mut layers = vec![rel.clone()];
-    if p.state.backend == Backend::Overlay {
-        layers.extend(latest.layers.iter().cloned());
-    }
-    p.state.generations.push(Generation {
-        id,
-        commit: source_head.clone(),
-        created_at: sys::now(),
-        layers,
-    });
-    p.save()?;
     println!(
-        "Template g{id}: {}..{}, {changed} files changed, setup {}, {} on disk, {}",
-        git::short(&latest.commit),
-        git::short(&source_head),
-        if ran { "re-run" } else { "not needed" },
-        sys::human_bytes(sys::disk_usage(&p.abs(&rel))),
-        sys::human_duration(start.elapsed())
+        "Template g{}: {}..{}, {} files changed, setup {}, {}",
+        r.generation,
+        git::short(&r.from),
+        git::short(&r.to),
+        r.changed_files,
+        if r.setup_ran { "re-run" } else { "not needed" },
+        sys::human_duration(std::time::Duration::from_millis(r.elapsed_ms))
     );
-    println!("New sessions use g{id}. Existing sessions stay on their generation.");
+    println!(
+        "New sessions use g{}. Existing sessions stay on their generation.",
+        r.generation
+    );
     Ok(())
 }
 
@@ -553,99 +415,100 @@ fn cmd_refresh(p: &mut Project) -> Result<()> {
 // Sessions
 // ---------------------------------------------------------------------------
 
-fn cmd_new(p: &mut Project, name: &str, from: Option<&str>) -> Result<()> {
-    validate_name("session", name)?;
-    if p.state.sessions.contains_key(name) {
-        bail!("session {name} already exists");
-    }
-    let path = p.session_path(name);
-    if path.symlink_metadata().is_ok() || p.volume_dir(name).exists() {
-        bail!(
-            "{} is left over from an earlier session; remove it first",
-            path.display()
-        );
-    }
+fn cmd_new(p: &mut Project, name: &str, from: Option<String>, at: Option<String>) -> Result<()> {
     let start = Instant::now();
-    let (generation, base_commit, lowers, parent) = match from {
-        None => {
-            let g = p.latest().clone();
-            if p.state.backend == Backend::Clone {
-                sys::clone_tree(&p.abs(&g.layers[0]), &path)?;
-            }
-            let lowers = match p.state.backend {
-                Backend::Overlay => g.layers.clone(),
-                Backend::Clone => Vec::new(),
-            };
-            (g.id, g.commit, lowers, None)
-        }
-        Some(parent) => {
-            let ps = p.session(parent)?.clone();
-            let parent_path = p.ensure_ready(parent)?;
-            sys::sync();
-            let lowers = match p.state.backend {
-                Backend::Overlay => {
-                    // Freeze the parent's changes into a layer both sessions sit on.
-                    let layer = format!("layers/fork-{parent}-{name}-{}", sys::now());
-                    sys::clone_tree(&p.volume_dir(parent).join("upper"), &p.abs(&layer))?;
-                    let mut lowers = vec![layer];
-                    lowers.extend(ps.lowers.iter().cloned());
-                    lowers
-                }
-                Backend::Clone => {
-                    sys::clone_tree(&parent_path, &path)?;
-                    Vec::new()
-                }
-            };
-            (
-                ps.generation,
-                ps.base_commit,
-                lowers,
-                Some(parent.to_string()),
-            )
-        }
+    let origin = match (from, at) {
+        (None, _) => ops::Origin::Template,
+        (Some(session), None) => ops::Origin::Session(session),
+        (Some(session), Some(label)) => ops::Origin::Checkpoint { session, label },
     };
-    let session = Session {
-        name: name.to_string(),
-        generation,
-        base_commit,
-        branch: format!("shoal/{name}"),
-        port: p.next_port(),
-        created_at: sys::now(),
-        parent,
-        lowers,
-        services: Vec::new(),
-        last_active: sys::now(),
-    };
-    let created = (|| -> Result<std::time::Duration> {
-        if p.state.backend == Backend::Overlay {
-            p.mount(&session)?;
-        }
-        let ready = start.elapsed();
-        git::git(&path, &["switch", "-q", "-c", &session.branch])?;
-        Ok(ready)
-    })();
-    let ready = match created {
-        Ok(ready) => ready,
-        Err(err) => {
-            let _ = p.destroy_volume(name);
-            return Err(err);
-        }
-    };
-    p.state.sessions.insert(name.to_string(), session.clone());
-    p.save()?;
-    let origin = match &session.parent {
-        Some(parent) => format!("forked from {parent}"),
-        None => format!("from template g{}", session.generation),
+    let info = ops::create_session(p, name, &origin)?;
+    let what = match (&info.parent, &info.from_checkpoint) {
+        (Some(parent), Some(cp)) => format!("from {parent}@{cp}"),
+        (Some(parent), None) => format!("forked from {parent}"),
+        _ => format!("from template g{}", info.generation),
     };
     println!(
-        "Created {name} {origin} in {} (branch {} {})",
-        sys::human_duration(ready),
-        session.branch,
-        sys::human_duration(start.elapsed() - ready)
+        "Created {name} {what} in {} (branch {} {})",
+        sys::human_duration(std::time::Duration::from_millis(info.ready_ms)),
+        info.branch,
+        sys::human_duration(
+            start
+                .elapsed()
+                .saturating_sub(std::time::Duration::from_millis(info.ready_ms))
+        )
     );
-    println!("  path  {}", path.display());
-    println!("  port  {}", session.port);
+    println!("  path  {}", info.path.display());
+    println!("  port  {}", info.port);
     Ok(())
+}
+
+fn cmd_land(
+    dir: &Path,
+    name: &str,
+    message: Option<String>,
+    test: Option<String>,
+    no_test: bool,
+    into: Option<String>,
+    timeout: u64,
+) -> Result<i32> {
+    let r = ops::land(
+        dir,
+        name,
+        &ops::LandOptions {
+            test: if no_test { Some(String::new()) } else { test },
+            commit_message: message,
+            into,
+            test_timeout: std::time::Duration::from_secs(timeout.max(1)),
+        },
+    )?;
+    println!("{}: {}", r.status, r.message);
+    if !r.files.is_empty() {
+        println!("  files: {}", r.files.join(", "));
+    }
+    if let Some(t) = &r.tests {
+        println!(
+            "  tests: `{}` {} in {}",
+            t.command,
+            if t.passed {
+                "passed"
+            } else if t.timed_out {
+                "timed out"
+            } else {
+                "failed"
+            },
+            sys::human_duration(std::time::Duration::from_millis(t.duration_ms))
+        );
+        if !t.passed {
+            println!("{}", t.output_tail);
+        }
+    }
+    Ok(if r.status == "landed" || r.status == "nothing_to_land" {
+        0
+    } else {
+        3
+    })
+}
+
+fn cmd_api(tool: &str, args: Option<&str>, project: Option<&Path>) -> Result<i32> {
+    let mut args: serde_json::Value = match args {
+        Some(raw) => serde_json::from_str(raw).context("arguments must be a JSON object")?,
+        None => serde_json::json!({}),
+    };
+    if let (Some(dir), Some(obj)) = (project, args.as_object_mut()) {
+        obj.entry("project")
+            .or_insert_with(|| serde_json::json!(dir.to_string_lossy()));
+    }
+    match tools::call(tool, &args) {
+        Ok(value) => {
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            Ok(0)
+        }
+        Err(err) => {
+            println!("{}", serde_json::json!({"error": format!("{err:#}")}));
+            Ok(1)
+        }
+    }
 }
 
 struct SessionSummary {
@@ -1034,49 +897,7 @@ fn cmd_serve(
     on_demand: bool,
     command: Vec<String>,
 ) -> Result<()> {
-    validate_name("service", service)?;
-    p.ensure_ready(name)?;
-    let session = p.session(name)?.clone();
-    let index = session.services.iter().position(|s| s.name == service);
-    if let Some(existing) = index.map(|i| &session.services[i]) {
-        if services::state(existing) == services::State::Running {
-            bail!(
-                "{service} is already running in {name} (process group {}); `shoal stop {name} {service}` first",
-                existing.pid.unwrap_or_default()
-            );
-        }
-    }
-    let slot = index.unwrap_or(session.services.len());
-    if slot >= 10 {
-        bail!("a session has ports for at most 10 services");
-    }
-    let existing = index.map(|i| session.services[i].clone());
-    let mut svc = Service {
-        name: service.to_string(),
-        command,
-        port: session.port + slot as u16,
-        pid: None,
-        started_at: 0,
-        stopped_for_idle: false,
-        internal_port: None,
-        gateway: existing.as_ref().and_then(|e| e.gateway),
-    };
-    if on_demand {
-        svc.internal_port = match existing.as_ref().and_then(|e| e.internal_port) {
-            Some(port) => Some(port),
-            None => Some(gateway::free_port()?),
-        };
-    } else if let Some(mut old) = existing {
-        services::stop_gateway(&mut old); // switching back to a plain service
-        svc.gateway = None;
-    }
-    services::start(p, &session, &mut svc)?;
-    if on_demand && !services::gateway_running(&svc) {
-        if let Err(err) = services::start_gateway(p, &session, &mut svc) {
-            let _ = services::stop_all(vec![&mut svc]);
-            return Err(err);
-        }
-    }
+    let svc = services::serve(p, name, service, on_demand, command)?;
     match svc.internal_port {
         Some(internal) => println!(
             "Started {service} in {name} on port {} (on demand: the service listens on {internal}), log {}",
@@ -1090,53 +911,7 @@ fn cmd_serve(
             p.log_path(name, service).display()
         ),
     }
-    let s = p.state.sessions.get_mut(name).expect("session exists");
-    match index {
-        Some(i) => s.services[i] = svc,
-        None => s.services.push(svc),
-    }
-    s.last_active = sys::now();
-    p.save()
-}
-
-/// Stop the running services of a session; returns how many stopped and the
-/// memory they were using (KB).
-fn stop_services(
-    p: &mut Project,
-    name: &str,
-    only: Option<&str>,
-    for_idle: bool,
-    keep_gateways: bool,
-) -> Result<(usize, u64)> {
-    let session = p
-        .state
-        .sessions
-        .get_mut(name)
-        .with_context(|| format!("no session named {name:?}"))?;
-    let mut running = Vec::new();
-    for svc in session.services.iter_mut() {
-        if only.is_some_and(|o| o != svc.name) {
-            continue;
-        }
-        if services::state(svc) == services::State::Running {
-            svc.stopped_for_idle = for_idle;
-            running.push(svc);
-        } else if svc.pid.is_some() {
-            svc.pid = None; // it had exited on its own
-        }
-    }
-    let count = running.len();
-    let kb = services::stop_all(running)?.iter().sum();
-    if !keep_gateways {
-        let session = p.state.sessions.get_mut(name).expect("session exists");
-        for svc in session.services.iter_mut() {
-            if only.is_none_or(|o| o == svc.name) {
-                services::stop_gateway(svc);
-            }
-        }
-    }
-    p.save()?;
-    Ok((count, kb))
+    Ok(())
 }
 
 fn cmd_stop(p: &mut Project, name: &str, service: Option<&str>) -> Result<()> {
@@ -1145,7 +920,7 @@ fn cmd_stop(p: &mut Project, name: &str, service: Option<&str>) -> Result<()> {
             bail!("{name} has no service named {service:?}");
         }
     }
-    let (count, kb) = stop_services(p, name, service, false, false)?;
+    let (count, kb) = services::stop_session(p, name, service, false, false)?;
     if count == 0 {
         println!("Nothing was running in {name}.");
     } else {
@@ -1320,111 +1095,29 @@ fn cmd_reap(idle: &str, watch: Option<&str>) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn cmd_checkpoint(p: &mut Project, name: &str, label: Option<String>) -> Result<()> {
-    let path = p.ensure_ready(name)?;
-    let label = label.unwrap_or_else(|| {
-        let n = p
-            .state
-            .checkpoints
-            .iter()
-            .filter(|c| c.session == name)
-            .count();
-        format!("cp{}", n + 1)
-    });
-    validate_name("checkpoint", &label)?;
-    if p.state
-        .checkpoints
-        .iter()
-        .any(|c| c.session == name && c.label == label)
-    {
-        bail!("{name} already has a checkpoint named {label}");
-    }
-    let start = Instant::now();
-    let dst = p.checkpoint_dir(name, &label);
-    std::fs::create_dir_all(dst.parent().expect("checkpoint dir has a parent"))?;
-    sys::sync();
-    match p.state.backend {
-        Backend::Overlay => sys::clone_tree(&p.volume_dir(name).join("upper"), &dst)?,
-        Backend::Clone => sys::clone_tree(&path, &dst)?,
-    }
-    let head = git::head(&path)?;
-    p.state.checkpoints.push(Checkpoint {
-        session: name.to_string(),
-        label: label.clone(),
-        created_at: sys::now(),
-        head: head.clone(),
-    });
-    p.save()?;
+    let r = ops::checkpoint(p, name, label.as_deref(), false)?;
+    let label = r.label.unwrap_or_default();
     println!(
         "Checkpoint {name}@{label} at {} in {} ({} stored)",
-        git::short(&head),
-        sys::human_duration(start.elapsed()),
-        sys::human_bytes(sys::disk_usage(&dst))
+        git::short(r.head.as_deref().unwrap_or_default()),
+        sys::human_duration(std::time::Duration::from_millis(r.elapsed_ms)),
+        sys::human_bytes(sys::disk_usage(&p.checkpoint_dir(name, &label)))
     );
     Ok(())
 }
 
 fn cmd_rewind(p: &mut Project, name: &str, label: &str) -> Result<()> {
-    let session = p.session(name)?.clone();
-    if !p
-        .state
-        .checkpoints
-        .iter()
-        .any(|c| c.session == name && c.label == label)
-    {
-        bail!("{name} has no checkpoint named {label}");
-    }
-    // Services hold the session open; stop them now and start them again after.
-    let restart: Vec<String> = session
-        .services
-        .iter()
-        .filter(|svc| services::state(svc) == services::State::Running)
-        .map(|svc| svc.name.clone())
-        .collect();
-    stop_services(p, name, None, false, true)?;
-    let start = Instant::now();
-    let saved = p.checkpoint_dir(name, label);
-    let path = p.session_path(name);
-    match p.state.backend {
-        Backend::Overlay => {
-            if sys::is_mounted(&path) {
-                sys::unmount(&path)?;
-            }
-            let volume = p.volume_dir(name);
-            for dir in ["upper", "work"] {
-                let dir = volume.join(dir);
-                if dir.exists() {
-                    std::fs::remove_dir_all(&dir)?;
-                }
-            }
-            sys::clone_tree(&saved, &volume.join("upper"))?;
-            p.mount(&session)?;
-        }
-        Backend::Clone => {
-            let trash = p.dir.join(format!("trash-{name}-{}", sys::now()));
-            std::fs::rename(&path, &trash)?;
-            sys::clone_tree(&saved, &path)?;
-            std::fs::remove_dir_all(&trash)?;
-        }
-    }
+    let r = ops::rewind(p, name, label)?;
     println!(
-        "Rewound {name} to {label} (HEAD {}) in {}",
-        git::short(&git::head(&path)?),
-        sys::human_duration(start.elapsed())
+        "Rewound {name} to {} (HEAD {}) in {}",
+        r.label,
+        git::short(&r.head),
+        sys::human_duration(std::time::Duration::from_millis(r.elapsed_ms))
     );
-    let session = p.session(name)?.clone();
-    for (i, svc) in session.services.iter().enumerate() {
-        if restart.contains(&svc.name) {
-            let mut svc = svc.clone();
-            services::start(p, &session, &mut svc)?;
-            println!("Restarted {} on port {}", svc.name, svc.port);
-            p.state
-                .sessions
-                .get_mut(name)
-                .expect("session exists")
-                .services[i] = svc;
-        }
+    for svc in r.restarted_services {
+        println!("Restarted {svc}");
     }
-    p.mark_active(name)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1438,32 +1131,16 @@ fn cmd_import(p: &Project, names: Vec<String>, all: bool) -> Result<()> {
         names
     };
     for name in names {
-        let s = p.session(&name)?;
-        let path = p.ensure_ready(&name)?;
-        let head = git::head(&path)?;
-        let dirty = !git::status_lines(&path)?.is_empty();
-        let note = if dirty {
-            " (it also has uncommitted changes, which stay in the session)"
-        } else {
+        let r = ops::import(p, &name)?;
+        let note = if r.uncommitted.is_empty() {
             ""
+        } else {
+            " (it also has uncommitted changes, which stay in the session)"
         };
-        if head == s.base_commit {
-            println!("{name}: no commits yet, skipped{note}");
-            continue;
+        match r.branch {
+            Some(branch) => println!("{name}: {} commit(s) imported as {branch}{note}", r.commits),
+            None => println!("{name}: no commits yet, skipped{note}"),
         }
-        let commits = git::count_commits(&path, &format!("{}..HEAD", s.base_commit))?;
-        let target = format!("refs/heads/shoal/{name}");
-        git::git(
-            &p.state.source,
-            &[
-                "fetch",
-                "-q",
-                "--no-tags",
-                &path.to_string_lossy(),
-                &format!("+HEAD:{target}"),
-            ],
-        )?;
-        println!("{name}: {commits} commit(s) imported as shoal/{name}{note}");
     }
     Ok(())
 }
@@ -1523,36 +1200,7 @@ fn cmd_conflicts(p: &Project) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn cmd_rm(p: &mut Project, name: &str, force: bool) -> Result<()> {
-    let s = p.session(name)?.clone();
-    if !force {
-        let path = p.ensure_ready(name)?;
-        if !git::status_lines(&path)?.is_empty() {
-            bail!("{name} has uncommitted changes; commit them, or pass --force to discard them");
-        }
-        let head = git::head(&path)?;
-        let imported = git::git(
-            &p.state.source,
-            &["cat-file", "-e", &format!("{head}^{{commit}}")],
-        )
-        .is_ok();
-        if head != s.base_commit && !imported {
-            bail!("{name} has commits that are not in the source repository; run `shoal import {name}`, or pass --force");
-        }
-    }
-    stop_services(p, name, None, false, false)?;
-    p.destroy_volume(name)?;
-    let checkpoints = p.dir.join("checkpoints").join(name);
-    if checkpoints.exists() {
-        std::fs::remove_dir_all(&checkpoints)?;
-    }
-    p.state.checkpoints.retain(|c| c.session != name);
-    p.state.sessions.remove(name);
-    p.save()?;
-    conflicts::forget(&p.dir, name);
-    let _ = git::git(
-        &p.dir.join("hub.git"),
-        &["update-ref", "-d", &format!("refs/snapshots/{name}")],
-    );
+    ops::remove(p, name, force, false)?;
     println!("Removed {name}");
     Ok(())
 }
@@ -1569,7 +1217,7 @@ fn cmd_down(p: &mut Project) -> Result<()> {
     // Running services keep a session busy, and `down` usually precedes a shutdown.
     let names: Vec<String> = p.state.sessions.keys().cloned().collect();
     for name in &names {
-        let (count, _) = stop_services(p, name, None, false, false)?;
+        let (count, _) = services::stop_session(p, name, None, false, false)?;
         if count > 0 {
             println!("Stopped {count} service(s) in {name}");
         }

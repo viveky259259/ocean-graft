@@ -68,7 +68,7 @@ fn fnv(bytes: &[u8], mut hash: u64) -> u64 {
 }
 
 /// HEAD, the status entries, and the size and mtime of each listed path.
-fn fingerprint(dir: &Path) -> Result<String> {
+pub fn fingerprint(dir: &Path) -> Result<String> {
     let out = git::command(dir)
         .args([
             "status",

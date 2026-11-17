@@ -115,6 +115,13 @@ pub struct Checkpoint {
     pub label: String,
     pub created_at: u64,
     pub head: String,
+    /// Taken by a hook at the end of an agent turn (pruned to the newest few).
+    #[serde(default)]
+    pub auto: bool,
+    /// The session's fingerprint when taken; an unchanged session is not
+    /// checkpointed again.
+    #[serde(default)]
+    pub fingerprint: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -227,17 +234,34 @@ pub fn locate(explicit: Option<&Path>) -> Result<PathBuf> {
     Ok(dir)
 }
 
-fn lock(dir: &Path) -> Result<File> {
+fn lock(dir: &Path, wait: Option<std::time::Duration>) -> Result<File> {
     let file = File::options()
         .create(true)
         .truncate(false)
         .write(true)
         .open(dir.join("lock"))
         .with_context(|| format!("could not open the lock in {}", dir.display()))?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("could not lock the project");
+    let Some(wait) = wait else {
+        loop {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(file);
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
+                return Err(err).context("could not lock the project");
+            }
+        }
+    };
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(file);
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("the project is busy (another shoal command holds its lock)");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
-    Ok(file)
 }
 
 /// Every initialised project under SHOAL_HOME.
@@ -270,7 +294,7 @@ pub fn validate_name(kind: &str, name: &str) -> Result<()> {
 
 impl Project {
     pub fn create(dir: PathBuf, state: State) -> Result<Project> {
-        let lock = lock(&dir)?;
+        let lock = lock(&dir, None)?;
         let project = Project {
             dir,
             state,
@@ -281,7 +305,16 @@ impl Project {
     }
 
     pub fn open(dir: PathBuf) -> Result<Project> {
-        let lock = lock(&dir)?;
+        Self::open_with(dir, None)
+    }
+
+    /// Like `open`, but give up if the lock is not free within `wait`.
+    pub fn open_within(dir: PathBuf, wait: std::time::Duration) -> Result<Project> {
+        Self::open_with(dir, Some(wait))
+    }
+
+    fn open_with(dir: PathBuf, wait: Option<std::time::Duration>) -> Result<Project> {
+        let lock = lock(&dir, wait)?;
         let raw = std::fs::read_to_string(dir.join("state.json"))
             .with_context(|| format!("no project state in {}", dir.display()))?;
         let state: State = serde_json::from_str(&raw).context("project state is unreadable")?;

@@ -1,0 +1,242 @@
+//! `shoal hook <event>`: Claude Code hook handlers. Input is the hook's JSON
+//! on stdin.
+//!
+//! - worktree-create / worktree-remove replace Claude Code's git worktree
+//!   logic. They fail loudly (exit 1, reason on stderr): Claude Code must not
+//!   carry on with a half-made directory or delete the wrong one.
+//! - stop, session-start and prompt run around every turn. They always exit
+//!   0, never wait long for the project lock, and only ever print the
+//!   context text SessionStart asks for.
+
+use crate::ops::{self, Origin};
+use crate::project::Project;
+use anyhow::{bail, Context, Result};
+use serde_json::Value;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// How long turn hooks wait for a busy project before skipping.
+const TURN_HOOK_LOCK_WAIT: Duration = Duration::from_secs(5);
+const MAX_INPUT: u64 = 4 * 1024 * 1024;
+
+pub const EVENTS: &[&str] = &[
+    "worktree-create",
+    "worktree-remove",
+    "stop",
+    "session-start",
+    "prompt",
+];
+
+fn read_input() -> Result<Value> {
+    let mut raw = String::new();
+    std::io::stdin()
+        .take(MAX_INPUT)
+        .read_to_string(&mut raw)
+        .context("could not read the hook input")?;
+    if raw.trim().is_empty() {
+        return Ok(Value::Object(Default::default()));
+    }
+    serde_json::from_str(&raw).context("the hook input is not JSON")
+}
+
+fn field<'a>(input: &'a Value, key: &str) -> Option<&'a str> {
+    input
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+}
+
+/// The directory the agent is working in.
+fn agent_cwd(input: &Value) -> Option<PathBuf> {
+    field(input, "cwd")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("CLAUDE_PROJECT_DIR").map(PathBuf::from))
+        .or_else(|| std::env::current_dir().ok())
+}
+
+/// The project and session `path` is inside, if it is inside a session.
+fn session_at(path: &Path, wait: Option<Duration>) -> Option<(Project, String)> {
+    let dir = ops::project_for_path(path, false).ok()?;
+    let p = match wait {
+        Some(w) => Project::open_within(dir, w).ok()?,
+        None => Project::open(dir).ok()?,
+    };
+    let name = ops::session_for_path(&p, path)?;
+    Some((p, name))
+}
+
+/// Returns the path to print as the last line of stdout.
+pub fn worktree_create(input: &Value) -> Result<PathBuf> {
+    let raw = field(input, "name").unwrap_or("worktree");
+    let cwd = agent_cwd(input).context("no working directory in the hook input")?;
+    // Inside a session (a subagent of an agent that works in one), fork it,
+    // so the subagent starts with the parent's uncommitted work.
+    let (mut p, origin) = match session_at(&cwd, None) {
+        Some((p, parent)) => (p, Origin::Session(parent)),
+        None => {
+            let repo = std::env::var_os("CLAUDE_PROJECT_DIR")
+                .map(PathBuf::from)
+                .filter(|d| d.is_dir())
+                .unwrap_or(cwd);
+            let dir = ops::ensure_project(&repo)?;
+            let mut p = Project::open(dir)?;
+            let r = ops::refresh(&mut p)?;
+            if !r.up_to_date {
+                ops::progress(format!(
+                    "template refreshed to {}",
+                    crate::git::short(&r.to)
+                ));
+            }
+            (p, Origin::Template)
+        }
+    };
+    let name = ops::unique_name(&p, &ops::sanitize_name(raw));
+    let info = ops::create_session(&mut p, &name, &origin)?;
+    ops::progress(format!(
+        "session {} ready in {} ms on branch {}",
+        info.name, info.ready_ms, info.branch
+    ));
+    Ok(info.path.canonicalize().unwrap_or(info.path))
+}
+
+pub fn worktree_remove(input: &Value) -> Result<()> {
+    let path = field(input, "worktree_path").context("no worktree_path in the hook input")?;
+    let path = Path::new(path);
+    if path.symlink_metadata().is_err() {
+        return Ok(()); // already gone
+    }
+    let Some((mut p, name)) = session_at(path, None) else {
+        bail!(
+            "{} is not a shoal session, so shoal will not delete it",
+            path.display()
+        );
+    };
+    if ops::session_for_path(&p, path).as_deref() != Some(name.as_str())
+        || path.canonicalize()? != p.session_path(&name).canonicalize()?
+    {
+        bail!(
+            "{} is inside session {name}, not the session itself; refusing to delete it",
+            path.display()
+        );
+    }
+    let info = ops::remove(&mut p, &name, false, true)?;
+    if let Some(saved) = &info.saved {
+        if let Some(branch) = &saved.import.branch {
+            ops::progress(format!(
+                "saved {} commit(s) of {name} as {branch} in the source repository",
+                saved.import.commits
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// End of a turn (Stop, SubagentStop): checkpoint the session if it changed.
+pub fn stop(input: &Value) -> Result<()> {
+    let Some(cwd) = agent_cwd(input) else {
+        return Ok(());
+    };
+    let Some((mut p, name)) = session_at(&cwd, Some(TURN_HOOK_LOCK_WAIT)) else {
+        return Ok(());
+    };
+    p.mark_active(&name)?;
+    if !ops::checkpoints_are_cheap(&p) {
+        return Ok(());
+    }
+    let info = ops::checkpoint(&mut p, &name, None, true)?;
+    if let Some(label) = info.label {
+        ops::progress(format!(
+            "checkpoint {name}@{label} in {} ms",
+            info.elapsed_ms
+        ));
+    }
+    Ok(())
+}
+
+/// SessionStart: tell Claude where it is, as context.
+pub fn session_start(input: &Value) -> Result<Option<String>> {
+    let Some(cwd) = agent_cwd(input) else {
+        return Ok(None);
+    };
+    let Some((p, name)) = session_at(&cwd, Some(TURN_HOOK_LOCK_WAIT)) else {
+        return Ok(None);
+    };
+    let s = p.session(&name)?;
+    Ok(Some(format!(
+        "You are working in shoal session \"{name}\" (branch {}, port {}), an isolated copy-on-write copy of {} with dependencies installed. Your changes stay here until you land them with the shoal land tool. A checkpoint is taken at the end of each turn; use the shoal rewind tool to undo, fork to try alternatives, and preview to show the user the running app.",
+        s.branch,
+        s.port,
+        p.state.source.display()
+    )))
+}
+
+pub fn prompt(input: &Value) -> Result<()> {
+    if let Some(cwd) = agent_cwd(input) {
+        if let Some((mut p, name)) = session_at(&cwd, Some(TURN_HOOK_LOCK_WAIT)) {
+            p.mark_active(&name)?;
+        }
+    }
+    Ok(())
+}
+
+/// Run a hook; returns the process exit code.
+pub fn run(event: &str) -> i32 {
+    let input = match read_input() {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!("shoal hook {event}: {err:#}");
+            return if matches!(event, "worktree-create" | "worktree-remove") {
+                1
+            } else {
+                0
+            };
+        }
+    };
+    match event {
+        "worktree-create" => match worktree_create(&input) {
+            Ok(path) => {
+                println!("{}", path.display());
+                0
+            }
+            Err(err) => {
+                eprintln!("shoal hook worktree-create: {err:#}");
+                1
+            }
+        },
+        "worktree-remove" => match worktree_remove(&input) {
+            Ok(()) => 0,
+            Err(err) => {
+                eprintln!("shoal hook worktree-remove: {err:#}");
+                1
+            }
+        },
+        "stop" => {
+            if let Err(err) = stop(&input) {
+                eprintln!("shoal hook stop: {err:#}");
+            }
+            0
+        }
+        "session-start" => {
+            match session_start(&input) {
+                Ok(Some(text)) => println!("{text}"),
+                Ok(None) => {}
+                Err(err) => eprintln!("shoal hook session-start: {err:#}"),
+            }
+            0
+        }
+        "prompt" => {
+            if let Err(err) = prompt(&input) {
+                eprintln!("shoal hook prompt: {err:#}");
+            }
+            0
+        }
+        other => {
+            eprintln!(
+                "shoal hook: unknown event {other:?}; events: {}",
+                EVENTS.join(", ")
+            );
+            2
+        }
+    }
+}
