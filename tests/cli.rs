@@ -280,3 +280,137 @@ fn sandbox_confines_writes() {
     assert!(env.path("a").join("inside.txt").exists());
     assert!(!outside.exists());
 }
+
+extern "C" {
+    #[link_name = "kill"]
+    fn libc_kill(pid: i32, signal: i32) -> i32;
+}
+
+fn alive(pid: i32) -> bool {
+    unsafe { libc_kill(pid, 0) == 0 }
+}
+
+/// The PID column of `shoal services` for one session's service.
+fn service_pid(listing: &str, session: &str) -> Option<i32> {
+    listing
+        .lines()
+        .find(|l| l.split_whitespace().next() == Some(session))
+        .and_then(|l| l.split_whitespace().nth(4))
+        .and_then(|pid| pid.parse().ok())
+}
+
+#[test]
+fn queue_limits_concurrent_jobs() {
+    use std::time::{Duration, Instant};
+    let env = Env::new();
+    let _unmount = Unmount(&env);
+    env.shoal(&["init", "--backend", "clone"]);
+    env.shoal(&["new", "a"]);
+    env.shoal(&["queue", "--slots", "2"]);
+
+    // Each job records how many jobs are running when it starts.
+    let marks = env.root.path().join("marks");
+    fs::create_dir_all(marks.join("running")).unwrap();
+    let script = format!(
+        "touch {m}/running/$$; ls {m}/running | wc -l >> {m}/counts; sleep 1; rm {m}/running/$$",
+        m = marks.display()
+    );
+    let start = Instant::now();
+    let jobs: Vec<_> = (0..5)
+        .map(|_| {
+            env.command(env!("CARGO_BIN_EXE_shoal"), &env.repo())
+                .args(["run", "a", "--", "sh", "-c", &script])
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(400));
+    let queue = env.shoal(&["queue"]);
+    assert!(
+        queue.contains("2 of 2 slot(s) busy, 3 job(s) waiting"),
+        "{queue}"
+    );
+    assert!(
+        queue.contains("RUNNING") && queue.contains("/a "),
+        "{queue}"
+    );
+    for mut job in jobs {
+        assert!(job.wait().unwrap().success());
+    }
+    let most = read(marks.join("counts"))
+        .lines()
+        .map(|l| l.trim().parse::<u32>().unwrap())
+        .max()
+        .unwrap();
+    assert!(most <= 2, "{most} jobs ran at once with 2 slots");
+    // Five one-second jobs, two at a time: at least three rounds.
+    assert!(
+        start.elapsed() >= Duration::from_millis(2900),
+        "{:?}",
+        start.elapsed()
+    );
+    assert!(env
+        .shoal(&["queue"])
+        .contains("0 of 2 slot(s) busy, 0 job(s) waiting"));
+
+    // Inside a session, `run` finds the session from the working directory.
+    let out = env
+        .command(env!("CARGO_BIN_EXE_shoal"), &env.path("a"))
+        .args(["run", "--", "sh", "-c", "echo $SHOAL_SESSION"])
+        .output()
+        .unwrap();
+    assert_eq!(stdout(&out).trim(), "a", "{}", stderr(&out));
+}
+
+#[test]
+fn idle_services_are_stopped_and_woken() {
+    use std::time::Duration;
+    let env = Env::new();
+    let _unmount = Unmount(&env);
+    env.shoal(&["init", "--backend", "clone"]);
+    env.shoal(&["new", "a"]);
+    env.shoal(&["new", "b"]);
+    let server = ["sh", "-c", "echo listening on $PORT; exec sleep 300"];
+    let started = env.shoal(&[&["serve", "a", "--"][..], &server[..]].concat());
+    assert!(
+        started.contains("Started web in a on port 4100"),
+        "{started}"
+    );
+    env.shoal(&[&["serve", "b", "--"][..], &server[..]].concat());
+    let listing = env.shoal(&["services"]);
+    let (pid_a, pid_b) = (
+        service_pid(&listing, "a").unwrap(),
+        service_pid(&listing, "b").unwrap(),
+    );
+    assert!(alive(pid_a) && alive(pid_b), "{listing}");
+    let twice = env.shoal_in(
+        &env.repo(),
+        &[&["serve", "a", "--"][..], &server[..]].concat(),
+    );
+    assert!(stderr(&twice).contains("already running"));
+
+    // Both go quiet; then someone works in b.
+    std::thread::sleep(Duration::from_secs(2));
+    fs::write(env.path("b").join("notes.txt"), "still working\n").unwrap();
+    let reaped = env.shoal(&["reap", "--idle", "1s"]);
+    assert!(reaped.contains("stopped 1 service(s) in a"), "{reaped}");
+    assert!(!reaped.contains("in b"), "{reaped}");
+    assert!(!alive(pid_a), "a's server should have stopped");
+    assert!(alive(pid_b), "b is active, so its server keeps running");
+    let listing = env.shoal(&["services"]);
+    assert!(listing.contains("stopped (idle)"), "{listing}");
+    assert!(env.shoal(&["ls"]).contains("1 idle-stopped"));
+
+    // Wake brings a's server back on the same port.
+    let woke = env.shoal(&["wake", "a"]);
+    assert!(woke.contains("Started web in a on port 4100"), "{woke}");
+    let pid_a = service_pid(&env.shoal(&["services"]), "a").unwrap();
+    assert!(alive(pid_a));
+
+    let stopped = env.shoal(&["stop", "b"]);
+    assert!(stopped.contains("Stopped 1 service(s) in b"), "{stopped}");
+    assert!(!alive(pid_b));
+    env.shoal(&["rm", "a", "--force"]);
+    assert!(!alive(pid_a), "rm stops the session's services");
+}

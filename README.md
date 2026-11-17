@@ -35,6 +35,12 @@ shoal import --all                         # commits come back as shoal/<name> b
 | `diff NAME [--stat]` | Everything changed against the template, including untracked files |
 | `exec [--sandbox] NAME -- CMD` | Run a command in the session with `SHOAL_SESSION`, `SHOAL_PORT` and `PORT` set |
 | `shell [--sandbox] NAME` | Open a shell in the session |
+| `run [NAME] [--slots K] -- CMD` | Run a heavy command (tests, a build) once a machine-wide queue slot is free. Inside a session, NAME can be left out |
+| `queue [--slots N]` | Show running and waiting jobs, or set how many may run at once (default: one per CPU) |
+| `serve NAME [--as SERVICE] -- CMD` | Start a long-running service, such as a dev server, in the background on the session's port |
+| `services` / `stop NAME [SERVICE]` | List services with their memory and idle time; stop them |
+| `reap [--idle 15m] [--watch 1m]` | Stop the services of sessions with no recent activity, in every project |
+| `wake NAME` / `touch NAME` | Restart services that `reap` stopped; mark a session active (for agent hooks) |
 | `checkpoint NAME [LABEL]` / `rewind NAME LABEL` | Save the whole session state and restore it later |
 | `conflicts` | Files that two or more sessions changed, and which pairs really conflict (`git merge-tree`) |
 | `import [NAME...] [--all]` | Fetch session commits into the source repo as `shoal/NAME` branches |
@@ -154,6 +160,48 @@ On one machine, storage stops being the limit. CPU, memory for running
 processes, and the quadratic conflict check limit how many sessions can be
 active.
 
+## Job queue and idle shutdown
+
+On one machine, the limits are CPU and memory for running processes, not
+sessions. Two features keep many sessions practical.
+
+**Job queue.** `shoal run -- npm test` waits for one of N slots before it
+starts. There is one slot per CPU by default, shared by every project on the
+machine.
+- Each slot is an exclusive lock on a file, so a job that crashes frees its
+  slot at once. No daemon is needed.
+- Waiters line up in arrival order.
+- A job can ask for several slots (`--slots`).
+- `shoal queue` shows what is running and what is waiting.
+
+**Idle shutdown.** `shoal serve` starts a session's dev server in its own
+process group, on the session's port, with a log under `logs/` in the
+project. `shoal reap --idle 15m` stops the servers of sessions that have
+been idle that long, and frees their memory. Run it with `--watch 1m` to
+keep checking. `shoal wake` starts them again.
+
+A session counts as active when any of these happen:
+- shoal runs something in it (`exec`, `run`, `serve`, `touch`)
+- a file in it changes, apart from dependency, build and cache directories
+- its git history moves
+
+`rm`, `down` and `rewind` stop a session's services first; `rewind` starts
+them again afterwards.
+
+Measured with [`demo/resources.py`](demo/resources.py) on the notes app
+(4 vCPU, overlay backend, two runs):
+
+| | Result |
+|---|---|
+| 16 test runs started at once, no queue | 4.4–5.1 s, up to 80 test-runner processes, 3.9–4.3 GB peak |
+| The same 16 through the queue (4 slots) | 4.4–4.8 s, up to 32 processes, 1.05–1.12 GB peak |
+| 8 dev servers | 1.6–1.9 GB in total, about 210–240 MB each |
+| `reap --idle 3s`, with 2 sessions still being edited | stopped the 6 idle servers in 1.35 s, freed about 1.3 GB, kept the 2 busy ones |
+| `wake` | the server answered again 0.5–1.3 s later |
+
+The queue does not make this workload faster. It cuts peak memory by about
+four times, which is what lets many sessions share a laptop.
+
 ## Tests
 
 ```bash
@@ -163,8 +211,10 @@ cargo test --release
 The tests drive the real binary against a throwaway repository. They cover
 the full lifecycle on both backends: isolation, status, diff, ports,
 conflicts, checkpoint and rewind, fork, import, refresh, rm safety, remount
-and gc. They also cover sandbox confinement. The overlay test needs root and
-is skipped otherwise.
+and gc. They also cover sandbox confinement, the queue never running more
+jobs than it has slots, and idle shutdown, which stops the idle session's
+server, keeps the busy one, then wakes, stops and removes them. The overlay
+test needs root and is skipped otherwise.
 
 ## Limitations
 
@@ -177,3 +227,8 @@ is skipped otherwise.
   it at the time.
 - Ports are handed out, not reserved; `shoal` does not check whether a port
   is free.
+- The queue only governs commands started with `shoal run`. An agent that
+  runs `npm test` directly bypasses it, so agents have to be told to use it
+  (Ocean can wrap their commands).
+- A stopped server comes back with `shoal wake`, not on the first request to
+  its port.

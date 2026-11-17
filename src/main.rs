@@ -8,11 +8,13 @@
 
 mod git;
 mod project;
+mod queue;
+mod services;
 mod sys;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use project::{validate_name, Backend, Checkpoint, Generation, Project, Session, State};
+use project::{validate_name, Backend, Checkpoint, Generation, Project, Service, Session, State};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -68,6 +70,53 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
+    /// Run a heavy command (tests, a build) in a session once a queue slot is
+    /// free. With no NAME, uses the session the current directory is in.
+    Run {
+        name: Option<String>,
+        /// Queue slots this job needs (a build that uses every core can take more)
+        #[arg(long, default_value_t = 1)]
+        slots: usize,
+        #[arg(long)]
+        sandbox: bool,
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Show the machine-wide job queue, or change its number of slots
+    Queue {
+        /// Set the number of jobs that may run at once (default: one per CPU)
+        #[arg(long)]
+        slots: Option<usize>,
+    },
+    /// Start a long-running service, such as a dev server, in a session
+    Serve {
+        name: String,
+        /// Service name, so a session can run several
+        #[arg(long = "as", default_value = "web")]
+        service: String,
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Stop a session's services (all of them, or the one named)
+    Stop {
+        name: String,
+        service: Option<String>,
+    },
+    /// List services in this project
+    Services,
+    /// Restart services that `reap` stopped while the session was idle
+    Wake { name: String },
+    /// Stop the services of sessions that have been idle, in every project
+    Reap {
+        /// How long without activity before services stop
+        #[arg(long, default_value = "15m")]
+        idle: String,
+        /// Keep running, checking at this interval (e.g. 1m)
+        #[arg(long)]
+        watch: Option<String>,
+    },
+    /// Mark a session as active (for hooks, e.g. when an agent starts a turn)
+    Touch { name: String },
     /// Open a shell in a session
     Shell {
         #[arg(long)]
@@ -167,9 +216,18 @@ fn main() {
 }
 
 fn run(cli: Cli) -> Result<i32> {
+    // Commands that are not about one project.
     let command = match cli.command {
         Cmd::Init(args) => {
             cmd_init(args)?;
+            return Ok(0);
+        }
+        Cmd::Queue { slots } => {
+            cmd_queue(slots)?;
+            return Ok(0);
+        }
+        Cmd::Reap { idle, watch } => {
+            cmd_reap(&idle, watch.as_deref())?;
             return Ok(0);
         }
         other => other,
@@ -188,18 +246,37 @@ fn run(cli: Cli) -> Result<i32> {
             name,
             command,
         } => return cmd_exec(p, &name, sandbox, command),
+        Cmd::Run {
+            name,
+            slots,
+            sandbox,
+            command,
+        } => return cmd_run(p, name, slots, sandbox, command),
+        Cmd::Queue { .. } | Cmd::Reap { .. } => unreachable!(),
+        Cmd::Serve {
+            name,
+            service,
+            command,
+        } => cmd_serve(&mut p, &name, &service, command)?,
+        Cmd::Stop { name, service } => cmd_stop(&mut p, &name, service.as_deref())?,
+        Cmd::Services => cmd_services(&p)?,
+        Cmd::Wake { name } => cmd_wake(&mut p, &name)?,
+        Cmd::Touch { name } => {
+            p.session(&name)?;
+            p.mark_active(&name)?;
+        }
         Cmd::Shell { sandbox, name } => {
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
             return cmd_exec(p, &name, sandbox, vec![shell]);
         }
         Cmd::Checkpoint { name, label } => cmd_checkpoint(&mut p, &name, label)?,
-        Cmd::Rewind { name, label } => cmd_rewind(&p, &name, &label)?,
+        Cmd::Rewind { name, label } => cmd_rewind(&mut p, &name, &label)?,
         Cmd::Import { names, all } => cmd_import(&p, names, all)?,
         Cmd::Conflicts => cmd_conflicts(&p)?,
         Cmd::Refresh => cmd_refresh(&mut p)?,
         Cmd::Rm { name, force } => cmd_rm(&mut p, &name, force)?,
         Cmd::Up => cmd_up(&p)?,
-        Cmd::Down => cmd_down(&p)?,
+        Cmd::Down => cmd_down(&mut p)?,
         Cmd::Gc => cmd_gc(&mut p)?,
         Cmd::Info => cmd_info(&p)?,
     }
@@ -509,6 +586,8 @@ fn cmd_new(p: &mut Project, name: &str, from: Option<&str>) -> Result<()> {
         created_at: sys::now(),
         parent,
         lowers,
+        services: Vec::new(),
+        last_active: sys::now(),
     };
     let created = (|| -> Result<std::time::Duration> {
         if p.state.backend == Backend::Overlay {
@@ -577,13 +656,30 @@ fn cmd_ls(p: &Project) -> Result<()> {
         .unwrap_or(4)
         .max(4);
     println!(
-        "{:<width$}  {:<4}  {:<5}  {:>7}  {:>11}  {:>8}  ORIGIN",
-        "NAME", "GEN", "PORT", "COMMITS", "UNCOMMITTED", "DELTA"
+        "{:<width$}  {:<4}  {:<5}  {:>7}  {:>11}  {:>8}  {:>5}  {:<15}  ORIGIN",
+        "NAME", "GEN", "PORT", "COMMITS", "UNCOMMITTED", "DELTA", "IDLE", "SERVICES"
     );
     for s in p.state.sessions.values() {
         let sum = summarize(p, s)?;
+        let idle = sys::now().saturating_sub(services::last_activity(p, s));
+        let running = s
+            .services
+            .iter()
+            .filter(|svc| services::state(svc) == services::State::Running)
+            .count();
+        let sleeping = s
+            .services
+            .iter()
+            .filter(|svc| services::state(svc) == services::State::StoppedIdle)
+            .count();
+        let services_label = match (running, sleeping) {
+            (0, 0) => "-".to_string(),
+            (r, 0) => format!("{r} running"),
+            (0, z) => format!("{z} idle-stopped"),
+            (r, z) => format!("{r} up, {z} idle"),
+        };
         println!(
-            "{:<width$}  {:<4}  {:<5}  {:>7}  {:>11}  {:>8}  {}",
+            "{:<width$}  {:<4}  {:<5}  {:>7}  {:>11}  {:>8}  {:>5}  {:<15}  {}",
             s.name,
             format!("g{}", s.generation),
             s.port,
@@ -592,6 +688,8 @@ fn cmd_ls(p: &Project) -> Result<()> {
             sum.delta
                 .map(sys::human_bytes)
                 .unwrap_or_else(|| "-".into()),
+            services::human_secs(idle),
+            services_label,
             match &s.parent {
                 Some(parent) => format!("fork of {parent}"),
                 None => "template".into(),
@@ -763,26 +861,391 @@ fn sandbox_command(project_dir: &Path, session: &Path, command: &[String]) -> Re
     Ok(cmd)
 }
 
-fn cmd_exec(p: Project, name: &str, sandbox: bool, command: Vec<String>) -> Result<i32> {
-    let path = p.ensure_ready(name)?;
-    let port = p.session(name)?.port.to_string();
-    let project_dir = p.dir.clone();
-    drop(p); // release the project lock while the command runs
+/// The command to run in a session, with its working directory and environment.
+fn session_command(
+    project_dir: &Path,
+    path: &Path,
+    name: &str,
+    port: u16,
+    sandbox: bool,
+    command: &[String],
+) -> Result<Command> {
     let mut cmd = if sandbox {
-        sandbox_command(&project_dir, &path, &command)?
+        sandbox_command(project_dir, path, command)?
     } else {
         let mut cmd = Command::new(&command[0]);
         cmd.args(&command[1..]);
         cmd
     };
-    cmd.current_dir(&path)
+    cmd.current_dir(path)
         .env("SHOAL_SESSION", name)
-        .env("SHOAL_PORT", &port)
-        .env("SHOAL_PROJECT", &project_dir);
+        .env("SHOAL_PORT", port.to_string())
+        .env("SHOAL_PROJECT", project_dir);
     if std::env::var_os("PORT").is_none() {
-        cmd.env("PORT", &port);
+        cmd.env("PORT", port.to_string());
     }
-    sys::interactive(&mut cmd)
+    Ok(cmd)
+}
+
+fn cmd_exec(mut p: Project, name: &str, sandbox: bool, command: Vec<String>) -> Result<i32> {
+    let path = p.ensure_ready(name)?;
+    let port = p.session(name)?.port;
+    p.mark_active(name)?;
+    let project_dir = p.dir.clone();
+    drop(p); // release the project lock while the command runs
+    let mut cmd = session_command(&project_dir, &path, name, port, sandbox, &command)?;
+    sys::supervised(&mut cmd)
+}
+
+fn cmd_run(
+    mut p: Project,
+    name: Option<String>,
+    slots: usize,
+    sandbox: bool,
+    command: Vec<String>,
+) -> Result<i32> {
+    let name = match name {
+        Some(name) => name,
+        None => p.session_from_cwd()?,
+    };
+    let path = p.ensure_ready(&name)?;
+    let port = p.session(&name)?.port;
+    p.mark_active(&name)?;
+    let project_dir = p.dir.clone();
+    drop(p);
+
+    let job = queue::Job {
+        pid: std::process::id(),
+        project: project_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        session: name.clone(),
+        command: command.join(" "),
+        slots,
+        queued_at: sys::now(),
+        started_at: None,
+    };
+    let queued = Instant::now();
+    let held = queue::acquire(&job, |status| {
+        eprintln!(
+            "shoal: waiting for a queue slot ({} of {} busy, {} waiting)",
+            status.busy,
+            status.slots,
+            status.waiting.len()
+        );
+    })?;
+    let waited = queued.elapsed();
+    if waited.as_millis() >= 100 {
+        eprintln!("shoal: got a slot after {}", sys::human_duration(waited));
+    }
+    let mut cmd = session_command(&project_dir, &path, &name, port, sandbox, &command)?;
+    let code = sys::supervised(&mut cmd);
+    drop(held);
+    // The job counts as activity too; best effort, the job's result matters more.
+    if let Ok(mut p) = Project::open(project_dir) {
+        let _ = p.mark_active(&name);
+    }
+    code
+}
+
+fn cmd_queue(slots: Option<usize>) -> Result<()> {
+    if let Some(n) = slots {
+        queue::set_slot_count(n)?;
+        println!("The queue now runs up to {n} job(s) at once.");
+        return Ok(());
+    }
+    let status = queue::status()?;
+    println!(
+        "{} of {} slot(s) busy, {} job(s) waiting",
+        status.busy,
+        status.slots,
+        status.waiting.len()
+    );
+    if !status.running.is_empty() {
+        println!();
+        println!("RUNNING");
+        let mut seen = BTreeSet::new();
+        for (_, job) in &status.running {
+            if !seen.insert(job.pid) {
+                continue; // one line per job, even if it holds several slots
+            }
+            let started = job.started_at.unwrap_or(job.queued_at);
+            println!(
+                "  {:<24} {:>6}  slots {}  {}",
+                format!("{}/{}", job.project, job.session),
+                services::human_secs(sys::now().saturating_sub(started)),
+                job.slots,
+                job.command
+            );
+        }
+    }
+    if !status.waiting.is_empty() {
+        println!();
+        println!("WAITING");
+        for job in &status.waiting {
+            println!(
+                "  {:<24} {:>6}  slots {}  {}",
+                format!("{}/{}", job.project, job.session),
+                services::human_secs(sys::now().saturating_sub(job.queued_at)),
+                job.slots,
+                job.command
+            );
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Services and idle shutdown
+// ---------------------------------------------------------------------------
+
+fn cmd_serve(p: &mut Project, name: &str, service: &str, command: Vec<String>) -> Result<()> {
+    validate_name("service", service)?;
+    p.ensure_ready(name)?;
+    let session = p.session(name)?.clone();
+    let index = session.services.iter().position(|s| s.name == service);
+    if let Some(existing) = index.map(|i| &session.services[i]) {
+        if services::state(existing) == services::State::Running {
+            bail!(
+                "{service} is already running in {name} (process group {}); `shoal stop {name} {service}` first",
+                existing.pid.unwrap_or_default()
+            );
+        }
+    }
+    let slot = index.unwrap_or(session.services.len());
+    if slot >= 10 {
+        bail!("a session has ports for at most 10 services");
+    }
+    let mut svc = Service {
+        name: service.to_string(),
+        command,
+        port: session.port + slot as u16,
+        pid: None,
+        started_at: 0,
+        stopped_for_idle: false,
+    };
+    services::start(p, &session, &mut svc)?;
+    println!(
+        "Started {service} in {name} on port {} (process group {}), log {}",
+        svc.port,
+        svc.pid.unwrap_or_default(),
+        p.log_path(name, service).display()
+    );
+    let s = p.state.sessions.get_mut(name).expect("session exists");
+    match index {
+        Some(i) => s.services[i] = svc,
+        None => s.services.push(svc),
+    }
+    s.last_active = sys::now();
+    p.save()
+}
+
+/// Stop the running services of a session; returns how many stopped and the
+/// memory they were using (KB).
+fn stop_services(
+    p: &mut Project,
+    name: &str,
+    only: Option<&str>,
+    for_idle: bool,
+) -> Result<(usize, u64)> {
+    let session = p
+        .state
+        .sessions
+        .get_mut(name)
+        .with_context(|| format!("no session named {name:?}"))?;
+    let mut running = Vec::new();
+    for svc in session.services.iter_mut() {
+        if only.is_some_and(|o| o != svc.name) {
+            continue;
+        }
+        if services::state(svc) == services::State::Running {
+            svc.stopped_for_idle = for_idle;
+            running.push(svc);
+        } else if svc.pid.is_some() {
+            svc.pid = None; // it had exited on its own
+        }
+    }
+    let count = running.len();
+    let kb = services::stop_all(running)?.iter().sum();
+    p.save()?;
+    Ok((count, kb))
+}
+
+fn cmd_stop(p: &mut Project, name: &str, service: Option<&str>) -> Result<()> {
+    if let Some(service) = service {
+        if !p.session(name)?.services.iter().any(|s| s.name == service) {
+            bail!("{name} has no service named {service:?}");
+        }
+    }
+    let (count, kb) = stop_services(p, name, service, false)?;
+    if count == 0 {
+        println!("Nothing was running in {name}.");
+    } else {
+        println!(
+            "Stopped {count} service(s) in {name}, freeing about {}",
+            sys::human_bytes(kb * 1024)
+        );
+    }
+    Ok(())
+}
+
+fn cmd_services(p: &Project) -> Result<()> {
+    let rows: Vec<(&Session, &Service)> = p
+        .state
+        .sessions
+        .values()
+        .flat_map(|s| s.services.iter().map(move |svc| (s, svc)))
+        .collect();
+    if rows.is_empty() {
+        println!("No services. Start one with `shoal serve <session> -- <command>`.");
+        return Ok(());
+    }
+    println!(
+        "{:<12} {:<8} {:<5}  {:<15} {:>7} {:>9} {:>6}  COMMAND",
+        "SESSION", "SERVICE", "PORT", "STATE", "PID", "MEMORY", "IDLE"
+    );
+    for (session, svc) in rows {
+        let state = services::state(svc);
+        let running = state == services::State::Running;
+        let idle = sys::now().saturating_sub(services::last_activity(p, session));
+        println!(
+            "{:<12} {:<8} {:<5}  {:<15} {:>7} {:>9} {:>6}  {}",
+            session.name,
+            svc.name,
+            svc.port,
+            state.label(),
+            if running {
+                svc.pid.unwrap_or_default().to_string()
+            } else {
+                "-".into()
+            },
+            if running {
+                sys::human_bytes(services::group_rss_kb(svc.pid.unwrap_or_default()) * 1024)
+            } else {
+                "-".into()
+            },
+            services::human_secs(idle),
+            svc.command.join(" ")
+        );
+    }
+    Ok(())
+}
+
+fn cmd_wake(p: &mut Project, name: &str) -> Result<()> {
+    p.ensure_ready(name)?;
+    let session = p.session(name)?.clone();
+    let mut woken = 0;
+    for (i, svc) in session.services.iter().enumerate() {
+        if services::state(svc) != services::State::StoppedIdle {
+            continue;
+        }
+        let mut svc = svc.clone();
+        services::start(p, &session, &mut svc)?;
+        println!(
+            "Started {} in {name} on port {} (process group {})",
+            svc.name,
+            svc.port,
+            svc.pid.unwrap_or_default()
+        );
+        p.state
+            .sessions
+            .get_mut(name)
+            .expect("session exists")
+            .services[i] = svc;
+        woken += 1;
+    }
+    p.mark_active(name)?;
+    if woken == 0 {
+        println!("{name} has no services stopped for being idle.");
+    }
+    Ok(())
+}
+
+fn reap_once(idle: u64) -> Result<()> {
+    for dir in project::all_projects()? {
+        let mut p = match Project::open(dir.clone()) {
+            Ok(p) => p,
+            Err(err) => {
+                eprintln!("shoal: skipping {}: {err:#}", dir.display());
+                continue;
+            }
+        };
+        let due: Vec<(String, u64)> = p
+            .state
+            .sessions
+            .values()
+            .filter(|s| {
+                s.services
+                    .iter()
+                    .any(|svc| services::state(svc) == services::State::Running)
+            })
+            .map(|s| {
+                (
+                    s.name.clone(),
+                    sys::now().saturating_sub(services::last_activity(&p, s)),
+                )
+            })
+            .filter(|(_, idle_for)| *idle_for >= idle)
+            .collect();
+        if due.is_empty() {
+            continue;
+        }
+        // Stop every due service in the project together, not one by one.
+        let mut owners = Vec::new();
+        let mut targets = Vec::new();
+        for session in p.state.sessions.values_mut() {
+            if !due.iter().any(|(name, _)| *name == session.name) {
+                continue;
+            }
+            for svc in session.services.iter_mut() {
+                if services::state(svc) == services::State::Running {
+                    svc.stopped_for_idle = true;
+                    owners.push(session.name.clone());
+                    targets.push(svc);
+                }
+            }
+        }
+        let freed = services::stop_all(targets)?;
+        p.save()?;
+        for (name, idle_for) in due {
+            let mine: Vec<u64> = owners
+                .iter()
+                .zip(&freed)
+                .filter(|(owner, _)| **owner == name)
+                .map(|(_, kb)| *kb)
+                .collect();
+            println!(
+                "{}: stopped {} service(s) in {name}, idle for {}, freeing about {}",
+                dir.file_name().unwrap_or_default().to_string_lossy(),
+                mine.len(),
+                services::human_secs(idle_for),
+                sys::human_bytes(mine.iter().sum::<u64>() * 1024)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_reap(idle: &str, watch: Option<&str>) -> Result<()> {
+    let idle = services::parse_duration(idle)?.as_secs();
+    match watch {
+        None => reap_once(idle),
+        Some(interval) => {
+            let interval = services::parse_duration(interval)?;
+            println!(
+                "Stopping services idle for {} or more; checking every {}",
+                services::human_secs(idle),
+                services::human_secs(interval.as_secs())
+            );
+            loop {
+                if let Err(err) = reap_once(idle) {
+                    eprintln!("shoal: {err:#}");
+                }
+                std::thread::sleep(interval);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -833,7 +1296,7 @@ fn cmd_checkpoint(p: &mut Project, name: &str, label: Option<String>) -> Result<
     Ok(())
 }
 
-fn cmd_rewind(p: &Project, name: &str, label: &str) -> Result<()> {
+fn cmd_rewind(p: &mut Project, name: &str, label: &str) -> Result<()> {
     let session = p.session(name)?.clone();
     if !p
         .state
@@ -843,6 +1306,14 @@ fn cmd_rewind(p: &Project, name: &str, label: &str) -> Result<()> {
     {
         bail!("{name} has no checkpoint named {label}");
     }
+    // Services hold the session open; stop them now and start them again after.
+    let restart: Vec<String> = session
+        .services
+        .iter()
+        .filter(|svc| services::state(svc) == services::State::Running)
+        .map(|svc| svc.name.clone())
+        .collect();
+    stop_services(p, name, None, false)?;
     let start = Instant::now();
     let saved = p.checkpoint_dir(name, label);
     let path = p.session_path(name);
@@ -873,7 +1344,20 @@ fn cmd_rewind(p: &Project, name: &str, label: &str) -> Result<()> {
         git::short(&git::head(&path)?),
         sys::human_duration(start.elapsed())
     );
-    Ok(())
+    let session = p.session(name)?.clone();
+    for (i, svc) in session.services.iter().enumerate() {
+        if restart.contains(&svc.name) {
+            let mut svc = svc.clone();
+            services::start(p, &session, &mut svc)?;
+            println!("Restarted {} on port {}", svc.name, svc.port);
+            p.state
+                .sessions
+                .get_mut(name)
+                .expect("session exists")
+                .services[i] = svc;
+        }
+    }
+    p.mark_active(name)
 }
 
 // ---------------------------------------------------------------------------
@@ -1046,6 +1530,7 @@ fn cmd_rm(p: &mut Project, name: &str, force: bool) -> Result<()> {
             bail!("{name} has commits that are not in the source repository; run `shoal import {name}`, or pass --force");
         }
     }
+    stop_services(p, name, None, false)?;
     p.destroy_volume(name)?;
     let checkpoints = p.dir.join("checkpoints").join(name);
     if checkpoints.exists() {
@@ -1070,7 +1555,15 @@ fn cmd_up(p: &Project) -> Result<()> {
     Ok(())
 }
 
-fn cmd_down(p: &Project) -> Result<()> {
+fn cmd_down(p: &mut Project) -> Result<()> {
+    // Running services keep a session busy, and `down` usually precedes a shutdown.
+    let names: Vec<String> = p.state.sessions.keys().cloned().collect();
+    for name in &names {
+        let (count, _) = stop_services(p, name, None, false)?;
+        if count > 0 {
+            println!("Stopped {count} service(s) in {name}");
+        }
+    }
     if p.state.backend != Backend::Overlay {
         println!("Nothing to unmount: the clone backend uses plain directories.");
         return Ok(());

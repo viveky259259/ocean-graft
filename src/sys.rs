@@ -48,6 +48,44 @@ pub fn interactive(cmd: &mut Command) -> Result<i32> {
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)))
 }
 
+static CHILD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+extern "C" fn forward_signal(signal: libc::c_int) {
+    let pid = CHILD.load(std::sync::atomic::Ordering::SeqCst);
+    if pid > 0 {
+        unsafe { libc::kill(pid, signal) };
+    }
+}
+
+/// Like `interactive`, but shoal stays in charge of the child until it exits:
+/// SIGTERM and SIGHUP sent to shoal are passed on to the child, and Ctrl-C
+/// reaches the child directly from the terminal. This keeps resources that
+/// shoal holds for the job (such as a queue slot) tied to the job's lifetime.
+pub fn supervised(cmd: &mut Command) -> Result<i32> {
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("could not start `{}`", describe(cmd)))?;
+    CHILD.store(child.id() as i32, std::sync::atomic::Ordering::SeqCst);
+    let handler = forward_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+    let previous = unsafe {
+        [
+            (libc::SIGTERM, libc::signal(libc::SIGTERM, handler)),
+            (libc::SIGHUP, libc::signal(libc::SIGHUP, handler)),
+            (libc::SIGINT, libc::signal(libc::SIGINT, libc::SIG_IGN)),
+            (libc::SIGQUIT, libc::signal(libc::SIGQUIT, libc::SIG_IGN)),
+        ]
+    };
+    let status = child.wait();
+    for (signal, old) in previous {
+        unsafe { libc::signal(signal, old) };
+    }
+    CHILD.store(0, std::sync::atomic::Ordering::SeqCst);
+    let status = status?;
+    Ok(status
+        .code()
+        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)))
+}
+
 fn cstring(path: &Path) -> Result<CString> {
     CString::new(path.as_os_str().as_bytes())
         .with_context(|| format!("path contains a NUL byte: {}", path.display()))

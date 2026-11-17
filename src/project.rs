@@ -71,6 +71,20 @@ pub struct Generation {
     pub layers: Vec<String>,
 }
 
+/// A long-running process for a session, such as its dev server.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Service {
+    pub name: String,
+    pub command: Vec<String>,
+    pub port: u16,
+    /// The service runs as its own process group; this is the group id.
+    pub pid: Option<i32>,
+    pub started_at: u64,
+    /// Stopped by `shoal reap` because the session went idle.
+    #[serde(default)]
+    pub stopped_for_idle: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Session {
     pub name: String,
@@ -82,6 +96,11 @@ pub struct Session {
     pub parent: Option<String>,
     /// Overlay only: the read-only layers under this session, top-most first.
     pub lowers: Vec<String>,
+    #[serde(default)]
+    pub services: Vec<Service>,
+    /// Last time shoal ran something in the session (exec, run, serve, touch...).
+    #[serde(default)]
+    pub last_active: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -215,6 +234,21 @@ fn lock(dir: &Path) -> Result<File> {
     Ok(file)
 }
 
+/// Every initialised project under SHOAL_HOME.
+pub fn all_projects() -> Result<Vec<PathBuf>> {
+    let projects = shoal_home()?.join("projects");
+    let Ok(entries) = std::fs::read_dir(&projects) else {
+        return Ok(Vec::new());
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|d| d.join("state.json").exists())
+        .collect();
+    dirs.sort();
+    Ok(dirs)
+}
+
 pub fn validate_name(kind: &str, name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 40
@@ -283,6 +317,33 @@ impl Project {
 
     pub fn checkpoint_dir(&self, session: &str, label: &str) -> PathBuf {
         self.dir.join("checkpoints").join(session).join(label)
+    }
+
+    /// The session whose directory contains the current working directory.
+    pub fn session_from_cwd(&self) -> Result<String> {
+        let cwd = std::env::current_dir()?.canonicalize()?;
+        let sessions = self.dir.join("sessions").canonicalize()?;
+        cwd.strip_prefix(&sessions)
+            .ok()
+            .and_then(|rest| rest.components().next())
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .filter(|name| self.state.sessions.contains_key(name))
+            .context("not inside a session directory; name the session")
+    }
+
+    /// Record that something just happened in the session.
+    pub fn mark_active(&mut self, name: &str) -> Result<()> {
+        if let Some(s) = self.state.sessions.get_mut(name) {
+            s.last_active = sys::now();
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    pub fn log_path(&self, session: &str, service: &str) -> PathBuf {
+        self.dir
+            .join("logs")
+            .join(format!("{session}-{service}.log"))
     }
 
     pub fn latest(&self) -> &Generation {
