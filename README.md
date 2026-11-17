@@ -132,6 +132,28 @@ Vitest tests and 1,506 files in `node_modules`.
      `search` still passed.
    - `shoal rewind` restored the fork in 90 ms, and its tests passed again.
 
+## Scale test: 100 sessions on one machine
+
+[`demo/scale.py`](demo/scale.py) adds 100 sessions to the live-test project,
+for 104 in total, and gives each a small edit. Every fifth session edits the
+same tracked file, so real conflicts exist. Measured on a 4 vCPU VM with the
+overlay backend.
+
+| What | Result |
+|---|---|
+| Create a session | 0.2 ms median for the first 10, 0.5 ms for the last 10, 1.2 ms worst; plus 4 ms to create the branch |
+| Disk for 104 sessions | 167 MB, of which the template is 128 MB |
+| Memory for files | `node_modules` read in 10 sessions occupied 109 MB of page cache, the same as in 1. Overlay sessions share the template's cache. Reflink copies on XFS do not: each extra copy added about 110 MB. |
+| `shoal ls` | 678 ms (about 6.5 ms per session) |
+| `shoal conflicts` | 7.5 s for 5,356 pairs, of which 1,216 share a file and 955 conflict. About 3 ms per session snapshot and 3 ms per overlapping pair, so it grows with the square of the session count. |
+| Test suite in parallel | 53 runs/min with 1 session, 218 with 4, 231 with 8, 234 with 16. It saturates at the core count. |
+| One running dev server | 209 MB resident |
+| Remove 100 sessions | 1.65 s |
+
+On one machine, storage stops being the limit. CPU, memory for running
+processes, and the quadratic conflict check limit how many sessions can be
+active.
+
 ## Tests
 
 ```bash
