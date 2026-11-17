@@ -476,3 +476,69 @@ fn conflict_check_is_incremental() {
         "{committed}"
     );
 }
+
+/// One HTTP/1.0 GET; returns the status line, or None if nothing answered.
+fn http_get(port: u16) -> Option<String> {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(70)))
+        .ok()?;
+    stream
+        .write_all(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+        .ok()?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).ok()?;
+    let text = String::from_utf8_lossy(&response);
+    text.lines().next().map(str::to_string)
+}
+
+#[test]
+fn on_demand_service_wakes_on_first_request() {
+    use std::time::{Duration, Instant};
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipped: needs python3 for a test HTTP server");
+        return;
+    }
+    let env = Env::new();
+    let _unmount = Unmount(&env);
+    env.shoal(&["init", "--backend", "clone", "--port-base", "4700"]);
+    env.shoal(&["new", "a"]);
+    let started = env.shoal(&[
+        "serve",
+        "a",
+        "--on-demand",
+        "--",
+        "sh",
+        "-c",
+        "exec python3 -m http.server \"$PORT\" --bind 127.0.0.1",
+    ]);
+    assert!(started.contains("on port 4700 (on demand"), "{started}");
+    // The server needs a moment to bind its private port; the gateway waits.
+    let first = http_get(4700).expect("the gateway answers");
+    assert!(first.contains("200"), "{first}");
+    assert!(env.shoal(&["services"]).contains("running (on demand)"));
+
+    // Idle: reap stops the server but the gateway stays.
+    std::thread::sleep(Duration::from_secs(2));
+    let reaped = env.shoal(&["reap", "--idle", "1s"]);
+    assert!(reaped.contains("stopped 1 service(s) in a"), "{reaped}");
+    assert!(env.shoal(&["services"]).contains("asleep (on demand)"));
+
+    // The next request wakes it and is answered.
+    let start = Instant::now();
+    let woken = http_get(4700).expect("the gateway answers after reap");
+    assert!(woken.contains("200"), "{woken}");
+    eprintln!("woke and answered in {:?}", start.elapsed());
+    assert!(env.shoal(&["services"]).contains("running (on demand)"));
+
+    // Requests count as activity: a session in use is not reaped.
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(http_get(4700).unwrap().contains("200"));
+    let kept = env.shoal(&["reap", "--idle", "1s"]);
+    assert!(!kept.contains("in a"), "a was just used: {kept}");
+
+    // stop removes the gateway too: nothing listens any more.
+    env.shoal(&["stop", "a"]);
+    assert!(http_get(4700).is_none(), "the gateway should be gone");
+}

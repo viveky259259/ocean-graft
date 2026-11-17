@@ -41,6 +41,68 @@ pub fn group_alive(pgid: i32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+pub fn gateway_running(service: &Service) -> bool {
+    service.gateway.is_some_and(group_alive)
+}
+
+/// A longer label for listings: idle on-demand services wake on request.
+pub fn describe(service: &Service) -> &'static str {
+    match state(service) {
+        State::StoppedIdle if gateway_running(service) => "asleep (on demand)",
+        State::Running if service.gateway.is_some() => "running (on demand)",
+        other => other.label(),
+    }
+}
+
+/// Start the gateway that owns an on-demand service's public port.
+pub fn start_gateway(p: &Project, session: &Session, service: &mut Service) -> Result<()> {
+    let log_path = p
+        .dir
+        .join("logs")
+        .join(format!("{}-{}-gateway.log", session.name, service.name));
+    std::fs::create_dir_all(log_path.parent().expect("log path has a parent"))?;
+    let log = File::options().create(true).append(true).open(&log_path)?;
+    let mut cmd = Command::new(std::env::current_exe().context("could not locate shoal")?);
+    cmd.arg("--project")
+        .arg(&p.dir)
+        .args(["gateway", &session.name, &service.name])
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().context("could not start the gateway")?;
+    std::thread::sleep(Duration::from_millis(200));
+    if let Some(status) = child.try_wait()? {
+        bail!(
+            "the gateway for {} exited straight away ({status}); see {}",
+            service.name,
+            log_path.display()
+        );
+    }
+    service.gateway = Some(child.id() as i32);
+    Ok(())
+}
+
+pub fn stop_gateway(service: &mut Service) {
+    if let Some(g) = service.gateway.take() {
+        if group_alive(g) {
+            unsafe { libc::kill(-g, libc::SIGTERM) };
+            wait_for(&[g], Duration::from_secs(3));
+            if group_alive(g) {
+                unsafe { libc::kill(-g, libc::SIGKILL) };
+                wait_for(&[g], Duration::from_secs(2));
+            }
+        }
+    }
+}
+
 pub fn state(service: &Service) -> State {
     match service.pid {
         Some(pgid) if group_alive(pgid) => State::Running,
@@ -94,7 +156,10 @@ pub fn start(p: &Project, session: &Session, service: &mut Service) -> Result<()
         .env("SHOAL_SESSION", &session.name)
         .env("SHOAL_SERVICE", &service.name)
         .env("SHOAL_PORT", session.port.to_string())
-        .env("PORT", service.port.to_string())
+        .env(
+            "PORT",
+            service.internal_port.unwrap_or(service.port).to_string(),
+        )
         .env("SHOAL_PROJECT", &p.dir);
     unsafe {
         cmd.pre_exec(|| {
@@ -208,12 +273,17 @@ fn newest_mtime(root: &Path) -> u64 {
 /// When the session last showed signs of work: a shoal command run in it, or
 /// a change to its files or git history.
 pub fn last_activity(p: &Project, session: &Session) -> u64 {
+    use std::os::unix::fs::MetadataExt;
     let files = match p.state.backend {
         // Only changed files live in the upper dir, so this is cheap.
         Backend::Overlay => newest_mtime(&p.volume_dir(&session.name).join("upper")),
         Backend::Clone => newest_mtime(&p.session_path(&session.name)),
     };
-    files.max(session.last_active)
+    // Requests through an on-demand gateway.
+    let requests = std::fs::metadata(crate::gateway::activity_file(&p.dir, &session.name))
+        .map(|m| m.mtime().max(0) as u64)
+        .unwrap_or(0);
+    files.max(session.last_active).max(requests)
 }
 
 /// "90", "45s", "15m", "2h" -> seconds.

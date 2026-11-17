@@ -7,6 +7,7 @@
 //! only what it changes.
 
 mod conflicts;
+mod gateway;
 mod git;
 mod project;
 mod queue;
@@ -95,9 +96,17 @@ enum Cmd {
         /// Service name, so a session can run several
         #[arg(long = "as", default_value = "web")]
         service: String,
+        /// Put a gateway on the port that starts the service again on the
+        /// first request after `reap` stopped it (the service gets a private
+        /// port in PORT)
+        #[arg(long)]
+        on_demand: bool,
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
+    /// Internal: the wake-on-request gateway for an on-demand service
+    #[command(hide = true)]
+    Gateway { name: String, service: String },
     /// Stop a session's services (all of them, or the one named)
     Stop {
         name: String,
@@ -257,8 +266,25 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Serve {
             name,
             service,
+            on_demand,
             command,
-        } => cmd_serve(&mut p, &name, &service, command)?,
+        } => cmd_serve(&mut p, &name, &service, on_demand, command)?,
+        Cmd::Gateway { name, service } => {
+            let svc = p
+                .session(&name)?
+                .services
+                .iter()
+                .find(|s| s.name == service)
+                .cloned()
+                .with_context(|| format!("{name} has no service named {service:?}"))?;
+            let internal = svc
+                .internal_port
+                .with_context(|| format!("{service} is not an on-demand service"))?;
+            let dir = p.dir.clone();
+            drop(p); // the gateway runs for a long time; never hold the lock
+            gateway::run(&dir, &name, svc.port, internal)?;
+            return Ok(0);
+        }
         Cmd::Stop { name, service } => cmd_stop(&mut p, &name, service.as_deref())?,
         Cmd::Services => cmd_services(&p)?,
         Cmd::Wake { name } => cmd_wake(&mut p, &name)?,
@@ -1001,7 +1027,13 @@ fn cmd_queue(slots: Option<usize>) -> Result<()> {
 // Services and idle shutdown
 // ---------------------------------------------------------------------------
 
-fn cmd_serve(p: &mut Project, name: &str, service: &str, command: Vec<String>) -> Result<()> {
+fn cmd_serve(
+    p: &mut Project,
+    name: &str,
+    service: &str,
+    on_demand: bool,
+    command: Vec<String>,
+) -> Result<()> {
     validate_name("service", service)?;
     p.ensure_ready(name)?;
     let session = p.session(name)?.clone();
@@ -1018,6 +1050,7 @@ fn cmd_serve(p: &mut Project, name: &str, service: &str, command: Vec<String>) -
     if slot >= 10 {
         bail!("a session has ports for at most 10 services");
     }
+    let existing = index.map(|i| session.services[i].clone());
     let mut svc = Service {
         name: service.to_string(),
         command,
@@ -1025,14 +1058,38 @@ fn cmd_serve(p: &mut Project, name: &str, service: &str, command: Vec<String>) -
         pid: None,
         started_at: 0,
         stopped_for_idle: false,
+        internal_port: None,
+        gateway: existing.as_ref().and_then(|e| e.gateway),
     };
+    if on_demand {
+        svc.internal_port = match existing.as_ref().and_then(|e| e.internal_port) {
+            Some(port) => Some(port),
+            None => Some(gateway::free_port()?),
+        };
+    } else if let Some(mut old) = existing {
+        services::stop_gateway(&mut old); // switching back to a plain service
+        svc.gateway = None;
+    }
     services::start(p, &session, &mut svc)?;
-    println!(
-        "Started {service} in {name} on port {} (process group {}), log {}",
-        svc.port,
-        svc.pid.unwrap_or_default(),
-        p.log_path(name, service).display()
-    );
+    if on_demand && !services::gateway_running(&svc) {
+        if let Err(err) = services::start_gateway(p, &session, &mut svc) {
+            let _ = services::stop_all(vec![&mut svc]);
+            return Err(err);
+        }
+    }
+    match svc.internal_port {
+        Some(internal) => println!(
+            "Started {service} in {name} on port {} (on demand: the service listens on {internal}), log {}",
+            svc.port,
+            p.log_path(name, service).display()
+        ),
+        None => println!(
+            "Started {service} in {name} on port {} (process group {}), log {}",
+            svc.port,
+            svc.pid.unwrap_or_default(),
+            p.log_path(name, service).display()
+        ),
+    }
     let s = p.state.sessions.get_mut(name).expect("session exists");
     match index {
         Some(i) => s.services[i] = svc,
@@ -1049,6 +1106,7 @@ fn stop_services(
     name: &str,
     only: Option<&str>,
     for_idle: bool,
+    keep_gateways: bool,
 ) -> Result<(usize, u64)> {
     let session = p
         .state
@@ -1069,6 +1127,14 @@ fn stop_services(
     }
     let count = running.len();
     let kb = services::stop_all(running)?.iter().sum();
+    if !keep_gateways {
+        let session = p.state.sessions.get_mut(name).expect("session exists");
+        for svc in session.services.iter_mut() {
+            if only.is_none_or(|o| o == svc.name) {
+                services::stop_gateway(svc);
+            }
+        }
+    }
     p.save()?;
     Ok((count, kb))
 }
@@ -1079,7 +1145,7 @@ fn cmd_stop(p: &mut Project, name: &str, service: Option<&str>) -> Result<()> {
             bail!("{name} has no service named {service:?}");
         }
     }
-    let (count, kb) = stop_services(p, name, service, false)?;
+    let (count, kb) = stop_services(p, name, service, false, false)?;
     if count == 0 {
         println!("Nothing was running in {name}.");
     } else {
@@ -1103,7 +1169,7 @@ fn cmd_services(p: &Project) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<12} {:<8} {:<5}  {:<15} {:>7} {:>9} {:>6}  COMMAND",
+        "{:<12} {:<8} {:<5}  {:<19} {:>7} {:>9} {:>6}  COMMAND",
         "SESSION", "SERVICE", "PORT", "STATE", "PID", "MEMORY", "IDLE"
     );
     for (session, svc) in rows {
@@ -1111,11 +1177,11 @@ fn cmd_services(p: &Project) -> Result<()> {
         let running = state == services::State::Running;
         let idle = sys::now().saturating_sub(services::last_activity(p, session));
         println!(
-            "{:<12} {:<8} {:<5}  {:<15} {:>7} {:>9} {:>6}  {}",
+            "{:<12} {:<8} {:<5}  {:<19} {:>7} {:>9} {:>6}  {}",
             session.name,
             svc.name,
             svc.port,
-            state.label(),
+            services::describe(svc),
             if running {
                 svc.pid.unwrap_or_default().to_string()
             } else {
@@ -1314,7 +1380,7 @@ fn cmd_rewind(p: &mut Project, name: &str, label: &str) -> Result<()> {
         .filter(|svc| services::state(svc) == services::State::Running)
         .map(|svc| svc.name.clone())
         .collect();
-    stop_services(p, name, None, false)?;
+    stop_services(p, name, None, false, true)?;
     let start = Instant::now();
     let saved = p.checkpoint_dir(name, label);
     let path = p.session_path(name);
@@ -1473,7 +1539,7 @@ fn cmd_rm(p: &mut Project, name: &str, force: bool) -> Result<()> {
             bail!("{name} has commits that are not in the source repository; run `shoal import {name}`, or pass --force");
         }
     }
-    stop_services(p, name, None, false)?;
+    stop_services(p, name, None, false, false)?;
     p.destroy_volume(name)?;
     let checkpoints = p.dir.join("checkpoints").join(name);
     if checkpoints.exists() {
@@ -1503,7 +1569,7 @@ fn cmd_down(p: &mut Project) -> Result<()> {
     // Running services keep a session busy, and `down` usually precedes a shutdown.
     let names: Vec<String> = p.state.sessions.keys().cloned().collect();
     for name in &names {
-        let (count, _) = stop_services(p, name, None, false)?;
+        let (count, _) = stop_services(p, name, None, false, false)?;
         if count > 0 {
             println!("Stopped {count} service(s) in {name}");
         }

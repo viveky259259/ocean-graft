@@ -37,7 +37,7 @@ shoal import --all                         # commits come back as shoal/<name> b
 | `shell [--sandbox] NAME` | Open a shell in the session |
 | `run [NAME] [--slots K] -- CMD` | Run a heavy command (tests, a build) once a machine-wide queue slot is free. Inside a session, NAME can be left out |
 | `queue [--slots N]` | Show running and waiting jobs, or set how many may run at once (default: one per CPU) |
-| `serve NAME [--as SERVICE] -- CMD` | Start a long-running service, such as a dev server, in the background on the session's port |
+| `serve NAME [--as SERVICE] [--on-demand] -- CMD` | Start a long-running service, such as a dev server, in the background on the session's port. With `--on-demand`, a gateway on the port starts it again on the first request after `reap` stopped it |
 | `services` / `stop NAME [SERVICE]` | List services with their memory and idle time; stop them |
 | `reap [--idle 15m] [--watch 1m]` | Stop the services of sessions with no recent activity, in every project |
 | `wake NAME` / `touch NAME` | Restart services that `reap` stopped; mark a session active (for agent hooks) |
@@ -192,6 +192,17 @@ A session counts as active when any of these happen:
 `rm`, `down` and `rewind` stop a session's services first; `rewind` starts
 them again afterwards.
 
+**Wake on request.** `shoal serve NAME --on-demand -- CMD` runs the server
+on a private port (given to it as `PORT`) and puts a small gateway on the
+session's public port. The gateway is a plain TCP relay, so HTTP,
+WebSockets and hot reload pass through. When a request arrives and nothing
+answers, the gateway runs `shoal wake` and holds the connection until the
+server is up. Each request also counts as activity, so a preview someone is
+using is not reaped. `reap` leaves the gateway running; `stop`, `rm` and
+`down` remove it. With the notes app's dev server, the first request after
+`reap` was answered in 0.73 s; the gateway uses about 3.6 MB, against about
+240 MB for the server it stands in for.
+
 Measured with [`demo/resources.py`](demo/resources.py) on the notes app
 (4 vCPU, overlay backend, two runs):
 
@@ -217,8 +228,9 @@ the full lifecycle on both backends: isolation, status, diff, ports,
 conflicts, checkpoint and rewind, fork, import, refresh, rm safety, remount
 and gc. They also cover sandbox confinement, the queue never running more
 jobs than it has slots, and idle shutdown, which stops the idle session's
-server, keeps the busy one, then wakes, stops and removes them. The overlay
-test needs root and is skipped otherwise.
+server, keeps the busy one, then wakes, stops and removes them. Two more
+cover the incremental conflict check and wake on request with a real HTTP
+server. The overlay test needs root and is skipped otherwise.
 
 ## Limitations
 
@@ -234,5 +246,6 @@ test needs root and is skipped otherwise.
 - The queue only governs commands started with `shoal run`. An agent that
   runs `npm test` directly bypasses it, so agents have to be told to use it
   (Ocean can wrap their commands).
-- A stopped server comes back with `shoal wake`, not on the first request to
-  its port.
+- Wake on request is opt-in (`--on-demand`), because the server then sees a
+  different port than the one users open. Most dev servers handle this, but
+  one that prints or redirects to its own port would show the private one.

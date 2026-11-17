@@ -83,6 +83,12 @@ pub struct Service {
     /// Stopped by `shoal reap` because the session went idle.
     #[serde(default)]
     pub stopped_for_idle: bool,
+    /// On-demand services listen here; a gateway owns `port` and wakes them.
+    #[serde(default)]
+    pub internal_port: Option<u16>,
+    /// The gateway's process group, for on-demand services.
+    #[serde(default)]
+    pub gateway: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
