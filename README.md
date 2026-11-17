@@ -42,7 +42,7 @@ shoal import --all                         # commits come back as shoal/<name> b
 | `reap [--idle 15m] [--watch 1m]` | Stop the services of sessions with no recent activity, in every project |
 | `wake NAME` / `touch NAME` | Restart services that `reap` stopped; mark a session active (for agent hooks) |
 | `checkpoint NAME [LABEL]` / `rewind NAME LABEL` | Save the whole session state and restore it later |
-| `conflicts` | Files that two or more sessions changed, and which pairs really conflict (`git merge-tree`) |
+| `conflicts` | Files that two or more sessions changed, and which pairs really conflict (`git merge-tree`). Incremental: only sessions that changed since the last check are looked at again |
 | `import [NAME...] [--all]` | Fetch session commits into the source repo as `shoal/NAME` branches |
 | `refresh` | Build the next template generation from the source repo; setup re-runs only when a lockfile changed |
 | `rm NAME [--force]` | Remove a session; refuses if it would lose uncommitted or unimported work |
@@ -77,10 +77,15 @@ template are hidden. It is not available on macOS yet.
 
 - **Git.** Each session has its own `.git`, so a checkpoint or fork captures
   HEAD, the index and any rebase in progress along with the files. `import`
-  fetches `HEAD` from the session into the source repo. `conflicts` commits
-  each working tree to a throwaway object (HEAD and the index are untouched),
-  fetches those into `hub.git`, and runs `git merge-tree` on every pair that
-  touches a common file.
+  fetches `HEAD` from the session into the source repo.
+- **Conflicts.** `conflicts` fingerprints each session from one `git status`
+  (HEAD, the entries, and the size and modification time of each listed
+  file). Only a session whose fingerprint changed gets a new snapshot: its
+  working tree committed to a throwaway object, with HEAD and the index left
+  alone. Only pairs that change a file in common are merged with
+  `git merge-tree`. It runs in `hub.git` and reads both sessions' objects in
+  place, so nothing is copied. Results are cached by the two snapshot ids,
+  and the work runs on all cores.
 - **Templates are never modified.** Sessions set `gc.auto=0` so they never
   repack shared objects. `refresh` builds a new generation on top of the old
   one; running sessions keep theirs.
@@ -151,14 +156,13 @@ overlay backend.
 | Disk for 104 sessions | 167 MB, of which the template is 128 MB |
 | Memory for files | `node_modules` read in 10 sessions occupied 109 MB of page cache, the same as in 1. Overlay sessions share the template's cache. Reflink copies on XFS do not: each extra copy added about 110 MB. |
 | `shoal ls` | 678 ms (about 6.5 ms per session) |
-| `shoal conflicts` | 7.5 s for 5,356 pairs, of which 1,216 share a file and 955 conflict. About 3 ms per session snapshot and 3 ms per overlapping pair, so it grows with the square of the session count. |
+| `shoal conflicts` | 5,356 pairs, of which 1,216 share a file and 955 conflict. The first version took 7.5 s. The incremental check takes 3.8 s the first time, 0.19 s when nothing changed, and 0.23 s after one session changes. |
 | Test suite in parallel | 53 runs/min with 1 session, 218 with 4, 231 with 8, 234 with 16. It saturates at the core count. |
 | One running dev server | 209 MB resident |
-| Remove 100 sessions | 1.65 s |
+| Remove 100 sessions | 1.65 s in one run and 12.4 s in another. The time is the kernel unmounting each overlay (16 to 220 ms), which shoal waits for so it never removes a session someone is still using. |
 
-On one machine, storage stops being the limit. CPU, memory for running
-processes, and the quadratic conflict check limit how many sessions can be
-active.
+On one machine, storage stops being the limit. CPU and memory for running
+processes limit how many sessions can be active.
 
 ## Job queue and idle shutdown
 

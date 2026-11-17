@@ -6,6 +6,7 @@
 //! branch and its installed dependencies, created in milliseconds and storing
 //! only what it changes.
 
+mod conflicts;
 mod git;
 mod project;
 mod queue;
@@ -1402,111 +1403,53 @@ fn cmd_import(p: &Project, names: Vec<String>, all: bool) -> Result<()> {
 }
 
 fn cmd_conflicts(p: &Project) -> Result<()> {
-    git::require_version(2, 38)?;
-    let hub = p.dir.join("hub.git");
-    let mut changed: Vec<(String, BTreeSet<String>)> = Vec::new();
-    for (name, s) in &p.state.sessions {
-        let path = p.ensure_ready(name)?;
-        // Compare what is on disk now, committed or not.
-        let snapshot = git::snapshot_commit(&path)?;
-        git::git(&path, &["update-ref", "refs/shoal/snapshot", &snapshot])?;
-        git::git(
-            &hub,
-            &[
-                "fetch",
-                "-q",
-                "--no-tags",
-                &path.to_string_lossy(),
-                &format!("+refs/shoal/snapshot:refs/snapshots/{name}"),
-            ],
-        )?;
-        let files: BTreeSet<String> = git::git(
-            &hub,
-            &[
-                "diff",
-                "--name-only",
-                &s.base_commit,
-                &format!("refs/snapshots/{name}"),
-            ],
-        )?
-        .lines()
-        .map(str::to_string)
-        .collect();
-        changed.push((name.clone(), files));
-    }
-    let width = changed.iter().map(|(n, _)| n.len()).max().unwrap_or(4);
+    let start = Instant::now();
+    let report = conflicts::check(p)?;
+    let width = report
+        .changed
+        .iter()
+        .map(|(n, _)| n.len())
+        .max()
+        .unwrap_or(4);
     println!("Files changed, committed or not:");
-    for (name, files) in &changed {
-        println!("  {name:<width$}  {}", files.len());
+    for (name, files) in &report.changed {
+        println!("  {name:<width$}  {files}");
     }
-    if changed.len() < 2 {
-        return Ok(());
-    }
-    println!();
-    let mut quiet_pairs = 0;
-    let mut conflicts = 0;
-    for i in 0..changed.len() {
-        for j in i + 1..changed.len() {
-            let (a, a_files) = &changed[i];
-            let (b, b_files) = &changed[j];
-            let overlap: Vec<&String> = a_files.intersection(b_files).collect();
-            if overlap.is_empty() {
-                quiet_pairs += 1;
-                continue;
-            }
-            let out = git::command(&hub)
-                .args([
-                    "merge-tree",
-                    "--write-tree",
-                    "--name-only",
-                    "--no-messages",
-                    &format!("refs/snapshots/{a}"),
-                    &format!("refs/snapshots/{b}"),
-                ])
-                .output()?;
-            let pair = format!("{a} + {b}");
-            match out.status.code() {
-                Some(0) => println!(
-                    "  {pair:<w$}  merge cleanly, both change: {}",
-                    join(&overlap),
-                    w = width * 2 + 3
-                ),
-                Some(1) => {
-                    conflicts += 1;
-                    let files: Vec<String> = String::from_utf8_lossy(&out.stdout)
-                        .lines()
-                        .skip(1)
-                        .filter(|l| !l.is_empty())
-                        .map(str::to_string)
-                        .collect();
-                    println!(
-                        "  {pair:<w$}  CONFLICT in: {}",
-                        files.join(", "),
-                        w = width * 2 + 3
-                    );
-                }
-                _ => bail!(
-                    "git merge-tree failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ),
+    if report.changed.len() >= 2 {
+        println!();
+        let w = width * 2 + 3;
+        let mut conflicts = 0;
+        for pair in &report.pairs {
+            let label = format!("{} + {}", pair.a, pair.b);
+            if pair.conflicts.is_empty() {
+                println!(
+                    "  {label:<w$}  merge cleanly, both change: {}",
+                    pair.shared.join(", ")
+                );
+            } else {
+                conflicts += 1;
+                println!("  {label:<w$}  CONFLICT in: {}", pair.conflicts.join(", "));
             }
         }
+        if report.quiet_pairs > 0 {
+            println!(
+                "  {} other pair(s) change no files in common.",
+                report.quiet_pairs
+            );
+        }
+        if conflicts == 0 {
+            println!("\nNo conflicts.");
+        }
     }
-    if quiet_pairs > 0 {
-        println!("  {quiet_pairs} other pair(s) change no files in common.");
-    }
-    if conflicts == 0 {
-        println!("\nNo conflicts.");
-    }
+    println!(
+        "\nChecked {} session(s) ({} changed since the last check) and {} overlapping pair(s) ({} merged now) in {}",
+        report.changed.len(),
+        report.sessions_resnapshotted,
+        report.pairs.len(),
+        report.pairs_merged,
+        sys::human_duration(start.elapsed())
+    );
     Ok(())
-}
-
-fn join(items: &[&String]) -> String {
-    items
-        .iter()
-        .map(|s| s.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 // ---------------------------------------------------------------------------
@@ -1539,6 +1482,7 @@ fn cmd_rm(p: &mut Project, name: &str, force: bool) -> Result<()> {
     p.state.checkpoints.retain(|c| c.session != name);
     p.state.sessions.remove(name);
     p.save()?;
+    conflicts::forget(&p.dir, name);
     let _ = git::git(
         &p.dir.join("hub.git"),
         &["update-ref", "-d", &format!("refs/snapshots/{name}")],

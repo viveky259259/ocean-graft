@@ -414,3 +414,65 @@ fn idle_services_are_stopped_and_woken() {
     env.shoal(&["rm", "a", "--force"]);
     assert!(!alive(pid_a), "rm stops the session's services");
 }
+
+#[test]
+fn conflict_check_is_incremental() {
+    let env = Env::new();
+    let _unmount = Unmount(&env);
+    env.shoal(&["init", "--backend", "clone"]);
+    for name in ["a", "b", "c"] {
+        env.shoal(&["new", name]);
+    }
+    let original = read(env.path("b").join("src/app.txt"));
+    fs::write(
+        env.path("a").join("src/app.txt"),
+        "line one\nfrom a\nline three\n",
+    )
+    .unwrap();
+    fs::write(
+        env.path("b").join("src/app.txt"),
+        "line one\nfrom b\nline three\n",
+    )
+    .unwrap();
+    fs::write(env.path("c").join("README.md"), "c was here\n").unwrap();
+
+    let first = env.shoal(&["conflicts"]);
+    assert!(
+        first.contains("a + b") && first.contains("CONFLICT in: src/app.txt"),
+        "{first}"
+    );
+    assert!(
+        first.contains("(3 changed since the last check)"),
+        "{first}"
+    );
+    assert!(
+        first.contains("1 overlapping pair(s) (1 merged now)"),
+        "{first}"
+    );
+
+    // Nothing changed: no new snapshots, no new merges, same answer.
+    let again = env.shoal(&["conflicts"]);
+    assert!(
+        again.contains("(0 changed since the last check)"),
+        "{again}"
+    );
+    assert!(again.contains("(0 merged now)"), "{again}");
+    assert!(again.contains("CONFLICT in: src/app.txt"), "{again}");
+
+    // b takes its edit back: only b is looked at again, and the conflict is gone.
+    fs::write(env.path("b").join("src/app.txt"), &original).unwrap();
+    let after = env.shoal(&["conflicts"]);
+    assert!(
+        after.contains("(1 changed since the last check)"),
+        "{after}"
+    );
+    assert!(after.contains("No conflicts."), "{after}");
+
+    // A committed change counts too, even when the files are the same on disk.
+    env.git(&env.path("a"), &["commit", "-q", "-am", "a commits"]);
+    let committed = env.shoal(&["conflicts"]);
+    assert!(
+        committed.contains("(1 changed since the last check)"),
+        "{committed}"
+    );
+}

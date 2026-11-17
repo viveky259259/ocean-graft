@@ -176,6 +176,13 @@ def main():
     results["conflicts_ms"] = round(ms)
     results["conflict_pairs"] = out.count("CONFLICT in")
     results["clean_overlap_pairs"] = out.count("merge cleanly")
+    # The check is incremental: nothing changed, then one session changes.
+    ms, _ = timed(sh, "shoal", "conflicts")
+    results["conflicts_unchanged_ms"] = round(ms)
+    with open(os.path.join(paths[names[0]], EDIT_TARGETS[0]), "a") as f:
+        f.write("// one more edit\n")
+    ms, _ = timed(sh, "shoal", "conflicts")
+    results["conflicts_after_one_change_ms"] = round(ms)
 
     # 4. Page cache: one copy of node_modules in memory however many sessions read it.
     if drop_caches():
