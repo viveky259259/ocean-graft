@@ -222,7 +222,6 @@ fn let_a_second_pass() {
     std::thread::sleep(Duration::from_millis(1200));
 }
 
-
 // ---------------------------------------------------------------------------
 // Launcher: exit-code mapping
 // ---------------------------------------------------------------------------
@@ -769,11 +768,10 @@ fn auto_checkpoints_report_matches_the_stop_hook() {
 // Idle worktree sweep
 // ---------------------------------------------------------------------------
 
-/// A WorktreeCreate for a subagent (the hook input carries agent_id).
+/// A WorktreeCreate as Claude Code sends it for a subagent (no agent fields:
+/// it never sends them for WorktreeCreate). Nothing interactive runs in it.
 fn subagent_worktree(env: &Env, name: &str, cwd: &Path, idle_hours: &str) -> PathBuf {
-    let mut input = create_input(name, cwd);
-    input["agent_id"] = json!(format!("agent-{name}"));
-    input["agent_type"] = json!("general-purpose");
+    let input = create_input(name, cwd);
     let r = hook_env(
         env,
         "worktree-create",
@@ -802,9 +800,11 @@ fn sweep(env: &Env, idle_hours: &str) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
-/// Only idle subagent sessions are swept (work saved first). Interactive
-/// worktree sessions, api forks, sessions with a running service, and
-/// sessions some process is working in are kept. 0 hours turns it off.
+/// Only idle hook-made sessions that no main session ran in are swept (work
+/// saved first). Sessions where SessionStart or UserPromptSubmit fired
+/// (`claude --worktree`, background sessions), api forks, sessions with a
+/// running service, and sessions some process is working in are kept. 0
+/// hours turns it off.
 #[test]
 fn worktree_sweep_removes_only_idle_subagent_sessions() {
     for backend in backends() {
@@ -826,20 +826,50 @@ fn worktree_sweep_removes_only_idle_subagent_sessions() {
             .unwrap();
         let (interactive, _) = worktree_create(&env, "interactive", &repo, Some("0"));
         assert!(interactive.exists());
+        // A main session starts in one, and the user types a prompt in another.
+        let ss = hook_env(
+            &env,
+            "session-start",
+            &json!({"cwd": interactive, "hook_event_name": "SessionStart"}),
+            &interactive,
+            &[],
+            &[],
+        );
+        assert_eq!(ss.code, 0, "{}", ss.stderr);
+        let prompted = subagent_worktree(&env, "prompted", &repo, "0");
+        let up = hook_env(
+            &env,
+            "prompt",
+            &json!({"cwd": prompted, "hook_event_name": "UserPromptSubmit"}),
+            &prompted,
+            &[],
+            &[],
+        );
+        assert_eq!(up.code, 0, "{}", up.stderr);
         env.api("fork", json!({"name": "manual"})).unwrap();
         let st = env.state();
         assert_eq!(
-            st["sessions"]["sub1"]["subagent"],
+            st["sessions"]["sub1"]["hook_created"],
             json!(true),
             "[{backend}]"
         );
         assert_eq!(
-            st["sessions"]["interactive"]["subagent"],
+            st["sessions"]["sub1"]["interactive"],
             json!(false),
             "[{backend}]"
         );
         assert_eq!(
-            st["sessions"]["manual"]["subagent"],
+            st["sessions"]["interactive"]["interactive"],
+            json!(true),
+            "[{backend}]"
+        );
+        assert_eq!(
+            st["sessions"]["prompted"]["interactive"],
+            json!(true),
+            "[{backend}]"
+        );
+        assert_eq!(
+            st["sessions"]["manual"]["hook_created"],
             json!(false),
             "[{backend}]"
         );
@@ -850,7 +880,7 @@ fn worktree_sweep_removes_only_idle_subagent_sessions() {
 
         // 0 turns the sweep off.
         sweep(&env, "0");
-        assert_eq!(session_names(&env).len(), 6, "[{backend}] 0 must not sweep");
+        assert_eq!(session_names(&env).len(), 7, "[{backend}] 0 must not sweep");
 
         // A tiny limit: everything idle is eligible.
         let err = sweep(&env, "0.0001");
@@ -861,7 +891,7 @@ fn worktree_sweep_removes_only_idle_subagent_sessions() {
                 "[{backend}] {gone} kept: {names:?}\n{err}"
             );
         }
-        for kept in ["svc", "busy", "interactive", "manual"] {
+        for kept in ["svc", "busy", "interactive", "prompted", "manual"] {
             assert!(
                 names.contains(&kept.to_string()),
                 "[{backend}] {kept} swept: {names:?}\n{err}"

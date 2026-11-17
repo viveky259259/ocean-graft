@@ -970,7 +970,10 @@ fn repository_paths_with_spaces_and_unicode_and_same_named_repositories() {
             format!("lock {i}\n"),
             "[{dir}]"
         );
-        assert_eq!(r["sessions"][0]["port"], env.port_base + i as u16);
+        // The second project's port_base is one above the first's, so its
+        // first block would overlap the first project's (port_base..+9):
+        // it moves up to the next block that does not.
+        assert_eq!(r["sessions"][0]["port"], env.port_base + 11 * i as u16);
         let st = call(&env, &repo, "status", json!({})).unwrap();
         assert_eq!(
             PathBuf::from(st["source"].as_str().unwrap())

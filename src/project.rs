@@ -114,13 +114,17 @@ pub struct Session {
     /// Last time shoal ran something in the session (exec, run, serve, touch...).
     #[serde(default)]
     pub last_active: u64,
-    /// Made by the WorktreeCreate hook for a subagent or workflow agent (the
-    /// hook input carried agent_id or agent_type). Claude Code never sends
-    /// WorktreeRemove for those, so shoal removes them itself, saving their
-    /// work, once they have been idle for a long time. Interactive
-    /// `claude --worktree` sessions are never marked.
-    #[serde(default, alias = "worktree")]
-    pub subagent: bool,
+    /// Made by the WorktreeCreate hook. Claude Code never sends
+    /// WorktreeRemove for the worktrees of subagents and workflow agents, so
+    /// shoal removes hook-made sessions itself (saving their work) once idle
+    /// for a long time, unless they are `interactive`.
+    #[serde(default)]
+    pub hook_created: bool,
+    /// A main Claude Code session ran in it: SessionStart or UserPromptSubmit
+    /// fired with its cwd inside (they never fire for subagents). Such a
+    /// session (`claude --worktree`, a background session) is never swept.
+    #[serde(default)]
+    pub interactive: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -387,6 +391,17 @@ impl Project {
             let upper = volume.join("upper");
             for entry in entries.flatten() {
                 let file = entry.file_name().to_string_lossy().into_owned();
+                if let Some(pid) = file.strip_prefix("view-") {
+                    // A read-only view an in-place rewind left mounted.
+                    if pid.parse::<u32>().is_ok() {
+                        let view = entry.path();
+                        if sys::is_mounted(&view) {
+                            let _ = sys::unmount(&view);
+                        }
+                        let _ = std::fs::remove_dir(&view);
+                    }
+                    continue;
+                }
                 let result = if let Some(pid) = file.strip_prefix("upper.restore-") {
                     if pid.parse::<u32>().is_err() {
                         continue;
@@ -610,7 +625,11 @@ impl Project {
             .map(|k| base + k * 10)
             .take_while(|port| *port + 9 <= u32::from(u16::MAX))
             .map(|port| port as u16)
-            .find(|port| !used.contains(port) && !block_busy(*port))
+            // Blocks of ten must not overlap any other session's block, even
+            // one from a project with another port_base.
+            .find(|port| {
+                !used.iter().any(|u| u.abs_diff(*port) < 10) && !block_busy(*port)
+            })
             .with_context(|| {
                 format!(
                     "no free ports left above port_base {} ({} in use on this machine); remove sessions or change port_base",

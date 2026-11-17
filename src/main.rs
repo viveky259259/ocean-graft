@@ -169,7 +169,17 @@ enum Cmd {
     },
     /// Internal: the wake-on-request gateway for an on-demand service
     #[command(hide = true)]
-    Gateway { name: String, service: String },
+    Gateway {
+        name: String,
+        service: String,
+        /// Public port to listen on (given by shoal, so the gateway can bind
+        /// before it waits for the project lock)
+        #[arg(long)]
+        listen: Option<u16>,
+        /// The service's internal port
+        #[arg(long)]
+        to: Option<u16>,
+    },
     /// Stop a session's services (all of them, or the one named)
     Stop {
         name: String,
@@ -297,6 +307,18 @@ fn run(cli: Cli) -> Result<i32> {
             return Ok(0);
         }
         Cmd::Hook { event } => return Ok(hook::run(&event)),
+        // Started by shoal with its ports: bind at once, without the project
+        // lock its starter may still hold.
+        Cmd::Gateway {
+            name,
+            listen: Some(listen),
+            to: Some(to),
+            ..
+        } => {
+            let dir = project::locate(cli.project.as_deref())?;
+            gateway::run(&dir, &name, listen, to)?;
+            return Ok(0);
+        }
         other => other,
     };
     let mut p = Project::open(project::locate(cli.project.as_deref())?)?;
@@ -339,7 +361,7 @@ fn run(cli: Cli) -> Result<i32> {
             on_demand,
             command,
         } => cmd_serve(&mut p, &name, &service, on_demand, command)?,
-        Cmd::Gateway { name, service } => {
+        Cmd::Gateway { name, service, .. } => {
             let svc = p
                 .session(&name)?
                 .services
@@ -424,7 +446,7 @@ fn cmd_init(args: InitArgs) -> Result<()> {
 }
 
 fn cmd_refresh(dir: &std::path::Path) -> Result<()> {
-    let r = ops::refresh(dir, true)?;
+    let r = ops::refresh(dir, true, None)?;
     let p = Project::open(dir.to_path_buf())?;
     if r.up_to_date {
         println!(

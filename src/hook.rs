@@ -16,6 +16,11 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// The most a WorktreeCreate may spend refreshing the template (waiting for
+/// another refresh, running setup), well inside the hook's 900 s timeout in
+/// hooks.json; past it, the session starts from the last good template.
+const WORKTREE_REFRESH_BUDGET: Duration = Duration::from_secs(600);
+
 /// How long turn hooks wait for a busy project before skipping.
 const TURN_HOOK_LOCK_WAIT: Duration = Duration::from_secs(5);
 const MAX_INPUT: u64 = 4 * 1024 * 1024;
@@ -84,7 +89,7 @@ pub fn worktree_create(input: &Value) -> Result<PathBuf> {
                 .filter(|d| d.is_dir())
                 .unwrap_or(cwd);
             let dir = ops::ensure_project(&repo)?;
-            match ops::refresh(&dir, false) {
+            match ops::refresh(&dir, false, Some(WORKTREE_REFRESH_BUDGET)) {
                 Ok(r) if !r.up_to_date => ops::progress(format!(
                     "template refreshed to {}",
                     crate::git::short(&r.to)
@@ -104,14 +109,11 @@ pub fn worktree_create(input: &Value) -> Result<PathBuf> {
     };
     let name = ops::unique_name(&p, &ops::sanitize_name(raw));
     let info = ops::create_session(&mut p, &name, &origin)?;
-    // Hooks that fire for a subagent carry agent_id / agent_type; Claude
-    // Code never removes those worktrees, so shoal sweeps them when idle.
-    let subagent = field(input, "agent_id").is_some() || field(input, "agent_type").is_some();
-    if subagent {
-        if let Some(s) = p.state.sessions.get_mut(&name) {
-            s.subagent = true;
-            p.save()?;
-        }
+    // Swept when idle unless a main session turns out to run in it (see
+    // mark_interactive): Claude Code never removes subagent worktrees.
+    if let Some(s) = p.state.sessions.get_mut(&name) {
+        s.hook_created = true;
+        p.save()?;
     }
     let dir = p.dir.clone();
     drop(p);
@@ -136,6 +138,9 @@ fn start_background_sweep(dir: &Path, keep: &str) {
     cmd.arg("--project")
         .arg(dir)
         .args(["sweep", "--keep", keep])
+        // Not the hook's cwd: that may be a session, which this process
+        // would then keep busy (an overlay could not be unmounted).
+        .current_dir("/")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -226,6 +231,18 @@ fn forget_missing_session(path: &Path) {
     }
 }
 
+/// SessionStart and UserPromptSubmit only fire for a main Claude Code
+/// session, so a session they fire in is one a person works in.
+fn mark_interactive(p: &mut Project, name: &str) -> Result<()> {
+    if let Some(s) = p.state.sessions.get_mut(name) {
+        if !s.interactive {
+            s.interactive = true;
+            p.save()?;
+        }
+    }
+    Ok(())
+}
+
 /// End of a turn (Stop, SubagentStop): checkpoint the session if it changed.
 pub fn stop(input: &Value) -> Result<()> {
     let Some(cwd) = agent_cwd(input) else {
@@ -253,9 +270,10 @@ pub fn session_start(input: &Value) -> Result<Option<String>> {
     let Some(cwd) = agent_cwd(input) else {
         return Ok(None);
     };
-    let Some((p, name)) = session_at(&cwd, Some(TURN_HOOK_LOCK_WAIT))? else {
+    let Some((mut p, name)) = session_at(&cwd, Some(TURN_HOOK_LOCK_WAIT))? else {
         return Ok(None);
     };
+    mark_interactive(&mut p, &name)?;
     let s = p.session(&name)?;
     // Only promise automatic checkpoints where the Stop hook takes them.
     let checkpoints = if ops::checkpoints_are_cheap(&p) {
@@ -274,6 +292,7 @@ pub fn session_start(input: &Value) -> Result<Option<String>> {
 pub fn prompt(input: &Value) -> Result<()> {
     if let Some(cwd) = agent_cwd(input) {
         if let Some((mut p, name)) = session_at(&cwd, Some(TURN_HOOK_LOCK_WAIT))? {
+            mark_interactive(&mut p, &name)?;
             p.mark_active(&name)?;
         }
     }

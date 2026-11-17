@@ -924,7 +924,10 @@ fn bound_port_is_skipped_by_fork() {
             port, 5990,
             "[{backend}] fork handed out a port another process listens on"
         );
-        assert!(port > 5990 && (port - 5990).is_multiple_of(10), "[{backend}] {port}");
+        assert!(
+            port > 5990 && (port - 5990).is_multiple_of(10),
+            "[{backend}] {port}"
+        );
         drop(listener);
         // Once free, the next session gets it.
         let r = env.api("fork", json!({"name": "t"})).unwrap();

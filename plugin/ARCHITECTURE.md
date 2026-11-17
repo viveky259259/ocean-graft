@@ -46,7 +46,9 @@ Rules that keep the integration correct:
    work (an earlier session of the same name), the save goes to
    `shoal/<name>-2`. A session in the middle of a rebase or merge is not
    removed. `rewind` always checkpoints the state it replaces
-   (`pre-rewind-N`, newest 10 kept), and
+   (`pre-rewind-N`; the newest 10 are kept, pruned only after a successful
+   rewind and never the checkpoint being restored; a rewind that fails
+   without changing anything drops the one it made), and
    `land` never overwrites ignored files in the user's checkout. Ignored
    files (dependencies, build output) are not saved on removal.
 5. **Hooks never break Claude.** Stop, SubagentStop, SessionStart and
@@ -60,6 +62,11 @@ Rules that keep the integration correct:
    of the directory). Removal forgets a session before deleting its files.
    A rewind copies the checkpoint aside and swaps it in with renames; the
    next command to open the project repairs one that was killed halfway.
+   A session some process works in (Claude Code's shell) is instead
+   restored in place, file by file, so that process is not left in a
+   deleted directory and a busy overlay need not be unmounted; if that is
+   interrupted, the `pre-rewind-N` checkpoint is the way back. Setup and
+   test commands are killed with shoal if shoal itself is killed.
    Service process groups are only signalled while their leader's start
    time matches the one recorded, so a reused pid is never killed.
 
@@ -88,7 +95,7 @@ them. Errors set `isError` and say how to fix the problem.
 
 | Event | Handler | Behaviour |
 |---|---|---|
-| WorktreeCreate | `shoal hook worktree-create` | Creates a shoal session for `claude --worktree`, subagents with `isolation: worktree`, and background sessions. Inside an existing session it forks that session, so a subagent starts with the parent's uncommitted work; otherwise it starts from the latest template (auto-initialising the project on first use, and falling back to the last good template if a refresh fails). Prints the path as the last stdout line. Claude Code never sends WorktreeRemove for subagent or workflow worktrees, so sessions created for one (the hook input carries `agent_id`/`agent_type`) are swept by a background `shoal sweep` once idle for 72 hours (`SHOAL_WORKTREE_IDLE_HOURS`, 0 turns it off), their work saved first. Interactive worktree sessions, sessions running a service, and sessions any process is working in are never swept. |
+| WorktreeCreate | `shoal hook worktree-create` | Creates a shoal session for `claude --worktree`, subagents with `isolation: worktree`, and background sessions. Inside an existing session it forks that session, so a subagent starts with the parent's uncommitted work; otherwise it starts from the latest template (auto-initialising the project on first use, and falling back to the last good template if a refresh fails). Prints the path as the last stdout line. Claude Code never sends WorktreeRemove for subagent or workflow worktrees (and sends no field that tells them apart), so hook-made sessions are swept by a background `shoal sweep` once idle for 72 hours (`SHOAL_WORKTREE_IDLE_HOURS`, 0 turns it off), their work saved first, unless a main session ran in them: SessionStart or UserPromptSubmit firing inside a session marks it interactive for good (they never fire for subagents). Sessions running a service and sessions any process is working in are never swept. A refresh here gets at most 600 s (hook timeout 900 s) before falling back to the last good template. |
 | WorktreeRemove | `shoal hook worktree-remove` | Saves the session's work (WIP commit, import as `shoal/<name>`), then removes it. Refuses paths that are not shoal sessions. |
 | Stop, SubagentStop | `shoal hook stop` | Checkpoints the session the agent is in, when anything changed (ignored files included) and checkpoints are cheap (overlay, or copy-on-write clones). Keeps the 20 newest automatic checkpoints. `status` reports `auto_checkpoints`. |
 | SessionStart | `shoal hook session-start` | Inside a session, tells Claude which session, branch and port it has, whether checkpoints are automatic, and which tools exist. |
@@ -104,8 +111,9 @@ setup = "npm ci"            # makes the template warm
 test = "npm test"           # used by land
 preview = "npm run dev"     # used by preview
 copy = [".env"]             # ignored files to copy into the template
-port_base = 4100           # 1..65526; each session reserves a block of ten,
-                            # unique across all projects on the machine
+port_base = 4100           # 1..65526; each session reserves a block of ten
+                            # that overlaps no other session's block on the
+                            # machine, whatever their port_base
 backend = "clone"           # or "overlay" (Linux, root)
 ```
 
@@ -141,5 +149,7 @@ remembered for its commit: forks use the last good template (reporting
 6. The work is recorded as `shoal/<name>` in the source repository before
    step 5, without ever moving that branch backwards (see rule 4).
 
-The session is locked for the whole land: `rewind` and `discard` of it fail
-with a clear message until the land finishes.
+The session is locked for the whole land: `rewind`, `checkpoint`, `fork`
+and `discard` of it fail with a clear message until the land finishes. If
+`timeout_secs` runs out anywhere (a lock, the queue, the tests) the status
+is `timed_out`.

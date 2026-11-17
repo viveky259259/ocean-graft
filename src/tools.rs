@@ -330,7 +330,7 @@ fn fork(args: &Value) -> Result<Value> {
     let mut refreshed = None;
     let mut refresh_error = None;
     if from_main {
-        match ops::refresh(&dir, false) {
+        match ops::refresh(&dir, false, None) {
             Ok(r) if !r.up_to_date => refreshed = Some(r),
             Ok(_) => {}
             Err(err) => {

@@ -183,6 +183,50 @@ pub fn mount_overlay(lowers: &[&Path], upper: &Path, work: &Path, target: &Path)
     Ok(())
 }
 
+/// A read-only overlay of `lowers` (top first) at `target`: how the session
+/// would look with that stack of layers, without changing any of them.
+#[cfg(target_os = "linux")]
+pub fn mount_overlay_readonly(lowers: &[&Path], target: &Path) -> Result<()> {
+    for path in lowers.iter().copied().chain([target]) {
+        if path.to_string_lossy().contains([':', ',', '\\']) {
+            bail!(
+                "overlayfs cannot use a path containing ':', ',' or '\\': {}",
+                path.display()
+            );
+        }
+    }
+    let lowerdir = lowers
+        .iter()
+        .map(|p| p.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(":");
+    let fstype = CString::new("overlay")?;
+    let target_c = cstring(target)?;
+    let options_c = CString::new(format!("lowerdir={lowerdir}"))?;
+    let rc = unsafe {
+        libc::mount(
+            fstype.as_ptr(),
+            target_c.as_ptr(),
+            fstype.as_ptr(),
+            libc::MS_RDONLY,
+            options_c.as_ptr() as *const libc::c_void,
+        )
+    };
+    if rc != 0 {
+        bail!(
+            "mounting {} failed: {}",
+            target.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn mount_overlay_readonly(_: &[&Path], _: &Path) -> Result<()> {
+    bail!("the overlay backend is only available on Linux")
+}
+
 #[cfg(not(target_os = "linux"))]
 pub fn mount_overlay(_: &[&Path], _: &Path, _: &Path, _: &Path) -> Result<()> {
     bail!("the overlay backend is only available on Linux")
@@ -344,37 +388,206 @@ pub fn process_start(pid: i32) -> Option<String> {
     }
 }
 
+/// The working directory of every process this user can see. On Linux
+/// from /proc; elsewhere one `lsof` run. When it cannot be determined the
+/// result holds "/", which counts every directory as in use.
+pub fn process_cwds() -> Vec<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(procs) = std::fs::read_dir("/proc") else {
+            return vec![std::path::PathBuf::from("/")];
+        };
+        procs
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .bytes()
+                    .all(|b| b.is_ascii_digit())
+            })
+            .filter_map(|e| std::fs::read_link(e.path().join("cwd")).ok())
+            .collect()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let Ok(out) = Command::new("lsof")
+            .args(["-w", "-b", "-a", "-d", "cwd", "-Fn"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+        else {
+            return vec![std::path::PathBuf::from("/")];
+        };
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.strip_prefix('n'))
+            .map(std::path::PathBuf::from)
+            .collect()
+    }
+}
+
 /// Whether any process has its working directory at or under `dir`.
 pub fn is_cwd_of_a_process(dir: &Path) -> bool {
     let Ok(dir) = dir.canonicalize() else {
         return false;
     };
-    #[cfg(target_os = "linux")]
-    {
-        let Ok(procs) = std::fs::read_dir("/proc") else {
-            return false;
-        };
-        procs.flatten().any(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .bytes()
-                .all(|b| b.is_ascii_digit())
-                && std::fs::read_link(e.path().join("cwd")).is_ok_and(|cwd| cwd.starts_with(&dir))
-        })
+    process_cwds().iter().any(|cwd| cwd.starts_with(&dir))
+}
+
+/// Process groups shoal started for setup and tests. If shoal is killed
+/// (Ctrl-C, a hook timeout, the MCP server shutting down), they are killed
+/// with it instead of running on, orphaned and unbounded.
+static GROUPS: [std::sync::atomic::AtomicI32; 64] =
+    [const { std::sync::atomic::AtomicI32::new(0) }; 64];
+static GROUP_HANDLER: std::sync::Once = std::sync::Once::new();
+
+extern "C" fn kill_groups_and_die(signal: libc::c_int) {
+    for slot in &GROUPS {
+        let pgid = slot.load(std::sync::atomic::Ordering::SeqCst);
+        if pgid > 0 {
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        }
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let Ok(out) = Command::new("lsof")
-            .args(["-a", "-d", "cwd", "-Fn"])
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-        else {
-            return true; // cannot tell: assume in use
-        };
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter_map(|l| l.strip_prefix('n'))
-            .any(|cwd| Path::new(cwd).starts_with(&dir))
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
     }
+}
+
+/// Kill `pgid` if shoal dies, until the returned guard is dropped.
+pub fn own_group(pgid: i32) -> OwnedGroup {
+    GROUP_HANDLER.call_once(|| {
+        let handler = kill_groups_and_die as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            let old = unsafe { libc::signal(signal, handler) };
+            if old == libc::SIG_IGN {
+                unsafe { libc::signal(signal, libc::SIG_IGN) }; // keep ignoring
+            }
+        }
+    });
+    let slot = GROUPS.iter().position(|s| {
+        s.compare_exchange(
+            0,
+            pgid,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_ok()
+    });
+    OwnedGroup { slot }
+}
+
+pub struct OwnedGroup {
+    slot: Option<usize>,
+}
+
+impl Drop for OwnedGroup {
+    fn drop(&mut self) {
+        if let Some(i) = self.slot {
+            GROUPS[i].store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// Make the tree at `dst` the same as the one at `src`, in place: entries
+/// only in `dst` are removed, changed files (size, mtime, type or mode) are
+/// copied, symlinks recreated, and directory modes set. Used to restore a
+/// session that a process is working in, where swapping the directory
+/// would leave that process in a deleted one.
+pub fn sync_tree(src: &Path, dst: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let remove = |p: &Path| -> Result<()> {
+        match p.symlink_metadata() {
+            Ok(m) if m.is_dir() => std::fs::remove_dir_all(p)?,
+            Ok(_) => std::fs::remove_file(p)?,
+            Err(_) => {}
+        }
+        Ok(())
+    };
+    // Entries that should not be there.
+    for entry in
+        std::fs::read_dir(dst).with_context(|| format!("could not read {}", dst.display()))?
+    {
+        let entry = entry?;
+        if src.join(entry.file_name()).symlink_metadata().is_err() {
+            remove(&entry.path())?;
+        }
+    }
+    for entry in
+        std::fs::read_dir(src).with_context(|| format!("could not read {}", src.display()))?
+    {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let meta = from.symlink_metadata()?;
+        let existing = to.symlink_metadata().ok();
+        let ft = meta.file_type();
+        if ft.is_dir() {
+            if !existing.as_ref().is_some_and(|m| m.is_dir()) {
+                remove(&to)?;
+                std::fs::create_dir(&to)?;
+            }
+            sync_tree(&from, &to)?;
+            std::fs::set_permissions(&to, std::fs::Permissions::from_mode(meta.mode() & 0o7777))?;
+        } else if ft.is_symlink() {
+            let target = std::fs::read_link(&from)?;
+            let same = existing
+                .as_ref()
+                .is_some_and(|m| m.file_type().is_symlink())
+                && std::fs::read_link(&to).ok().as_deref() == Some(target.as_path());
+            if !same {
+                remove(&to)?;
+                std::os::unix::fs::symlink(&target, &to)?;
+            }
+        } else if ft.is_file() {
+            let same = existing.as_ref().is_some_and(|m| {
+                m.is_file()
+                    && m.len() == meta.len()
+                    && m.mtime() == meta.mtime()
+                    && m.mtime_nsec() == meta.mtime_nsec()
+                    && m.mode() == meta.mode()
+            });
+            if !same {
+                remove(&to)?;
+                std::fs::copy(&from, &to)
+                    .with_context(|| format!("could not copy {}", from.display()))?;
+                std::fs::set_permissions(
+                    &to,
+                    std::fs::Permissions::from_mode(meta.mode() & 0o7777),
+                )?;
+                set_mtime(&to, meta.mtime(), meta.mtime_nsec())?;
+            }
+        }
+        // Sockets, FIFOs and devices are not part of a working tree.
+    }
+    Ok(())
+}
+
+/// Set a file's modification time without opening it (works on read-only
+/// files too).
+fn set_mtime(path: &Path, secs: i64, nsecs: i64) -> Result<()> {
+    let c = cstring(path)?;
+    let times = [
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+        libc::timespec {
+            tv_sec: secs as libc::time_t,
+            tv_nsec: nsecs as _,
+        },
+    ];
+    let rc = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("could not set the time of {}", path.display()));
+    }
+    Ok(())
 }

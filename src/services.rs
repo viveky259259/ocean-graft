@@ -102,9 +102,18 @@ pub fn start_gateway(p: &Project, session: &Session, service: &mut Service) -> R
     std::fs::create_dir_all(log_path.parent().expect("log path has a parent"))?;
     let log = File::options().create(true).append(true).open(&log_path)?;
     let mut cmd = Command::new(std::env::current_exe().context("could not locate shoal")?);
+    let internal = service
+        .internal_port
+        .context("an on-demand service needs an internal port")?;
     cmd.arg("--project")
         .arg(&p.dir)
         .args(["gateway", &session.name, &service.name])
+        .args([
+            "--listen",
+            &service.port.to_string(),
+            "--to",
+            &internal.to_string(),
+        ])
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
@@ -117,13 +126,35 @@ pub fn start_gateway(p: &Project, session: &Session, service: &mut Service) -> R
         });
     }
     let mut child = cmd.spawn().context("could not start the gateway")?;
-    std::thread::sleep(Duration::from_millis(200));
-    if let Some(status) = child.try_wait()? {
-        bail!(
-            "the gateway for {} exited straight away ({status}); see {}",
-            service.name,
-            log_path.display()
-        );
+    // Return only once the URL answers, so a preview link works at once.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            bail!(
+                "the gateway for {} exited straight away ({status}); see {}",
+                service.name,
+                log_path.display()
+            );
+        }
+        if std::net::TcpStream::connect_timeout(
+            &([127, 0, 0, 1], service.port).into(),
+            Duration::from_millis(200),
+        )
+        .is_ok()
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+            let _ = child.wait();
+            bail!(
+                "the gateway for {} did not start listening on port {}; see {}",
+                service.name,
+                service.port,
+                log_path.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
     service.gateway = Some(child.id() as i32);
     service.gateway_start = sys::process_start(child.id() as i32);

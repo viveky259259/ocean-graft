@@ -68,10 +68,15 @@ fn setup_timeout() -> Duration {
     )
 }
 
-fn run_setup(dir: &Path, setup: &str) -> Result<()> {
+fn run_setup(dir: &Path, setup: &str, budget: Option<Instant>) -> Result<()> {
     progress(format!("running setup in the template: {setup}"));
     let start = Instant::now();
-    let limit = setup_timeout();
+    let full = setup_timeout();
+    let left = budget.map(|d| d.saturating_duration_since(start));
+    let (limit, cut_by_budget) = match left {
+        Some(left) if left < full => (left, true),
+        _ => (full, false),
+    };
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(setup)
@@ -84,6 +89,7 @@ fn run_setup(dir: &Path, setup: &str) -> Result<()> {
         .spawn()
         .with_context(|| format!("could not run setup `{setup}`"))?;
     let pgid = child.id() as i32;
+    let _owned = sys::own_group(pgid);
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -91,6 +97,12 @@ fn run_setup(dir: &Path, setup: &str) -> Result<()> {
         if start.elapsed() >= limit {
             unsafe { libc::kill(-pgid, libc::SIGKILL) };
             let _ = child.wait();
+            if cut_by_budget {
+                return Err(OverBudget(
+                    "the setup command did not finish in the time this caller has",
+                )
+                .into());
+            }
             bail!(
                 "setup command `{setup}` did not finish within {} (SHOAL_SETUP_TIMEOUT_SECS)",
                 sys::human_duration(limit)
@@ -252,7 +264,7 @@ pub fn init(o: InitOptions) -> Result<InitReport> {
             sys::clone_tree(&from, &to)?;
         }
         if let Some(setup) = &o.setup {
-            run_setup(&template, setup)?;
+            run_setup(&template, setup, None)?;
         }
         git::git(&template, &["status", "--porcelain"])?; // refresh the index's stat data
         git::head(&template)
@@ -419,7 +431,7 @@ fn touches_setup_inputs(changed: &[String], inputs: &[String]) -> bool {
 /// Serialises template refreshes of one project. Held across the slow build
 /// (fetch, copy, setup) instead of the project lock, so every other command
 /// keeps working while `npm ci` runs.
-fn refresh_lock(dir: &Path) -> Result<std::fs::File> {
+fn refresh_lock(dir: &Path, deadline: Option<Instant>) -> Result<std::fs::File> {
     use std::os::unix::io::AsRawFd;
     let file = std::fs::File::options()
         .create(true)
@@ -428,15 +440,35 @@ fn refresh_lock(dir: &Path) -> Result<std::fs::File> {
         .open(dir.join("refresh.lock"))
         .context("could not open the refresh lock")?;
     loop {
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             return Ok(file);
         }
         let err = std::io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::EINTR) {
+        if !matches!(
+            err.raw_os_error(),
+            Some(libc::EWOULDBLOCK) | Some(libc::EINTR)
+        ) {
             return Err(err).context("could not take the refresh lock");
         }
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(OverBudget("another template refresh is still running").into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+/// A refresh stopped because the caller's time budget ran out (not because
+/// the commit is broken): not remembered as a failed refresh.
+#[derive(Debug)]
+pub struct OverBudget(&'static str);
+
+impl std::fmt::Display for OverBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}, and there is no time left to wait", self.0)
+    }
+}
+
+impl std::error::Error for OverBudget {}
 
 /// Build a new template generation if the source branch moved. Takes the
 /// project lock only to read the state and to record the new generation;
@@ -446,9 +478,14 @@ fn refresh_lock(dir: &Path) -> Result<std::fs::File> {
 const REFRESH_RETRY_AFTER: u64 = 600;
 
 /// `force` retries even a commit whose refresh failed recently.
-pub fn refresh(dir: &Path, force: bool) -> Result<RefreshReport> {
+///
+/// `budget` bounds the wait for another refresh and the setup command, for
+/// callers that must answer in time (the WorktreeCreate hook); running out
+/// is an OverBudget error, not remembered as a failure of the commit.
+pub fn refresh(dir: &Path, force: bool, budget: Option<Duration>) -> Result<RefreshReport> {
     let start = Instant::now();
-    let _refreshing = refresh_lock(dir)?;
+    let deadline = budget.map(|b| start + b);
+    let _refreshing = refresh_lock(dir, deadline)?;
     let (latest, branch, backend, old_setup, old_inputs, source_head) = {
         let p = Project::open(dir.to_path_buf())?;
         let source_head = git::git_trim(&p.state.source, &["rev-parse", &p.state.branch])?;
@@ -541,7 +578,7 @@ pub fn refresh(dir: &Path, force: bool) -> Result<RefreshReport> {
         let mut ran = false;
         if let Some(cmd) = &setup {
             if setup != old_setup || touches_setup_inputs(&changed, &inputs) {
-                run_setup(&build, cmd)?;
+                run_setup(&build, cmd, deadline)?;
                 ran = true;
             }
         }
@@ -557,6 +594,9 @@ pub fn refresh(dir: &Path, force: bool) -> Result<RefreshReport> {
         Ok(r) => r,
         Err(err) => {
             let _ = std::fs::remove_dir_all(abs(&rel));
+            if err.downcast_ref::<OverBudget>().is_some() {
+                return Err(err);
+            }
             if let Ok(mut p) = Project::open(dir.to_path_buf()) {
                 p.state.refresh_failure = Some(project::RefreshFailure {
                     commit: source_head.clone(),
@@ -832,7 +872,8 @@ pub fn create_session(p: &mut Project, name: &str, origin: &Origin) -> Result<Se
         lowers,
         services: Vec::new(),
         last_active: sys::now(),
-        subagent: false,
+        hook_created: false,
+        interactive: false,
     };
     let created = (|| -> Result<Duration> {
         if p.state.backend == Backend::Overlay {
@@ -1049,32 +1090,6 @@ fn checkpoint_inner(
 
 const PRE_REWIND_KEPT: usize = 10;
 
-/// Drop the oldest checkpoints of `name` whose label starts with `prefix`,
-/// beyond the newest `keep`.
-fn prune_prefix(p: &mut Project, name: &str, prefix: &str, keep: usize) -> Result<()> {
-    let matching: Vec<String> = p
-        .state
-        .checkpoints
-        .iter()
-        .filter(|c| c.session == name && c.label.starts_with(prefix))
-        .map(|c| c.label.clone())
-        .collect();
-    if matching.len() <= keep {
-        return Ok(());
-    }
-    let drop: Vec<String> = matching[..matching.len() - keep].to_vec();
-    for label in &drop {
-        let dir = p.checkpoint_dir(name, label);
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir)?;
-        }
-    }
-    p.state
-        .checkpoints
-        .retain(|c| !(c.session == name && drop.contains(&c.label)));
-    p.save()
-}
-
 /// Drop the oldest automatic checkpoints beyond the newest few.
 fn prune_auto(p: &mut Project, name: &str) -> Result<Vec<String>> {
     let mut autos: Vec<(u64, u32, String)> = p
@@ -1123,6 +1138,156 @@ pub struct RewindInfo {
     pub restart_errors: Vec<String>,
     pub restarted_services: Vec<String>,
     pub elapsed_ms: u64,
+}
+
+/// Replace the session with checkpoint `saved` by building a copy aside and
+/// swapping it in with renames. Leaves the session unchanged on failure.
+fn restore_by_swap(p: &Project, session: &Session, saved: &Path, label: &str) -> Result<()> {
+    let name = session.name.as_str();
+    let path = p.session_path(name);
+    match p.state.backend {
+        Backend::Overlay => {
+            // Same shape as the clone backend: copy the checkpoint into a
+            // staging layer while the session is untouched, then swap with
+            // renames. Project::open repairs a rewind killed at any point:
+            // upper.restore-* is discarded; upper.rewind-* is put back when
+            // upper is missing and discarded otherwise.
+            let pid = std::process::id();
+            let volume = p.volume_dir(name);
+            let upper = volume.join("upper");
+            let work = volume.join("work");
+            let staging = volume.join(format!("upper.restore-{pid}"));
+            let aside = volume.join(format!("upper.rewind-{pid}"));
+            for d in [&staging, &aside] {
+                if d.symlink_metadata().is_ok() {
+                    std::fs::remove_dir_all(d)?;
+                }
+            }
+            if let Err(err) = sys::clone_tree(saved, &staging) {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(err.context(format!(
+                    "could not rewind {name} to {label}; the session is unchanged"
+                )));
+            }
+            if sys::is_mounted(&path) {
+                sys::unmount(&path)?;
+            }
+            if upper.exists() {
+                std::fs::rename(&upper, &aside)?;
+            }
+            std::fs::rename(&staging, &upper)?;
+            if work.exists() {
+                std::fs::remove_dir_all(&work)?;
+            }
+            std::fs::create_dir_all(&work)?;
+            if let Err(err) = p.mount(session) {
+                // Put the old layer back and remount it.
+                let _ = std::fs::remove_dir_all(&upper);
+                if aside.exists() {
+                    std::fs::rename(&aside, &upper)?;
+                }
+                p.mount(session)
+                    .context("rewind failed and the session could not be remounted")?;
+                return Err(err.context(format!(
+                    "could not rewind {name} to {label}; the session is unchanged"
+                )));
+            }
+            if aside.exists() {
+                std::fs::remove_dir_all(&aside)?;
+            }
+        }
+        Backend::Clone => {
+            // Copy into a staging directory first (the session is untouched
+            // while the slow copy runs), then swap with two renames. If the
+            // process dies at any point, Project::open puts things right:
+            // restore-* is always discarded; trash-* is restored when the
+            // session directory is missing and discarded otherwise.
+            let pid = std::process::id();
+            let staging = p.dir.join(format!("restore-{name}-{pid}"));
+            let trash = p.dir.join(format!("trash-{name}-{pid}"));
+            for d in [&staging, &trash] {
+                if d.symlink_metadata().is_ok() {
+                    std::fs::remove_dir_all(d)?;
+                }
+            }
+            if let Err(err) = sys::clone_tree(saved, &staging) {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(err.context(format!(
+                    "could not rewind {name} to {label}; the session is unchanged"
+                )));
+            }
+            std::fs::rename(&path, &trash)?;
+            if let Err(err) = std::fs::rename(&staging, &path) {
+                std::fs::rename(&trash, &path)?;
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(err)
+                    .context("could not swap the checkpoint in; the session is unchanged");
+            }
+            std::fs::remove_dir_all(&trash)?;
+        }
+    }
+    Ok(())
+}
+
+/// Make the live session match checkpoint `saved` file by file, without
+/// unmounting or moving it.
+fn restore_in_place(p: &Project, session: &Session, saved: &Path) -> Result<()> {
+    let path = p.ensure_ready(&session.name)?;
+    match p.state.backend {
+        Backend::Overlay => {
+            // The checkpoint holds only the session's own layer; mount it
+            // read-only over the session's lowers to see the whole tree.
+            let view = p
+                .volume_dir(&session.name)
+                .join(format!("view-{}", std::process::id()));
+            if sys::is_mounted(&view) {
+                sys::unmount(&view)?;
+            }
+            std::fs::create_dir_all(&view)?;
+            let mut lowers: Vec<PathBuf> = vec![saved.to_path_buf()];
+            lowers.extend(session.lowers.iter().map(|l| p.abs(l)));
+            let lowers: Vec<&Path> = lowers.iter().map(PathBuf::as_path).collect();
+            sys::mount_overlay_readonly(&lowers, &view)?;
+            let synced = sys::sync_tree(&view, &path);
+            let _ = sys::unmount(&view);
+            let _ = std::fs::remove_dir(&view);
+            synced
+        }
+        Backend::Clone => sys::sync_tree(saved, &path),
+    }
+}
+
+/// Forget a checkpoint and delete its files (best effort).
+fn drop_checkpoint(p: &mut Project, name: &str, label: &str) {
+    let _ = std::fs::remove_dir_all(p.checkpoint_dir(name, label));
+    p.state
+        .checkpoints
+        .retain(|c| !(c.session == name && c.label == label));
+    let _ = p.save();
+}
+
+/// Keep the newest PRE_REWIND_KEPT rewind safety checkpoints (labels
+/// exactly pre-rewind-<number>), never pruning `keep`.
+fn prune_pre_rewind(p: &mut Project, name: &str, keep: &str) -> Result<()> {
+    let is_safety = |l: &str| {
+        l.strip_prefix("pre-rewind-")
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let matching: Vec<String> = p
+        .state
+        .checkpoints
+        .iter()
+        .filter(|c| c.session == name && is_safety(&c.label) && c.label != keep)
+        .map(|c| c.label.clone())
+        .collect();
+    let keep_n = PRE_REWIND_KEPT.saturating_sub(usize::from(is_safety(keep)));
+    if matching.len() <= keep_n {
+        return Ok(());
+    }
+    for label in &matching[..matching.len() - keep_n] {
+        drop_checkpoint(p, name, label);
+    }
+    Ok(())
 }
 
 /// `label` may be "latest" for the newest checkpoint.
@@ -1183,91 +1348,37 @@ pub fn rewind(p: &mut Project, name: &str, label: &str) -> Result<RewindInfo> {
     // rewind replaces (stashes, other branches, deep inside ignored trees).
     let safety = next_label(p, name, "pre-rewind-");
     let saved_as = checkpoint_inner(p, name, Some(&safety), false)?.label;
-    prune_prefix(p, name, "pre-rewind-", PRE_REWIND_KEPT)?;
-    services::stop_session(p, name, None, false, true)?;
     let start = Instant::now();
     let path = p.session_path(name);
-    match p.state.backend {
-        Backend::Overlay => {
-            // Same shape as the clone backend: copy the checkpoint into a
-            // staging layer while the session is untouched, then swap with
-            // renames. Project::open repairs a rewind killed at any point:
-            // upper.restore-* is discarded; upper.rewind-* is put back when
-            // upper is missing and discarded otherwise.
-            let pid = std::process::id();
-            let volume = p.volume_dir(name);
-            let upper = volume.join("upper");
-            let work = volume.join("work");
-            let staging = volume.join(format!("upper.restore-{pid}"));
-            let aside = volume.join(format!("upper.rewind-{pid}"));
-            for d in [&staging, &aside] {
-                if d.symlink_metadata().is_ok() {
-                    std::fs::remove_dir_all(d)?;
-                }
-            }
-            if let Err(err) = sys::clone_tree(&saved, &staging) {
-                let _ = std::fs::remove_dir_all(&staging);
-                return Err(err.context(format!(
-                    "could not rewind {name} to {label}; the session is unchanged"
-                )));
-            }
-            if sys::is_mounted(&path) {
-                sys::unmount(&path)?;
-            }
-            if upper.exists() {
-                std::fs::rename(&upper, &aside)?;
-            }
-            std::fs::rename(&staging, &upper)?;
-            if work.exists() {
-                std::fs::remove_dir_all(&work)?;
-            }
-            std::fs::create_dir_all(&work)?;
-            if let Err(err) = p.mount(&session) {
-                // Put the old layer back and remount it.
-                let _ = std::fs::remove_dir_all(&upper);
-                if aside.exists() {
-                    std::fs::rename(&aside, &upper)?;
-                }
-                p.mount(&session)
-                    .context("rewind failed and the session could not be remounted")?;
-                return Err(err.context(format!(
-                    "could not rewind {name} to {label}; the session is unchanged"
-                )));
-            }
-            if aside.exists() {
-                std::fs::remove_dir_all(&aside)?;
-            }
+    // A session some process works in (Claude Code's shell sits in it) is
+    // restored in place: an overlay cannot be unmounted under it, and a
+    // swapped directory would leave the process in a deleted one.
+    let in_place = sys::is_cwd_of_a_process(&path);
+    let restored = services::stop_session(p, name, None, false, true).and_then(|_| {
+        if in_place {
+            restore_in_place(p, &session, &saved)
+        } else {
+            restore_by_swap(p, &session, &saved, &label)
         }
-        Backend::Clone => {
-            // Copy into a staging directory first (the session is untouched
-            // while the slow copy runs), then swap with two renames. If the
-            // process dies at any point, Project::open puts things right:
-            // restore-* is always discarded; trash-* is restored when the
-            // session directory is missing and discarded otherwise.
-            let pid = std::process::id();
-            let staging = p.dir.join(format!("restore-{name}-{pid}"));
-            let trash = p.dir.join(format!("trash-{name}-{pid}"));
-            for d in [&staging, &trash] {
-                if d.symlink_metadata().is_ok() {
-                    std::fs::remove_dir_all(d)?;
-                }
-            }
-            if let Err(err) = sys::clone_tree(&saved, &staging) {
-                let _ = std::fs::remove_dir_all(&staging);
-                return Err(err.context(format!(
-                    "could not rewind {name} to {label}; the session is unchanged"
-                )));
-            }
-            std::fs::rename(&path, &trash)?;
-            if let Err(err) = std::fs::rename(&staging, &path) {
-                std::fs::rename(&trash, &path)?;
-                let _ = std::fs::remove_dir_all(&staging);
-                return Err(err)
-                    .context("could not swap the checkpoint in; the session is unchanged");
-            }
-            std::fs::remove_dir_all(&trash)?;
+    });
+    if let Err(err) = restored {
+        if in_place {
+            // Possibly half restored: the safety checkpoint is the way back.
+            return Err(err.context(format!(
+                "rewinding {name} in place failed partway; rewind to {} to get back the state before this rewind",
+                saved_as.as_deref().unwrap_or("the pre-rewind checkpoint")
+            )));
         }
+        // The swap leaves the session unchanged on failure, so the safety
+        // checkpoint this attempt made is redundant: drop it, so retries do
+        // not push older states out.
+        if let Some(l) = &saved_as {
+            drop_checkpoint(p, name, l);
+        }
+        return Err(err);
     }
+    // Only now, and never the checkpoint just restored.
+    prune_pre_rewind(p, name, &label)?;
     let elapsed = start.elapsed();
     let head = git::head(&path)?;
     // The rewind is done; a service that will not start again is reported,
@@ -1475,8 +1586,18 @@ pub fn save_work(p: &Project, name: &str) -> Result<SaveInfo> {
     // which need not be on it (a detached HEAD, another branch checked
     // out). Branches whose tip the source already has are skipped below.
     let extra_name = |tag: &str| {
-        let tag: String = sanitize_name(tag).chars().take(24).collect();
-        with_suffix(&sanitize_name(name), &format!("--{tag}"))
+        // Cut first, then sanitise, so the result never ends in '.' or
+        // ".lock" (invalid in a git branch name).
+        let short: String = tag.chars().take(24).collect();
+        let full = with_suffix(
+            &sanitize_name(name),
+            &format!("--{}", sanitize_name(&short)),
+        );
+        if validate_name("branch", &full).is_ok() {
+            full
+        } else {
+            with_suffix(&sanitize_name(name), "--branch")
+        }
     };
     let mut extras: Vec<(String, String)> = branches
         .lines()
@@ -1516,6 +1637,9 @@ pub struct RemoveInfo {
     pub saved: Option<SaveInfo>,
     /// The session's files were already gone; only its record was cleared.
     pub already_gone: bool,
+    /// Where its checkpoints were kept, when its files were already gone
+    /// (they may hold the only copy of its work).
+    pub kept_checkpoints: Option<PathBuf>,
 }
 
 /// Remove a session. Without `force`, refuse if it holds work that is not in
@@ -1575,13 +1699,28 @@ pub fn remove(p: &mut Project, name: &str, force: bool, save: bool) -> Result<Re
     conflicts::forget(&p.dir, name);
     p.destroy_volume(name)?;
     let checkpoints = p.dir.join("checkpoints").join(name);
+    let mut kept_checkpoints = None;
     if checkpoints.exists() {
-        std::fs::remove_dir_all(&checkpoints)?;
+        if already_gone && !force {
+            // The checkpoints may be the only copy of this session's work
+            // left: keep them where a person can find them.
+            let keep = p
+                .dir
+                .join("orphaned-checkpoints")
+                .join(format!("{name}-{}", sys::now()));
+            std::fs::create_dir_all(keep.parent().expect("has a parent"))?;
+            std::fs::rename(&checkpoints, &keep)?;
+            progress(format!("kept {name}'s checkpoints in {}", keep.display()));
+            kept_checkpoints = Some(keep);
+        } else {
+            std::fs::remove_dir_all(&checkpoints)?;
+        }
     }
     Ok(RemoveInfo {
         session: name.to_string(),
         saved,
         already_gone,
+        kept_checkpoints,
     })
 }
 
@@ -1597,40 +1736,53 @@ pub fn subagent_idle_limit() -> Option<u64> {
     (hours > 0.0).then_some((hours * 3600.0) as u64)
 }
 
-/// Remove subagent sessions (which Claude Code never removes) idle longer
-/// than `max_idle_secs`: no running services, no live process working in
-/// them, and not `keep`. Work is saved to the source repository first; a
-/// session that cannot be saved is left alone. The project lock is held
-/// only while one session is chosen and removed at a time, never across
-/// the whole sweep. Meant to run in a background `shoal sweep`.
+/// Remove hook-made, non-interactive sessions (subagent and workflow
+/// worktrees, which Claude Code never removes) idle longer than
+/// `max_idle_secs`: no running services, no process working in them, and
+/// not `keep`. Work is saved to the source repository first; a session
+/// that cannot be saved is left alone. At most `limit` per run.
+///
+/// The process scan (slow on macOS) runs once, without the project lock.
+/// Each session is then checked again and removed under its own short hold
+/// of the lock, so a session that came back into use is left alone.
 pub fn sweep_subagents(
     dir: &Path,
     max_idle_secs: u64,
     limit: usize,
     keep: Option<&str>,
 ) -> Result<Vec<String>> {
-    let stale: Vec<String> = {
+    let candidates: Vec<(String, PathBuf)> = {
         let p = Project::open(dir.to_path_buf())?;
-        let now = sys::now();
         p.state
             .sessions
             .values()
-            .filter(|s| s.subagent && Some(s.name.as_str()) != keep)
-            .filter(|s| {
-                !s.services
-                    .iter()
-                    .any(|svc| services::state(svc) == services::State::Running)
-            })
-            .filter(|s| now.saturating_sub(services::last_activity(&p, s)) > max_idle_secs)
-            .filter(|s| !sys::is_cwd_of_a_process(&p.session_path(&s.name)))
-            .map(|s| s.name.clone())
-            .take(limit)
+            .filter(|s| s.hook_created && !s.interactive && Some(s.name.as_str()) != keep)
+            .map(|s| (s.name.clone(), p.session_path(&s.name)))
             .collect()
     };
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cwds = sys::process_cwds();
     let mut removed = Vec::new();
-    for name in stale {
+    for (name, path) in candidates {
+        if removed.len() >= limit {
+            break;
+        }
+        let canonical = path.canonicalize().unwrap_or(path);
+        if cwds.iter().any(|c| c.starts_with(&canonical)) {
+            continue;
+        }
         let mut p = Project::open(dir.to_path_buf())?;
-        if !p.state.sessions.contains_key(&name) {
+        let Some(s) = p.state.sessions.get(&name).cloned() else {
+            continue;
+        };
+        let idle = sys::now().saturating_sub(services::last_activity(&p, &s));
+        let running = s
+            .services
+            .iter()
+            .any(|svc| services::state(svc) == services::State::Running);
+        if s.interactive || running || idle <= max_idle_secs {
             continue;
         }
         match remove(&mut p, &name, false, true) {
@@ -1736,6 +1888,7 @@ fn run_tests(
         .spawn()
         .with_context(|| format!("could not run `{command}`"))?;
     let pgid = child.id() as i32;
+    let _owned = sys::own_group(pgid);
     let mut timed_out = false;
     let status = loop {
         if let Some(status) = child.try_wait()? {
@@ -1789,18 +1942,32 @@ fn path_in_the_way(source: &Path, session: &Path, tip: &str, rel: &str) -> bool 
 }
 
 /// Serialises the final fast-forward of every land in one project.
+/// A land ran out of its time limit somewhere other than in its tests.
+#[derive(Debug)]
+struct OutOfTime(&'static str);
+
+impl std::fmt::Display for OutOfTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the land ran out of time (timeout_secs) {}", self.0)
+    }
+}
+
+impl std::error::Error for OutOfTime {}
+
 /// Open the project within what is left of a land's time.
 fn open_by(project_dir: &Path, deadline: Instant) -> Result<Project> {
     let left = deadline.saturating_duration_since(Instant::now());
-    Project::open_within(project_dir.to_path_buf(), left.max(Duration::from_millis(1))).map_err(
-        |err| {
-            if format!("{err:#}").contains("busy") {
-                err.context("the land ran out of time (timeout_secs) waiting for the project; nothing was landed")
-            } else {
-                err
-            }
-        },
+    Project::open_within(
+        project_dir.to_path_buf(),
+        left.max(Duration::from_millis(1)),
     )
+    .map_err(|err| {
+        if format!("{err:#}").contains("busy") {
+            OutOfTime("waiting for the project lock").into()
+        } else {
+            err
+        }
+    })
 }
 
 fn land_lock(project_dir: &Path, deadline: Instant) -> Result<std::fs::File> {
@@ -1823,7 +1990,7 @@ fn land_lock(project_dir: &Path, deadline: Instant) -> Result<std::fs::File> {
             return Err(err).context("could not take the land lock");
         }
         if Instant::now() >= deadline {
-            bail!("the land ran out of time (timeout_secs) waiting for another land to finish; nothing was landed");
+            return Err(OutOfTime("waiting for another land to finish").into());
         }
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -1833,6 +2000,27 @@ fn land_lock(project_dir: &Path, deadline: Instant) -> Result<std::fs::File> {
 /// commit (optional), rebase onto the target, test, fast-forward. Never
 /// rewrites the target and never leaves the session mid-rebase.
 pub fn land(project_dir: &Path, name: &str, o: &LandOptions) -> Result<LandReport> {
+    match land_inner(project_dir, name, o) {
+        // Out of time anywhere is a status Claude can act on, not an error.
+        Err(err) if err.downcast_ref::<OutOfTime>().is_some() => Ok(LandReport {
+            status: "timed_out",
+            session: name.to_string(),
+            target: o.into.clone().unwrap_or_default(),
+            commits: 0,
+            head: None,
+            files: Vec::new(),
+            tests: None,
+            checkpoint: None,
+            attempts: 0,
+            message: format!(
+                "{err}; nothing was landed (the work is in the session, and on its shoal/ branch if it got that far). Land again, with a larger timeout_secs if needed"
+            ),
+        }),
+        other => other,
+    }
+}
+
+fn land_inner(project_dir: &Path, name: &str, o: &LandOptions) -> Result<LandReport> {
     // test_timeout bounds the whole land: queue waits, retries and tests.
     let deadline = Instant::now() + o.test_timeout;
     let _busy = {
