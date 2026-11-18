@@ -894,6 +894,7 @@ pub fn create_session(p: &mut Project, name: &str, origin: &Origin) -> Result<Se
                 // copied half done.
                 let _busy = try_session_lock(&p.dir, parent, "fork")?;
                 let parent_path = p.ensure_ready(parent)?;
+                let _paused = PausedServices::for_copy(p, parent);
                 sys::sync();
                 let lowers = match p.state.backend {
                     Backend::Overlay => {
@@ -1041,6 +1042,10 @@ pub struct CheckpointInfo {
     pub auto: bool,
     /// Why no checkpoint was taken, when none was.
     pub skipped: Option<String>,
+    /// Set when the session kept changing while it was copied: the
+    /// checkpoint may mix files from before and after those changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
     pub pruned: Vec<String>,
     pub elapsed_ms: u64,
 }
@@ -1141,6 +1146,7 @@ fn checkpoint_inner(
                     head: None,
                     auto,
                     skipped: Some("nothing changed since the last automatic checkpoint".into()),
+                    warning: None,
                     pruned: Vec::new(),
                     elapsed_ms: ms(start.elapsed()),
                 });
@@ -1170,16 +1176,43 @@ fn checkpoint_inner(
         bail!("{} already exists; pick another label", dst.display());
     }
     std::fs::create_dir_all(dst.parent().expect("checkpoint dir has a parent"))?;
-    sys::sync();
-    let copied = match p.state.backend {
-        Backend::Overlay => sys::clone_tree(&p.volume_dir(name).join("upper"), &dst),
-        Backend::Clone => sys::clone_tree(&path, &dst),
+    let _paused = PausedServices::for_copy(p, name);
+    let src = match p.state.backend {
+        Backend::Overlay => p.volume_dir(name).join("upper"),
+        Backend::Clone => path.clone(),
     };
-    if let Err(err) = copied {
-        let _ = sys::remove_tree(&dst);
-        return Err(err);
+    // Writers shoal did not start (a command Claude runs, a queued job) are
+    // caught by comparing HEAD and the fingerprint around the copy: a copy
+    // taken while they changed things is taken again.
+    let mut fingerprint = fingerprint;
+    let mut head = git::head(&path)?;
+    let mut warning = None;
+    for attempt in 1..=CHECKPOINT_ATTEMPTS {
+        sys::sync();
+        if let Err(err) = sys::clone_tree(&src, &dst) {
+            let _ = sys::remove_tree(&dst);
+            return Err(err);
+        }
+        let head_after = git::head(&path)?;
+        let after = conflicts::fingerprint_with_ignored(&path).ok();
+        // (Where the fingerprint cannot be taken at all, HEAD alone decides.)
+        if head_after == head && after == fingerprint {
+            break;
+        }
+        head = head_after;
+        if attempt == CHECKPOINT_ATTEMPTS {
+            // Keep it: a checkpoint that may mix two moments beats none.
+            // Without a fingerprint the next automatic one is not skipped.
+            fingerprint = None;
+            warning = Some(format!(
+                "the session kept changing while it was copied ({CHECKPOINT_ATTEMPTS} tries), so this checkpoint may mix files from before and after those changes; take another once the session is quiet"
+            ));
+            break;
+        }
+        sys::remove_tree(&dst)
+            .with_context(|| format!("removing the inconsistent copy {}", dst.display()))?;
+        fingerprint = after;
     }
-    let head = git::head(&path)?;
     p.state.checkpoints.push(Checkpoint {
         session: name.to_string(),
         label: label.clone(),
@@ -1200,12 +1233,61 @@ fn checkpoint_inner(
         head: Some(head),
         auto,
         skipped: None,
+        warning,
         pruned,
         elapsed_ms: ms(start.elapsed()),
     })
 }
 
 const PRE_REWIND_KEPT: usize = 10;
+
+/// Copies of a session that keeps changing, before keeping one with a warning.
+const CHECKPOINT_ATTEMPTS: u32 = 3;
+
+/// The session's running services, stopped with SIGSTOP until this is
+/// dropped (also on an error or a panic). Only groups that are still
+/// ours are signalled.
+struct PausedServices(Vec<i32>);
+
+impl PausedServices {
+    /// Hold the session's services still while it is copied, so the copy
+    /// is one moment of their writes (as after a crash). Not during a full
+    /// copy: that can take minutes, and the user's preview would hang as
+    /// long.
+    fn for_copy(p: &Project, name: &str) -> PausedServices {
+        if checkpoints_are_cheap(p) {
+            PausedServices::pause(p, name)
+        } else {
+            PausedServices(Vec::new())
+        }
+    }
+
+    fn pause(p: &Project, name: &str) -> PausedServices {
+        let mut groups = Vec::new();
+        if let Ok(s) = p.session(name) {
+            for svc in &s.services {
+                if let Some(pgid) = svc.pid {
+                    if services::owned_group_alive(pgid, svc.pid_start.as_deref())
+                        && unsafe { libc::kill(-pgid, libc::SIGSTOP) } == 0
+                    {
+                        groups.push(pgid);
+                    }
+                }
+            }
+        }
+        PausedServices(groups)
+    }
+}
+
+impl Drop for PausedServices {
+    fn drop(&mut self) {
+        for pgid in &self.0 {
+            unsafe {
+                libc::kill(-pgid, libc::SIGCONT);
+            }
+        }
+    }
+}
 
 /// Drop the oldest automatic checkpoints beyond the newest few.
 fn prune_auto(p: &mut Project, name: &str) -> Result<Vec<String>> {

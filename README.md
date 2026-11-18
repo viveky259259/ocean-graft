@@ -289,7 +289,7 @@ Silicon, 16 GB) every step passed:
 cargo test --release
 ```
 
-343 tests drive the real binary against throwaway repositories, on both
+346 tests drive the real binary against throwaway repositories, on both
 backends where they apply. Beyond the lifecycle (isolation, status, diff,
 ports, conflicts, checkpoint and rewind, fork, import, refresh, rm safety,
 remount, gc, sandbox, queue, idle shutdown, wake on request), they cover the
@@ -303,8 +303,11 @@ skipped otherwise.
 - The overlay backend needs root. As an ordinary user on Linux, `clone` is
   used instead; it copies files unless the filesystem supports reflinks, and
   that copy is made while the project is locked.
-- A checkpoint or fork of a session that is being written to is not atomic.
-  Take them between agent turns (the plugin's automatic checkpoints are).
+- A session's own services (`shoal serve`) are paused while it is
+  checkpointed or forked, where that copy is cheap. Other writers are not:
+  a checkpoint taken while something else keeps changing the session is
+  retried, and after three tries kept with a `warning`. A fork is not
+  checked that way, so fork between commands (tool calls are).
 - A session someone is working in is rewound in place, file by file; if that
   is interrupted, the `pre-rewind-N` checkpoint it took first is the way back.
 - `--sandbox` is Linux only (bubblewrap).

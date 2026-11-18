@@ -1178,6 +1178,9 @@ fn cmd_checkpoint(p: &mut Project, name: &str, label: Option<String>) -> Result<
         sys::human_bytes(sys::disk_usage(&p.checkpoint_dir(name, &label))),
         sys::SIZE_NOTE
     );
+    if let Some(warning) = r.warning {
+        eprintln!("warning: {warning}");
+    }
     Ok(())
 }
 
