@@ -1,6 +1,8 @@
 [package]
 name = "shoal"
 version = "0.1.0"
+license = "MIT"
+repository = "https://github.com/viveky259259/ocean_fs"
 edition = "2021"
 description = "Copy-on-write session volumes for running coding agents in parallel"
 publish = false

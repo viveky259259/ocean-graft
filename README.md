@@ -29,10 +29,28 @@ the operator: it forks, checkpoints, rewinds, previews and lands through MCP
 tools, and hooks give every `claude --worktree` session and every subagent
 with `isolation: worktree` its own shoal session automatically.
 
-```bash
-cargo build --release                      # the plugin runs target/release/shoal
-claude --plugin-dir ./plugin               # or install it from a marketplace
+In Claude Code:
+
+```text
+/plugin install shoal --marketplace viveky259259/ocean_fs
 ```
+
+On first use the plugin downloads the shoal binary for your machine (macOS
+on Apple Silicon or Intel, Linux on x86_64 or arm64) from this repository's
+releases, checks it against the SHA-256 in
+[`plugin/libexec/release.txt`](plugin/libexec/), which ships with the
+plugin, and caches it. To work on shoal itself, build it and load the plugin
+from the checkout; the launcher then uses `target/release/shoal`:
+
+```bash
+cargo build --release
+claude --plugin-dir ./plugin
+```
+
+A release is cut with `gh workflow run release.yml -f version=X.Y.Z` (the
+version in `Cargo.toml` and `plugin/.claude-plugin/plugin.json` first). It
+builds the four binaries, commits their checksums to `release.txt`, tags
+the commit and publishes the binaries.
 
 | Tool | What Claude uses it for |
 |---|---|
@@ -46,6 +64,10 @@ claude --plugin-dir ./plugin               # or install it from a marketplace
 
 How the plugin keeps Claude Code safe (exit codes, stdout, locks, crash
 recovery, the macOS rules) is in [`plugin/ARCHITECTURE.md`](plugin/ARCHITECTURE.md).
+
+## Licence
+
+MIT; see [`LICENSE`](LICENSE).
 
 ## Commands
 
@@ -267,7 +289,7 @@ Silicon, 16 GB) every step passed:
 cargo test --release
 ```
 
-336 tests drive the real binary against throwaway repositories, on both
+342 tests drive the real binary against throwaway repositories, on both
 backends where they apply. Beyond the lifecycle (isolation, status, diff,
 ports, conflicts, checkpoint and rewind, fork, import, refresh, rm safety,
 remount, gc, sandbox, queue, idle shutdown, wake on request), they cover the

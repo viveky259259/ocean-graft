@@ -58,6 +58,13 @@ Rules that keep the integration correct:
    Nothing ever exits 2 (which blocks a prompt or a stop): the launcher
    `libexec/shoal-plugin` maps every exit code, so a binary that is missing,
    older than the plugin, or crashes cannot block Claude.
+7. **The binary is verified, not trusted.** The launcher uses `$SHOAL_BIN`,
+   a binary bundled beside it, or a development build; otherwise it
+   downloads the release binary for this platform once into the plugin's
+   data directory. The download is checked against the SHA-256 in
+   `libexec/release.txt`, which the release workflow commits with the
+   plugin, so a tampered or truncated download is never run. On any failure
+   it falls back to `shoal` on PATH, and keeps the exit-code rule above.
 6. **Crash safety.** state.json is written durably (fsync, rename, fsync
    of the directory). Removal forgets a session before deleting its files.
    A rewind copies the checkpoint aside and swaps it in with renames; the

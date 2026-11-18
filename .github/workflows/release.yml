@@ -1,0 +1,110 @@
+name: Release
+
+# Builds shoal for every platform the plugin runs on, records each binary's
+# SHA-256 in plugin/libexec/release.txt (committed, so an installed plugin
+# verifies downloads against its own copy, never against the server), then
+# tags that commit and publishes the binaries as a GitHub release.
+#
+#   gh workflow run release.yml -f version=0.1.0
+#
+# The version must match Cargo.toml and plugin/.claude-plugin/plugin.json.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without the v (e.g. 0.1.0)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Version matches the manifests and is not released yet
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -eu
+          echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "not a version: $VERSION"; exit 1; }
+          cargo_v=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          plugin_v=$(python3 -c 'import json; print(json.load(open("plugin/.claude-plugin/plugin.json"))["version"])')
+          [ "$cargo_v" = "$VERSION" ] || { echo "Cargo.toml says $cargo_v"; exit 1; }
+          [ "$plugin_v" = "$VERSION" ] || { echo "plugin.json says $plugin_v"; exit 1; }
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null; then
+            echo "v$VERSION is already released"; exit 1
+          fi
+
+  build:
+    needs: check
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { runner: macos-latest, target: aarch64-apple-darwin, asset: shoal-darwin-arm64 }
+          - { runner: macos-latest, target: x86_64-apple-darwin, asset: shoal-darwin-x86_64 }
+          - { runner: ubuntu-latest, target: x86_64-unknown-linux-musl, asset: shoal-linux-x86_64 }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, asset: shoal-linux-aarch64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Build
+        run: |
+          rustup target add ${{ matrix.target }}
+          cargo build --release --locked --target ${{ matrix.target }}
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/shoal dist/${{ matrix.asset }}
+          strip dist/${{ matrix.asset }} || true
+          ./dist/${{ matrix.asset }} --version || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Record checksums, tag and publish
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          cd dist
+          {
+            echo "# shoal release binaries; the plugin launcher verifies downloads against this file."
+            echo "version $VERSION"
+            for f in shoal-*; do
+              echo "sha256 $f $(sha256sum "$f" | awk '{print $1}')"
+            done
+          } > ../plugin/libexec/release.txt
+          cd ..
+          cat plugin/libexec/release.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add plugin/libexec/release.txt
+          git commit -m "release: v$VERSION"
+          git tag "v$VERSION"
+          git push origin "HEAD:${GITHUB_REF_NAME}" "v$VERSION"
+          gh release create "v$VERSION" dist/shoal-* plugin/libexec/release.txt \
+            --title "shoal v$VERSION" \
+            --notes "Binaries for the shoal CLI and its Claude Code plugin. The plugin downloads the one for your machine on first use and checks it against plugin/libexec/release.txt."

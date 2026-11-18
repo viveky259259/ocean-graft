@@ -1,27 +1,88 @@
 #!/bin/sh
-# Runs the shoal binary for the plugin. Looks, in order, for $SHOAL_BIN, a
-# binary bundled next to this script for this platform (shoal-<os>-<arch>),
-# a development build in the repository, then shoal on PATH.
+# Runs the shoal binary for the plugin. Looks, in order, for:
+#   1. $SHOAL_BIN
+#   2. a binary bundled next to this script (shoal-<os>-<arch>)
+#   3. a development build in the repository (target/release/shoal)
+#   4. the release binary for this plugin version, downloaded once into the
+#      plugin's data directory and verified against the SHA-256 in
+#      release.txt, which ships with the plugin (never with the download)
+#   5. shoal on PATH
 #
 # Exit codes matter to Claude Code. Exit 2 from a hook blocks the prompt or
-# keeps Claude from stopping, so whatever the binary does (a version that
-# does not know the event, a crash), turn hooks always exit 0 and worktree
-# hooks exit 0 or 1.
+# keeps Claude from stopping, so whatever the binary does (missing, a
+# version that does not know the event, a crash), turn hooks always exit 0
+# and worktree hooks exit 0 or 1. Nothing here writes to stdout: it belongs
+# to the MCP protocol and to the worktree path.
 here=$(cd "$(dirname "$0")" && pwd)
 os=$(uname -s | tr '[:upper:]' '[:lower:]')
 arch=$(uname -m)
+asset="shoal-$os-$arch"
 bin=
-for candidate in "${SHOAL_BIN:-}" "$here/shoal-$os-$arch" "$here/../../target/release/shoal"; do
+
+say() { echo "shoal plugin: $*" >&2; }
+
+sha256_of() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    return 1
+  fi
+}
+
+# The release binary for this plugin version: cached, or downloaded and
+# verified now. Prints its path on success.
+release_binary() {
+  release="$here/release.txt"
+  [ -r "$release" ] || return 1
+  version=$(awk '$1 == "version" {print $2}' "$release")
+  want=$(awk -v a="$asset" '$1 == "sha256" && $2 == a {print $3}' "$release")
+  [ -n "$version" ] && [ -n "$want" ] || return 1
+  data="${CLAUDE_PLUGIN_DATA:-${HOME:-/tmp}/.shoal/plugin}"
+  dir="$data/bin/$version"
+  cached="$dir/$asset"
+  if [ -x "$cached" ]; then
+    echo "$cached"
+    return 0
+  fi
+  base="${SHOAL_RELEASE_BASE:-https://github.com/viveky259259/ocean_fs/releases/download}"
+  url="$base/v$version/$asset"
+  mkdir -p "$dir" 2>/dev/null || return 1
+  tmp="$dir/.download.$$"
+  say "downloading shoal $version for $os/$arch (first use)"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 10 --max-time 120 -o "$tmp" "$url" >&2 || { rm -f "$tmp"; say "download failed: $url"; return 1; }
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -T 60 -O "$tmp" "$url" >&2 || { rm -f "$tmp"; say "download failed: $url"; return 1; }
+  else
+    say "neither curl nor wget is available to download shoal"
+    return 1
+  fi
+  got=$(sha256_of "$tmp") || { rm -f "$tmp"; say "no shasum or sha256sum to verify the download"; return 1; }
+  if [ "$got" != "$want" ]; then
+    rm -f "$tmp"
+    say "the downloaded binary does not match release.txt (got $got, want $want); not using it"
+    return 1
+  fi
+  chmod 755 "$tmp" && mv -f "$tmp" "$cached" || { rm -f "$tmp"; return 1; }
+  echo "$cached"
+}
+
+for candidate in "${SHOAL_BIN:-}" "$here/$asset" "$here/../../target/release/shoal"; do
   if [ -n "$candidate" ] && [ -x "$candidate" ]; then
     bin=$candidate
     break
   fi
 done
+if [ -z "$bin" ]; then
+  bin=$(release_binary) || bin=
+fi
 if [ -z "$bin" ] && command -v shoal >/dev/null 2>&1; then
   bin=shoal
 fi
 if [ -z "$bin" ]; then
-  echo "shoal plugin: the shoal binary was not found. Build it (cargo build --release in the shoal repository), put it on PATH, or set SHOAL_BIN." >&2
+  say "the shoal binary was not found. Build it (cargo build --release in the shoal repository), put it on PATH, or set SHOAL_BIN."
 fi
 case "$1 $2" in
   "hook worktree-create" | "hook worktree-remove")

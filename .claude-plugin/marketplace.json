@@ -1,0 +1,17 @@
+{
+  "name": "shoal",
+  "owner": {
+    "name": "viveky259259",
+    "url": "https://github.com/viveky259259"
+  },
+  "plugins": [
+    {
+      "name": "shoal",
+      "source": "./plugin",
+      "description": "Instant copy-on-write sessions for Claude: fork the repository in milliseconds with dependencies installed, checkpoint and rewind, run variants in parallel, and land tested work on your branch."
+    }
+  ],
+  "metadata": {
+    "description": "shoal: instant copy-on-write sessions for Claude Code."
+  }
+}
