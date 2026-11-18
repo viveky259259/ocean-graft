@@ -469,7 +469,7 @@ pub fn clones_supported(dir: &Path) -> bool {
 }
 
 /// The working directory of every process this user can see: on Linux
-/// from /proc, elsewhere from one `lsof` run. None when that cannot be
+/// from /proc, on macOS from libproc, elsewhere from one `lsof` run. None when that cannot be
 /// determined; callers must then treat every directory as in use.
 pub fn process_cwds() -> Option<Vec<std::path::PathBuf>> {
     #[cfg(target_os = "linux")]
@@ -488,10 +488,61 @@ pub fn process_cwds() -> Option<Vec<std::path::PathBuf>> {
                 .collect(),
         )
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        // libproc, as Activity Monitor and lsof use it: every pid, then each
+        // one's current directory. Processes of other users are skipped
+        // (EPERM), as on Linux.
+        let mut pids: Vec<libc::c_int> = vec![0; 4096];
+        let n = loop {
+            let bytes = (pids.len() * std::mem::size_of::<libc::c_int>()) as libc::c_int;
+            let n = unsafe { libc::proc_listallpids(pids.as_mut_ptr() as *mut libc::c_void, bytes) };
+            if n < 0 {
+                return None;
+            }
+            if (n as usize) < pids.len() {
+                break n as usize;
+            }
+            pids.resize(pids.len() * 2, 0); // more processes than room
+        };
+        let mut cwds = Vec::new();
+        for &pid in &pids[..n] {
+            if pid <= 0 {
+                continue;
+            }
+            let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+            let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+            let got = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDVNODEPATHINFO,
+                    0,
+                    &mut info as *mut _ as *mut libc::c_void,
+                    size,
+                )
+            };
+            if got != size {
+                continue;
+            }
+            let raw: Vec<u8> = info
+                .pvi_cdir
+                .vip_path
+                .iter()
+                .flatten()
+                .map(|c| *c as u8)
+                .take_while(|b| *b != 0)
+                .collect();
+            if !raw.is_empty() {
+                use std::os::unix::ffi::OsStringExt;
+                cwds.push(std::path::PathBuf::from(std::ffi::OsString::from_vec(raw)));
+            }
+        }
+        Some(cwds)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let out = Command::new("lsof")
-            .args(["-w", "-b", "-a", "-d", "cwd", "-Fn"])
+            .args(["-w", "-a", "-d", "cwd", "-Fn"])
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .output()

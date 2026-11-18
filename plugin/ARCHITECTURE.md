@@ -182,9 +182,12 @@ shoal ships for macOS first; there it uses the clone backend (APFS
   listens and connects on both, and port checks also try to connect,
   because on macOS a test bind can succeed while another process listens on
   the wildcard address.
-- **No /proc.** Working directories of processes come from one `lsof` run;
-  if that fails, every session counts as in use.
+- **No /proc.** Working directories of processes come from libproc
+  (`proc_listallpids` and `proc_pidinfo`, as Activity Monitor uses them),
+  not from parsing `lsof`; if that fails, every session counts as in use.
 
-None of this has run on a Mac yet: the code compiles and passes clippy for
-`aarch64-apple-darwin` and `x86_64-apple-darwin`, and `demo/mac-test.sh`
-(also the `shoal macOS` GitHub workflow) runs the whole test suite there.
+None of this has run on a Mac yet. The code compiles and passes clippy for
+`aarch64-apple-darwin` and `x86_64-apple-darwin`; the whole suite passes on
+Linux both as root and as an unprivileged user (as on a Mac, where
+permissions apply); and `demo/mac-test.sh` (also the `shoal macOS` GitHub
+workflow) runs the whole suite on a Mac.
