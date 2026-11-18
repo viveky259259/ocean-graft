@@ -17,6 +17,12 @@ use std::time::Duration;
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_shoal");
 
+/// A static file server on $PORT for preview and gateway tests. Not
+/// `python3 -m http.server`: its bind does a reverse DNS lookup, and its
+/// stdout is buffered, so a hang there leaves an empty log. This one says
+/// "listening" (flushed) once it can take connections.
+pub const HTTP_SERVER: &str = r#"exec python3 -u -c "import http.server as h, os, socketserver as s; s.TCPServer.allow_reuse_address = True; srv = s.TCPServer(('127.0.0.1', int(os.environ['PORT'])), h.SimpleHTTPRequestHandler); print('listening on', os.environ['PORT'], flush=True); srv.serve_forever()""#;
+
 pub struct Env {
     pub root: tempfile::TempDir,
     pub port_base: u16,

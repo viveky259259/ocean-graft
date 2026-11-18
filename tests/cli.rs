@@ -515,7 +515,7 @@ fn on_demand_service_wakes_on_first_request() {
         "--",
         "sh",
         "-c",
-        "exec python3 -m http.server \"$PORT\" --bind 127.0.0.1",
+        r#"exec python3 -u -c "import http.server as h, os, socketserver as s; s.TCPServer.allow_reuse_address = True; srv = s.TCPServer(('127.0.0.1', int(os.environ['PORT'])), h.SimpleHTTPRequestHandler); print('listening on', os.environ['PORT'], flush=True); srv.serve_forever()""#,
     ]);
     assert!(started.contains("on port 4700 (on demand"), "{started}");
     // The server needs a moment to bind its private port; the gateway waits.

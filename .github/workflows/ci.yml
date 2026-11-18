@@ -27,4 +27,4 @@ jobs:
       - name: Tests (clone backend, as a normal user)
         run: cargo test --release -- --test-threads=4
       - name: Tests (overlay backend, as root)
-        run: sudo -E env "PATH=$PATH" cargo test --release -- --test-threads=4
+        run: sudo env "PATH=$PATH" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" cargo test --release -- --test-threads=4

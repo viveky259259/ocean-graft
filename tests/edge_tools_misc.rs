@@ -183,7 +183,7 @@ fn answers(port: u16) -> bool {
     TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_millis(300)).is_ok()
 }
 
-const SERVER: &str = "exec python3 -m http.server \"$PORT\" --bind 127.0.0.1";
+const SERVER: &str = HTTP_SERVER;
 
 fn web_service(env: &Env, session: &str) -> Option<Value> {
     env.state()["sessions"][session]["services"]
@@ -1269,7 +1269,8 @@ fn preview_uses_the_preview_command_from_shoal_toml() {
     let env = Env::new(5540);
     fs::write(
         env.repo().join("shoal.toml"),
-        format!("preview = '{}'\n", SERVER.replace('\'', "")),
+        // A TOML basic string: JSON string escapes are valid TOML.
+        format!("preview = {}\n", serde_json::to_string(SERVER).unwrap()),
     )
     .unwrap();
     env.git(&env.repo(), &["add", "shoal.toml"]);
