@@ -1768,12 +1768,23 @@ fn turn_hooks_give_up_when_the_project_is_locked() {
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
-        for (event, r, took) in results {
-            assert_eq!(r.code, 0, "{event}: {}", r.stderr);
+        // All three at once in a failure, with what each said: one slow
+        // hook alone and all three slow (a stalled machine) differ.
+        let report: String = results
+            .iter()
+            .map(|(event, r, took)| {
+                format!(
+                    "{event}: {took:?}, exit {}, stderr {:?}\n",
+                    r.code, r.stderr
+                )
+            })
+            .collect();
+        for (event, r, took) in &results {
+            assert_eq!(r.code, 0, "{event}:\n{report}");
             assert!(r.stdout.is_empty(), "{event} printed {:?}", r.stdout);
             assert!(
-                took < Duration::from_millis(6500),
-                "{event} took {took:?} with the lock held"
+                *took < Duration::from_millis(6500),
+                "{event} took {took:?} with the lock held:\n{report}"
             );
         }
         assert!(checkpoints(&env, "s").is_empty());

@@ -55,7 +55,7 @@ node --version
 cargo --version
 
 section "Build and end-to-end tests"
-(cd "$root" && cargo build --release && cargo test --release -- --nocapture)
+(cd "$root" && cargo build --release && cargo test --release --no-fail-fast -- --nocapture)
 export PATH="$root/target/release:$PATH"
 
 section "Four sessions, replaying the agents' work"
