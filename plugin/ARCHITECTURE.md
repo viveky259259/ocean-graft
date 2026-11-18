@@ -36,8 +36,14 @@ Rules that keep the integration correct:
    (fetch, copy, setup) run under their own refresh lock, tests in `land`
    run under a per-session land lock, and the MCP server's idle time holds
    nothing; each call opens the project, does its work and releases it.
-   Known exception: copying a session or checkpoint on a filesystem without
-   copy-on-write (ext4) is a full copy made under the lock.
+   A full copy (the clone backend on a filesystem without copy-on-write,
+   such as ext4) is made without the project lock too: a `pending` entry in
+   the state takes the new session's name, gc keeps the template it reads,
+   and the session lock of what it copies keeps that from changing hands.
+   The session lock's file names its holder, so a command that meets a copy
+   waits (giving up the project lock while it does), and one that meets a
+   land fails at once. A copy whose process died is cleaned up by the next
+   command that opens the project.
 4. **Nothing lost.** Any path that removes a session first saves its work:
    uncommitted changes are committed as WIP, the branch is imported into the
    source repository as `shoal/<name>`, and other local branches and stashes

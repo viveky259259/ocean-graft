@@ -12,7 +12,7 @@ use crate::config;
 use crate::conflicts;
 use crate::git;
 use crate::project::{
-    self, validate_name, Backend, Checkpoint, Generation, Project, Session, State,
+    self, validate_name, Backend, Checkpoint, Generation, Pending, Project, Session, State,
 };
 use crate::queue;
 use crate::services;
@@ -773,6 +773,10 @@ pub fn unique_name(p: &Project, base: &str) -> String {
     let taken = |n: &str| {
         project::RESERVED_SESSION_NAMES.contains(&n)
             || p.state.sessions.contains_key(n)
+            || p.state
+                .pending
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(n))
             || p.session_path(n).symlink_metadata().is_ok()
             || p.volume_dir(n).exists()
     };
@@ -808,12 +812,59 @@ pub struct SessionInfo {
     pub parent: Option<String>,
     pub from_checkpoint: Option<String>,
     pub ready_ms: u64,
+    /// Set when the session forked from kept changing while it was copied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// generation, base commit, lowers, parent, from_checkpoint
 type Built = (u32, String, Vec<String>, Option<String>, Option<String>);
 
 pub fn create_session(p: &mut Project, name: &str, origin: &Origin) -> Result<SessionInfo> {
+    create(p, name, false, origin)
+}
+
+/// Like create_session, with `base` made unique (base-2, ...) against the
+/// state the session is created in.
+pub fn create_session_unique(p: &mut Project, base: &str, origin: &Origin) -> Result<SessionInfo> {
+    create(p, base, true, origin)
+}
+
+fn create(p: &mut Project, name: &str, unique: bool, origin: &Origin) -> Result<SessionInfo> {
+    let slow = p.state.backend == Backend::Clone && !checkpoints_are_cheap(p);
+    // The session copied from is locked first: waiting for it (while
+    // another command copies it) re-reads the state, and the name must be
+    // checked against the state the session is created in. Not while it is
+    // being landed: its rebase would be copied half done. A checkpoint is
+    // locked only for a copy without the project lock: then the lock keeps
+    // the checkpoint from being pruned or removed.
+    let _source_lock = match origin {
+        Origin::Session(parent) => {
+            p.session(parent)?;
+            Some(session_lock(p, parent, "fork")?)
+        }
+        Origin::Checkpoint { session, label } if slow => {
+            p.session(session)?;
+            // A mistake is reported as such even while the session is busy.
+            if !p
+                .state
+                .checkpoints
+                .iter()
+                .any(|c| &c.session == session && &c.label == label)
+            {
+                bail!("{session} has no checkpoint named {label}");
+            }
+            Some(session_lock(p, session, "fork")?)
+        }
+        _ => None,
+    };
+    let chosen;
+    let name = if unique {
+        chosen = unique_name(p, name);
+        chosen.as_str()
+    } else {
+        name
+    };
     validate_name("session", name)?;
     if project::RESERVED_SESSION_NAMES.contains(&name) {
         bail!("{name:?} is reserved (fork from \"main\" means the repository); pick another name");
@@ -831,6 +882,18 @@ pub fn create_session(p: &mut Project, name: &str, origin: &Origin) -> Result<Se
         .find(|k| k.eq_ignore_ascii_case(name))
     {
         bail!("session {other} already exists");
+    }
+    if let Some(c) = p
+        .state
+        .pending
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(name))
+    {
+        bail!(
+            "session {} is being created (by process {}); pick another name",
+            c.name,
+            c.pid
+        );
     }
     let path = p.session_path(name);
     // Check for leftovers before deleting anything (on a case-insensitive
@@ -858,7 +921,13 @@ pub fn create_session(p: &mut Project, name: &str, origin: &Origin) -> Result<Se
     let reservation = p.reserve_port()?;
     let port = reservation.port;
     let start = Instant::now();
-    let fork_layer = |p: &Project, parent: &str, src: &Path| -> Result<String> {
+    let mut warning = None;
+    // `watched`: the session being copied, checked around the copy.
+    let fork_layer = |p: &Project,
+                      parent: &str,
+                      src: &Path,
+                      watched: Option<&Path>|
+     -> Result<(String, Option<String>)> {
         // "+" cannot occur in names, so parent/name pairs never collide; the
         // counter covers re-forks of the same pair in the same second. Flat
         // (one directory per layer under layers/), which gc relies on.
@@ -869,20 +938,39 @@ pub fn create_session(p: &mut Project, name: &str, origin: &Origin) -> Result<Se
             layer = format!("{stem}+{i}");
             i += 1;
         }
-        if let Err(err) = sys::clone_tree(src, &p.abs(&layer)) {
-            let _ = sys::remove_tree(p.abs(&layer));
-            return Err(err);
-        }
-        Ok(layer)
+        let dst = p.abs(&layer);
+        let warning = match watched {
+            Some(dir) => {
+                let fingerprint = conflicts::fingerprint_with_ignored(dir).ok();
+                copy_settled(src, &dst, dir, fingerprint, "fork")?.warning
+            }
+            None => {
+                if let Err(err) = sys::clone_tree(src, &dst) {
+                    let _ = sys::remove_tree(&dst);
+                    return Err(err);
+                }
+                None
+            }
+        };
+        Ok((layer, warning))
     };
-    let built = (|| -> Result<Built> {
+    // A full copy (the clone backend where the filesystem cannot clone)
+    // can take minutes. It is made without the project lock, so other
+    // sessions' commands are not held up meanwhile: a Pending entry takes
+    // the name, and what is copied stays put: a template layer because gc
+    // keeps a pending copy's source, a session or checkpoint because its
+    // session lock is held (taken above).
+    let built = (|p: &mut Project| -> Result<Built> {
         Ok(match origin {
             Origin::Template => {
                 let g = p.latest().clone();
                 let lowers = match p.state.backend {
                     Backend::Overlay => g.layers.clone(),
                     Backend::Clone => {
-                        sys::clone_tree(&p.abs(&g.layers[0]), &path)?;
+                        let src = p.abs(&g.layers[0]);
+                        copy_new_session(p, name, slow, Some(g.layers[0].clone()), || {
+                            sys::clone_tree(&src, &path)
+                        })?;
                         Vec::new()
                     }
                 };
@@ -890,22 +978,24 @@ pub fn create_session(p: &mut Project, name: &str, origin: &Origin) -> Result<Se
             }
             Origin::Session(parent) => {
                 let ps = p.session(parent)?.clone();
-                // Not while the parent is being landed: its rebase would be
-                // copied half done.
-                let _busy = try_session_lock(&p.dir, parent, "fork")?;
                 let parent_path = p.ensure_ready(parent)?;
                 let _paused = PausedServices::for_copy(p, parent);
-                sys::sync();
                 let lowers = match p.state.backend {
                     Backend::Overlay => {
                         // Freeze the parent's changes into a layer both sessions sit on.
-                        let layer = fork_layer(p, parent, &p.volume_dir(parent).join("upper"))?;
+                        let upper = p.volume_dir(parent).join("upper");
+                        let (layer, w) = fork_layer(p, parent, &upper, Some(&parent_path))?;
+                        warning = w;
                         let mut lowers = vec![layer];
                         lowers.extend(ps.lowers.iter().cloned());
                         lowers
                     }
                     Backend::Clone => {
-                        sys::clone_tree(&parent_path, &path)?;
+                        let fingerprint = conflicts::fingerprint_with_ignored(&parent_path).ok();
+                        warning = copy_new_session(p, name, slow, None, || {
+                            copy_settled(&parent_path, &path, &parent_path, fingerprint, "fork")
+                        })?
+                        .warning;
                         Vec::new()
                     }
                 };
@@ -931,13 +1021,13 @@ pub fn create_session(p: &mut Project, name: &str, origin: &Origin) -> Result<Se
                 let lowers = match p.state.backend {
                     Backend::Overlay => {
                         // A copy, so pruning the checkpoint later cannot break the fork.
-                        let layer = fork_layer(p, session, &saved)?;
+                        let (layer, _) = fork_layer(p, session, &saved, None)?;
                         let mut lowers = vec![layer];
                         lowers.extend(ps.lowers.iter().cloned());
                         lowers
                     }
                     Backend::Clone => {
-                        sys::clone_tree(&saved, &path)?;
+                        copy_new_session(p, name, slow, None, || sys::clone_tree(&saved, &path))?;
                         Vec::new()
                     }
                 };
@@ -950,7 +1040,7 @@ pub fn create_session(p: &mut Project, name: &str, origin: &Origin) -> Result<Se
                 )
             }
         })
-    })();
+    })(p);
     let (generation, base_commit, lowers, parent, from_checkpoint) = match built {
         Ok(b) => b,
         Err(err) => {
@@ -1003,6 +1093,7 @@ pub fn create_session(p: &mut Project, name: &str, origin: &Origin) -> Result<Se
         parent,
         from_checkpoint,
         ready_ms: ms(ready),
+        warning,
     })
 }
 
@@ -1016,18 +1107,75 @@ fn session_lock_file(project_dir: &Path, name: &str) -> Result<std::fs::File> {
     std::fs::File::options()
         .create(true)
         .truncate(false)
+        .read(true)
         .write(true)
         .open(dir.join(format!("{name}.lock")))
         .context("could not open the session lock")
 }
 
-fn try_session_lock(project_dir: &Path, name: &str, what: &str) -> Result<std::fs::File> {
-    use std::os::unix::io::AsRawFd;
-    let file = session_lock_file(project_dir, name)?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        bail!("{name} is being landed right now; {what} it after the land finishes");
+/// A session's lock. Its file says what the holder is doing ("land",
+/// "fork", ...), so a waiter can tell a land (minutes of tests: fail fast)
+/// from a copy (wait for it); it is emptied again on release.
+pub(crate) struct SessionLock(std::fs::File);
+
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        let _ = self.0.set_len(0);
     }
-    Ok(file)
+}
+
+/// The lock, or what its holder is doing ("" while a holder is still
+/// writing it, or for an older shoal, which never writes it).
+fn take_session_lock(
+    project_dir: &Path,
+    name: &str,
+    what: &str,
+) -> Result<std::result::Result<SessionLock, String>> {
+    use std::io::{Read, Seek, Write};
+    use std::os::unix::io::AsRawFd;
+    let mut file = session_lock_file(project_dir, name)?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let mut holder = String::new();
+        let _ = file.read_to_string(&mut holder);
+        return Ok(Err(holder.trim().to_string()));
+    }
+    let _ = file.set_len(0);
+    let _ = file.rewind();
+    let _ = file.write_all(what.as_bytes());
+    Ok(Ok(SessionLock(file)))
+}
+
+fn busy_message(name: &str, holder: &str, what: &str) -> String {
+    match holder {
+        "land" | "" => {
+            format!("{name} is being landed right now; {what} it after the land finishes")
+        }
+        other => format!("{name} is busy (a {other} is running); {what} it after that finishes"),
+    }
+}
+
+/// The session lock, waiting while another command copies the session (a
+/// full copy holds it for minutes, without the project lock, which this
+/// gives up while it waits; `p.state` is then re-read). A land is not
+/// waited for: that fails at once, as before.
+fn session_lock(p: &mut Project, name: &str, what: &str) -> Result<SessionLock> {
+    let mut unknown = 0;
+    loop {
+        match take_session_lock(&p.dir, name, what)? {
+            Ok(lock) => return Ok(lock),
+            Err(holder) if holder == "land" => bail!("{}", busy_message(name, &holder, what)),
+            // Just taken and not yet written, or an older shoal's land.
+            Err(holder) if holder.is_empty() && unknown >= 20 => {
+                bail!("{}", busy_message(name, &holder, what))
+            }
+            Err(holder) => {
+                if holder.is_empty() {
+                    unknown += 1;
+                }
+                p.without_lock(|| std::thread::sleep(Duration::from_millis(50)))?;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1117,8 +1265,12 @@ pub fn checkpoint(
     auto: bool,
 ) -> Result<CheckpointInfo> {
     p.session(name)?;
-    let _busy = try_session_lock(&p.dir, name, "checkpoint")?;
-    checkpoint_inner(p, name, label, auto)
+    let _busy = session_lock(p, name, "checkpoint")?;
+    p.session(name)?;
+    // A full copy can take minutes: make it without the project lock (the
+    // session lock keeps the session from changing hands meanwhile).
+    let unlocked = !checkpoints_are_cheap(p);
+    checkpoint_inner(p, name, label, auto, unlocked)
 }
 
 /// Checkpoint without the session lock, for operations that hold it.
@@ -1127,6 +1279,7 @@ fn checkpoint_inner(
     name: &str,
     label: Option<&str>,
     auto: bool,
+    unlocked: bool,
 ) -> Result<CheckpointInfo> {
     let start = Instant::now();
     let path = p.ensure_ready(name)?;
@@ -1182,37 +1335,17 @@ fn checkpoint_inner(
         Backend::Clone => path.clone(),
     };
     // Writers shoal did not start (a command Claude runs, a queued job) are
-    // caught by comparing HEAD and the fingerprint around the copy: a copy
-    // taken while they changed things is taken again.
-    let mut fingerprint = fingerprint;
-    let mut head = git::head(&path)?;
-    let mut warning = None;
-    for attempt in 1..=CHECKPOINT_ATTEMPTS {
-        sys::sync();
-        if let Err(err) = sys::clone_tree(&src, &dst) {
-            let _ = sys::remove_tree(&dst);
-            return Err(err);
-        }
-        let head_after = git::head(&path)?;
-        let after = conflicts::fingerprint_with_ignored(&path).ok();
-        // (Where the fingerprint cannot be taken at all, HEAD alone decides.)
-        if head_after == head && after == fingerprint {
-            break;
-        }
-        head = head_after;
-        if attempt == CHECKPOINT_ATTEMPTS {
-            // Keep it: a checkpoint that may mix two moments beats none.
-            // Without a fingerprint the next automatic one is not skipped.
-            fingerprint = None;
-            warning = Some(format!(
-                "the session kept changing while it was copied ({CHECKPOINT_ATTEMPTS} tries), so this checkpoint may mix files from before and after those changes; take another once the session is quiet"
-            ));
-            break;
-        }
-        sys::remove_tree(&dst)
-            .with_context(|| format!("removing the inconsistent copy {}", dst.display()))?;
-        fingerprint = after;
-    }
+    // caught by comparing the session around the copy.
+    let copy = || copy_settled(&src, &dst, &path, fingerprint, "checkpoint");
+    let settled = if unlocked {
+        p.without_lock(|| {
+            test_copy_delay();
+            copy()
+        })??
+    } else {
+        copy()?
+    };
+    let (head, fingerprint, warning) = (settled.head, settled.fingerprint, settled.warning);
     p.state.checkpoints.push(Checkpoint {
         session: name.to_string(),
         label: label.clone(),
@@ -1241,8 +1374,150 @@ fn checkpoint_inner(
 
 const PRE_REWIND_KEPT: usize = 10;
 
+/// The checkpoint a rewind to `label` ("latest" or a label) goes to.
+fn rewind_target(p: &Project, name: &str, label: &str) -> Result<String> {
+    p.session(name)?;
+    let label = if label == "latest" {
+        p.state
+            .checkpoints
+            .iter()
+            .rev() // checkpoints are appended in the order they are taken
+            // A rewind's own safety checkpoint is how to undo it, not where
+            // "latest" should go: rewinding to latest twice must not bounce.
+            .find(|c| c.session == name && !c.label.starts_with("pre-rewind-"))
+            .map(|c| c.label.clone())
+            .with_context(|| format!("{name} has no checkpoints"))?
+    } else {
+        label.to_string()
+    };
+    if !p
+        .state
+        .checkpoints
+        .iter()
+        .any(|c| c.session == name && c.label == label)
+    {
+        let known: Vec<String> = p
+            .state
+            .checkpoints
+            .iter()
+            .filter(|c| c.session == name)
+            .map(|c| c.label.clone())
+            .collect();
+        bail!(
+            "{name} has no checkpoint named {label}; it has: {}",
+            if known.is_empty() {
+                "none".into()
+            } else {
+                known.join(", ")
+            }
+        );
+    }
+    Ok(label)
+}
+
 /// Copies of a session that keeps changing, before keeping one with a warning.
-const CHECKPOINT_ATTEMPTS: u32 = 3;
+const COPY_ATTEMPTS: u32 = 3;
+
+struct SettledCopy {
+    head: String,
+    fingerprint: Option<String>,
+    warning: Option<String>,
+}
+
+/// Copy `src` to `dst` (which must not exist) while the session at
+/// `watched` may be changing. Its HEAD and fingerprint (`fingerprint`,
+/// taken just before) are compared around the copy, and a copy taken while
+/// they changed is taken again. After COPY_ATTEMPTS tries the last copy is
+/// kept, with a warning and no fingerprint: one that may mix two moments
+/// beats none, and without a fingerprint the next automatic checkpoint is
+/// not skipped as unchanged. (Where no fingerprint can be taken, HEAD alone
+/// decides.)
+fn copy_settled(
+    src: &Path,
+    dst: &Path,
+    watched: &Path,
+    fingerprint: Option<String>,
+    what: &str,
+) -> Result<SettledCopy> {
+    let mut fingerprint = fingerprint;
+    let mut head = git::head(watched)?;
+    for attempt in 1..=COPY_ATTEMPTS {
+        sys::sync();
+        let copied = sys::clone_tree(src, dst).and_then(|()| git::head(watched));
+        let head_after = match copied {
+            Ok(h) => h,
+            Err(err) => {
+                let _ = sys::remove_tree(dst);
+                return Err(err);
+            }
+        };
+        let after = conflicts::fingerprint_with_ignored(watched).ok();
+        if head_after == head && after == fingerprint {
+            return Ok(SettledCopy {
+                head,
+                fingerprint,
+                warning: None,
+            });
+        }
+        if attempt == COPY_ATTEMPTS {
+            let again = if what == "checkpoint" {
+                "take another"
+            } else {
+                "fork again"
+            };
+            return Ok(SettledCopy {
+                head: head_after,
+                fingerprint: None,
+                warning: Some(format!(
+                    "the session kept changing while it was copied ({COPY_ATTEMPTS} tries), so this {what} may mix files from before and after those changes; {again} once the session is quiet"
+                )),
+            });
+        }
+        head = head_after;
+        sys::remove_tree(dst)
+            .with_context(|| format!("removing the inconsistent copy {}", dst.display()))?;
+        fingerprint = after;
+    }
+    unreachable!("the last attempt returns")
+}
+
+/// For tests: make a copy that runs without the project lock take this
+/// long, so that what happens meanwhile can be observed.
+fn test_copy_delay() {
+    if let Some(ms) = std::env::var("SHOAL_TEST_COPY_DELAY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+}
+
+/// Copy a new session's files with `copy`. When `slow`, without the project
+/// lock, with a Pending entry taking the name meanwhile (see
+/// create_session); the state is re-read afterwards.
+fn copy_new_session<R>(
+    p: &mut Project,
+    name: &str,
+    slow: bool,
+    source: Option<String>,
+    copy: impl FnOnce() -> Result<R>,
+) -> Result<R> {
+    if !slow {
+        return copy();
+    }
+    p.state.pending.push(Pending::ours(name, source));
+    p.save()?;
+    // If the lock cannot be taken again, the entry stays until this process
+    // has exited and the next shoal command cleans it up.
+    let copied = p.without_lock(|| {
+        test_copy_delay();
+        copy()
+    })?;
+    let me = std::process::id() as i32;
+    p.state.pending.retain(|c| !(c.name == name && c.pid == me));
+    p.save()?;
+    copied
+}
 
 /// The session's running services, stopped with SIGSTOP until this is
 /// dropped (also on an error or a panic). Only groups that are still
@@ -1586,42 +1861,13 @@ fn prune_pre_rewind(p: &mut Project, name: &str, keep: &str) -> Result<()> {
 
 /// `label` may be "latest" for the newest checkpoint.
 pub fn rewind(p: &mut Project, name: &str, label: &str) -> Result<RewindInfo> {
+    // Checked before the session lock, so that a mistake is reported as
+    // such even while the session is busy, and again after it: waiting for
+    // the lock re-reads the state.
+    rewind_target(p, name, label)?;
+    let _busy = session_lock(p, name, "rewind")?;
+    let label = rewind_target(p, name, label)?;
     let session = p.session(name)?.clone();
-    let label = if label == "latest" {
-        p.state
-            .checkpoints
-            .iter()
-            .rev() // checkpoints are appended in the order they are taken
-            // A rewind's own safety checkpoint is how to undo it, not where
-            // "latest" should go: rewinding to latest twice must not bounce.
-            .find(|c| c.session == name && !c.label.starts_with("pre-rewind-"))
-            .map(|c| c.label.clone())
-            .with_context(|| format!("{name} has no checkpoints"))?
-    } else {
-        label.to_string()
-    };
-    if !p
-        .state
-        .checkpoints
-        .iter()
-        .any(|c| c.session == name && c.label == label)
-    {
-        let known: Vec<String> = p
-            .state
-            .checkpoints
-            .iter()
-            .filter(|c| c.session == name)
-            .map(|c| c.label.clone())
-            .collect();
-        bail!(
-            "{name} has no checkpoint named {label}; it has: {}",
-            if known.is_empty() {
-                "none".into()
-            } else {
-                known.join(", ")
-            }
-        );
-    }
     // Services hold the session open; stop them now and start them again after.
     let restart: Vec<String> = session
         .services
@@ -1629,7 +1875,6 @@ pub fn rewind(p: &mut Project, name: &str, label: &str) -> Result<RewindInfo> {
         .filter(|svc| services::state(svc) == services::State::Running)
         .map(|svc| svc.name.clone())
         .collect();
-    let _busy = try_session_lock(&p.dir, name, "rewind")?;
     let saved = p.checkpoint_dir(name, &label);
     if !saved.is_dir() {
         bail!(
@@ -1641,7 +1886,7 @@ pub fn rewind(p: &mut Project, name: &str, label: &str) -> Result<RewindInfo> {
     // rewind can be undone. Always: no cheap fingerprint sees everything a
     // rewind replaces (stashes, other branches, deep inside ignored trees).
     let safety = next_label(p, name, "pre-rewind-");
-    let saved_as = checkpoint_inner(p, name, Some(&safety), false)?.label;
+    let saved_as = checkpoint_inner(p, name, Some(&safety), false, false)?.label;
     let start = Instant::now();
     let path = p.session_path(name);
     // Stop the session's own services first: they run in it, and must not
@@ -1957,8 +2202,9 @@ pub struct RemoveInfo {
 /// Remove a session. Without `force`, refuse if it holds work that is not in
 /// the source repository. With `save`, save that work first instead.
 pub fn remove(p: &mut Project, name: &str, force: bool, save: bool) -> Result<RemoveInfo> {
+    p.session(name)?;
+    let _busy = session_lock(p, name, "remove")?;
     let s = p.session(name)?.clone();
-    let _busy = try_session_lock(&p.dir, name, "remove")?;
     let mut saved = None;
     // A session whose files are already gone (deleted by hand, a crash) has
     // nothing left to save; removing it just clears the record.
@@ -2411,11 +2657,24 @@ pub fn land(project_dir: &Path, name: &str, o: &LandOptions) -> Result<LandRepor
 fn land_inner(project_dir: &Path, name: &str, o: &LandOptions) -> Result<LandReport> {
     // test_timeout bounds the whole land: queue waits, retries and tests.
     let deadline = Instant::now() + o.test_timeout;
-    let _busy = {
-        let p = open_by(project_dir, deadline)?;
-        p.session(name)?;
-        try_session_lock(project_dir, name, "land")
-            .map_err(|_| anyhow::anyhow!("{name} is already being landed"))?
+    // A copy of the session (minutes, on filesystems that cannot clone) is
+    // waited for, within the deadline; another land is not.
+    let _busy = loop {
+        {
+            let p = open_by(project_dir, deadline)?;
+            p.session(name)?;
+            match take_session_lock(project_dir, name, "land")? {
+                Ok(lock) => break lock,
+                Err(holder) if holder == "land" || holder.is_empty() => {
+                    bail!("{name} is already being landed")
+                }
+                Err(_) => {}
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(OutOfTime("waiting for a copy of the session to finish", None).into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
     };
     let (path, source, target, port, test) = {
         let mut p = open_by(project_dir, deadline)?;
@@ -2488,7 +2747,7 @@ fn land_inner(project_dir: &Path, name: &str, o: &LandOptions) -> Result<LandRep
                 let mut p =
                     open_by(project_dir, deadline).map_err(|e| with_progress(e, &report))?;
                 let label = next_label(&p, name, "pre-land-");
-                let cp = checkpoint_inner(&mut p, name, Some(&label), false)?;
+                let cp = checkpoint_inner(&mut p, name, Some(&label), false, false)?;
                 report.checkpoint = cp.label;
             }
             let rebase = git_with_identity(&path)

@@ -289,7 +289,7 @@ Silicon, 16 GB) every step passed:
 cargo test --release
 ```
 
-346 tests drive the real binary against throwaway repositories, on both
+352 tests drive the real binary against throwaway repositories, on both
 backends where they apply. Beyond the lifecycle (isolation, status, diff,
 ports, conflicts, checkpoint and rewind, fork, import, refresh, rm safety,
 remount, gc, sandbox, queue, idle shutdown, wake on request), they cover the
@@ -301,13 +301,14 @@ skipped otherwise.
 ## Limitations
 
 - The overlay backend needs root. As an ordinary user on Linux, `clone` is
-  used instead; it copies files unless the filesystem supports reflinks, and
-  that copy is made while the project is locked.
+  used instead; it copies files unless the filesystem supports reflinks.
+  That copy is made without the project lock, so other sessions' commands
+  go on meanwhile; commands on the session being copied wait for it (a land
+  until its timeout).
 - A session's own services (`shoal serve`) are paused while it is
   checkpointed or forked, where that copy is cheap. Other writers are not:
-  a checkpoint taken while something else keeps changing the session is
-  retried, and after three tries kept with a `warning`. A fork is not
-  checked that way, so fork between commands (tool calls are).
+  a checkpoint or fork taken while something else keeps changing the
+  session is retried, and after three tries kept with a `warning`.
 - A session someone is working in is rewound in place, file by file; if that
   is interrupted, the `pre-rewind-N` checkpoint it took first is the way back.
 - `--sandbox` is Linux only (bubblewrap).

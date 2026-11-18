@@ -378,8 +378,7 @@ fn fork(args: &Value) -> Result<Value> {
         } else {
             base.clone()
         };
-        let name = ops::unique_name(&p, &wanted);
-        match ops::create_session(&mut p, &name, &origin) {
+        match ops::create_session_unique(&mut p, &wanted, &origin) {
             Ok(info) => created.push(info),
             Err(err) if !created.is_empty() => {
                 // Report what exists, so nothing is orphaned silently.

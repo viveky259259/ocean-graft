@@ -158,6 +158,44 @@ pub struct State {
     /// rebuild (and fail on) the same commit again.
     #[serde(default)]
     pub refresh_failure: Option<RefreshFailure>,
+    /// Sessions being copied without the project lock (a full copy, which
+    /// can take minutes): their names are taken, and what they copy from
+    /// is kept by gc.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending: Vec<Pending>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Pending {
+    pub name: String,
+    pub pid: i32,
+    pub pid_start: Option<String>,
+    /// A template layer the copy reads from.
+    pub source: Option<String>,
+}
+
+impl Pending {
+    /// For this process, copying from `source`.
+    pub fn ours(name: &str, source: Option<String>) -> Pending {
+        let pid = std::process::id() as i32;
+        Pending {
+            name: name.to_string(),
+            pid,
+            pid_start: sys::process_start(pid),
+            source,
+        }
+    }
+
+    /// Whether the process doing the copy is still running.
+    pub fn alive(&self) -> bool {
+        let exists = unsafe { libc::kill(self.pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        exists
+            && match (&self.pid_start, sys::process_start(self.pid)) {
+                (Some(then), Some(now)) => *then == now,
+                _ => true,
+            }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -188,6 +226,7 @@ impl State {
             sessions: BTreeMap::new(),
             checkpoints: Vec::new(),
             refresh_failure: None,
+            pending: Vec::new(),
         }
     }
 }
@@ -294,6 +333,16 @@ fn lock(dir: &Path, wait: Option<std::time::Duration>) -> Result<File> {
     }
 }
 
+fn read_state(dir: &Path) -> Result<State> {
+    let raw = std::fs::read_to_string(dir.join("state.json"))
+        .with_context(|| format!("no project state in {}", dir.display()))?;
+    let state: State = serde_json::from_str(&raw).context("project state is unreadable")?;
+    if state.version != STATE_VERSION {
+        bail!("project state version {} is not supported", state.version);
+    }
+    Ok(state)
+}
+
 /// Every initialised project under SHOAL_HOME.
 pub fn all_projects() -> Result<Vec<PathBuf>> {
     let projects = shoal_home()?.join("projects");
@@ -365,19 +414,60 @@ impl Project {
 
     fn open_with(dir: PathBuf, wait: Option<std::time::Duration>) -> Result<Project> {
         let lock = lock(&dir, wait)?;
-        let raw = std::fs::read_to_string(dir.join("state.json"))
-            .with_context(|| format!("no project state in {}", dir.display()))?;
-        let state: State = serde_json::from_str(&raw).context("project state is unreadable")?;
-        if state.version != STATE_VERSION {
-            bail!("project state version {} is not supported", state.version);
-        }
-        let project = Project {
+        let state = read_state(&dir)?;
+        let mut project = Project {
             dir,
             state,
             _lock: lock,
         };
         project.recover_interrupted_rewinds();
+        project.recover_abandoned_copies();
         Ok(project)
+    }
+
+    /// Run `f` with the project lock released, then take it again and
+    /// re-read the state, which other shoal commands may have changed
+    /// meanwhile. For copies that can take minutes: what they read must be
+    /// protected some other way (a session lock, or a `Pending` entry).
+    pub fn without_lock<R>(&mut self, f: impl FnOnce() -> R) -> Result<R> {
+        let fd = self._lock.as_raw_fd();
+        unsafe { libc::flock(fd, libc::LOCK_UN) };
+        let result = f();
+        loop {
+            if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
+                break;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EINTR) {
+                return Err(err).context("could not lock the project again");
+            }
+        }
+        self.state = read_state(&self.dir)?;
+        Ok(result)
+    }
+
+    /// A copy whose process died (a crash, a kill) left a partial session
+    /// directory and its `Pending` entry: remove both.
+    fn recover_abandoned_copies(&mut self) {
+        let abandoned: Vec<Pending> = self
+            .state
+            .pending
+            .iter()
+            .filter(|c| !c.alive())
+            .cloned()
+            .collect();
+        if abandoned.is_empty() {
+            return;
+        }
+        for c in &abandoned {
+            if !self.state.sessions.contains_key(&c.name) {
+                let _ = sys::remove_tree(self.session_path(&c.name));
+            }
+        }
+        self.state
+            .pending
+            .retain(|c| !abandoned.iter().any(|a| a.name == c.name && a.pid == c.pid));
+        let _ = self.save();
     }
 
     /// The overlay form: volumes/<name>/upper.restore-<pid> (a staging copy)

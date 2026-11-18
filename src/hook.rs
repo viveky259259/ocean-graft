@@ -146,8 +146,8 @@ pub fn worktree_create(input: &Value) -> Result<PathBuf> {
         Origin::Session(parent) => Some(parent.clone()),
         _ => None,
     };
-    let name = ops::unique_name(&p, &ops::sanitize_name(raw));
-    let info = ops::create_session(&mut p, &name, &origin)?;
+    let info = ops::create_session_unique(&mut p, &ops::sanitize_name(raw), &origin)?;
+    let name = info.name.clone();
     // Swept when idle unless a main session turns out to run in it (see
     // mark_interactive): Claude Code never removes subagent worktrees.
     if let Some(s) = p.state.sessions.get_mut(&name) {

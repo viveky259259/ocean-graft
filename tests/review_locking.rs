@@ -557,9 +557,10 @@ fn rewind_discard_and_a_second_land_fail_fast_while_a_session_is_landed() {
             );
             let fast = |what: &str, r: Result<Value, String>, t: Instant, want: &str| {
                 let took = t.elapsed();
-                let err = r.err().unwrap_or_else(|| {
-                    panic!("[{backend}] {what} of the landing session succeeded")
-                });
+                let err = match r {
+                    Err(err) => err,
+                    Ok(v) => panic!("[{backend}] {what} of the landing session succeeded: {v}"),
+                };
                 assert!(err.contains(want), "[{backend}] {what}: {err}");
                 assert!(
                     took < Duration::from_millis(1500),

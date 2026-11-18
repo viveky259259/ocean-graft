@@ -514,6 +514,9 @@ fn cmd_new(p: &mut Project, name: &str, from: Option<String>, at: Option<String>
     );
     println!("  path  {}", info.path.display());
     println!("  port  {}", info.port);
+    if let Some(warning) = info.warning {
+        eprintln!("warning: {warning}");
+    }
     Ok(())
 }
 
@@ -1324,6 +1327,8 @@ fn cmd_gc(p: &mut Project) -> Result<()> {
     let latest_id = p.latest().id;
     let mut keep: BTreeSet<String> = p.latest().layers.iter().cloned().collect();
     let mut keep_generations: BTreeSet<u32> = [latest_id].into();
+    // A session being copied without the project lock reads its source.
+    keep.extend(p.state.pending.iter().filter_map(|c| c.source.clone()));
     for s in p.state.sessions.values() {
         keep.extend(s.lowers.iter().cloned());
         if p.state.backend == Backend::Overlay {
