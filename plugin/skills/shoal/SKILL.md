@@ -24,6 +24,7 @@ directory, if it is inside a session).
 | Work is done and should reach the user | `land`. Pass `commit_message` if there are uncommitted changes |
 | The user should see the change running | `preview`, then give the user the URL |
 | Several sessions in progress | `conflicts` before landing any of them |
+| Running tests, a build, or anything else that loads the CPU, in a session | Run it through the job queue with the command in the session's `run` field from `status` (replace `<command>`), not directly. It waits for a free slot, so sessions running at once do not overload the machine. Its exit code and output are the command's |
 | Explore from an earlier state without losing the current one | `fork` with `from` set to the session and `at` set to the checkpoint |
 
 ## Rules

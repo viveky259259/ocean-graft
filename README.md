@@ -289,7 +289,7 @@ Silicon, 16 GB) every step passed:
 cargo test --release
 ```
 
-342 tests drive the real binary against throwaway repositories, on both
+343 tests drive the real binary against throwaway repositories, on both
 backends where they apply. Beyond the lifecycle (isolation, status, diff,
 ports, conflicts, checkpoint and rewind, fork, import, refresh, rm safety,
 remount, gc, sandbox, queue, idle shutdown, wake on request), they cover the

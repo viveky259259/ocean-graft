@@ -10,6 +10,7 @@
 
 use crate::ops::{self, Origin};
 use crate::project::Project;
+use crate::sys;
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::io::Read;
@@ -374,10 +375,11 @@ pub fn session_start(input: &Value) -> Result<Option<String>> {
         "Checkpoints are NOT taken automatically here (this filesystem cannot copy cheaply); call the shoal checkpoint tool yourself before risky steps, and rewind to undo"
     };
     Ok(Some(format!(
-        "You are working in shoal session \"{name}\" (branch {}, port {}), an isolated copy-on-write copy of {} with dependencies installed. Your changes stay here until you land them with the shoal land tool. {checkpoints}; fork to try alternatives, and preview to show the user the running app.",
+        "You are working in shoal session \"{name}\" (branch {}, port {}), an isolated copy-on-write copy of {} with dependencies installed. Your changes stay here until you land them with the shoal land tool. {checkpoints}; fork to try alternatives, and preview to show the user the running app. Run tests and builds from this directory as `{} run -- <command>`: it waits for a free slot in the job queue this machine's sessions share, so parallel sessions do not overload it.",
         s.branch,
         s.port,
-        p.state.source.display()
+        p.state.source.display(),
+        sys::shoal_command()
     )))
 }
 

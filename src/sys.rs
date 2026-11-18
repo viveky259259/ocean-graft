@@ -9,6 +9,28 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// Quote a word for a POSIX shell.
+pub fn shell_quote(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_./=:@%+,".contains(&b));
+    if plain {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
+/// How to invoke this binary from a shell: Claude's Bash tool has no
+/// `shoal` on PATH when the plugin's launcher found or downloaded it.
+pub fn shoal_command() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(shell_quote))
+        .unwrap_or_else(|| "shoal".into())
+}
+
 pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

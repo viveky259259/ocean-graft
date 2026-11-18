@@ -1921,3 +1921,78 @@ fn unsafe_kill_group(pgid: i32) {
         .unwrap();
     assert!(out.status.success(), "kill: {}", stderr(&out));
 }
+
+// ---------------------------------------------------------------------------
+// The queued run command Claude is told to use
+// ---------------------------------------------------------------------------
+
+/// `status` (per session) and the SessionStart context give Claude a
+/// command line for `shoal run`. Claude's Bash tool has no `shoal` on PATH
+/// when the plugin downloaded the binary, so the line names the binary by
+/// its full path, quoted: here a copy in a directory whose name has a space
+/// and a quote. Pasted into a shell, both lines run the command in the
+/// session through the queue and keep its exit code.
+#[test]
+fn the_run_command_in_status_and_session_start_works_from_a_shell() {
+    let env = setup(5587, "clone");
+    let odd = env.root.path().join("it's a dir");
+    fs::create_dir_all(&odd).unwrap();
+    let bin = odd.join("shoal");
+    fs::copy(BIN, &bin).unwrap();
+    let api = |tool: &str, args: Value| -> Value {
+        let out = env
+            .command(bin.to_str().unwrap(), &env.repo())
+            .args(["api", tool, &args.to_string()])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{tool}: {}", stderr(&out));
+        serde_json::from_str(&stdout(&out)).unwrap()
+    };
+    api("fork", json!({"name": "q"}));
+    let status = api("status", json!({}));
+    let run = status["sessions"][0]["run"].as_str().unwrap().to_string();
+    assert!(run.contains("<command>"), "{run}");
+    let session_path = PathBuf::from(status["sessions"][0]["path"].as_str().unwrap());
+
+    // From anywhere (here the user's checkout), the status line targets
+    // the session and keeps the exit code.
+    let line = run.replace("<command>", "sh -c 'pwd > from-status; exit 7'");
+    let out = env
+        .command("sh", &env.repo())
+        .args(["-c", &line])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(7), "{line}: {}", stderr(&out));
+    assert_eq!(
+        fs::canonicalize(read(session_path.join("from-status")).trim()).unwrap(),
+        fs::canonicalize(&session_path).unwrap()
+    );
+    assert!(!env.repo().join("from-status").exists());
+
+    // The SessionStart context's command runs from the session directory.
+    let mut cmd = env.command(bin.to_str().unwrap(), &session_path);
+    cmd.args(["hook", "session-start"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(json!({"cwd": session_path}).to_string().as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let context = stdout(&out);
+    let start = context.find("as `").unwrap() + 4;
+    let end = start + context[start..].find('`').unwrap();
+    let line = context[start..end].replace("<command>", "touch from-context");
+    let out = env
+        .command("sh", &session_path)
+        .args(["-c", &line])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{line}: {}", stderr(&out));
+    assert!(session_path.join("from-context").exists(), "{line}");
+}

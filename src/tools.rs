@@ -216,6 +216,14 @@ fn session_status(p: &Project, name: &str) -> Result<Value> {
         "port": s.port,
         "parent": s.parent,
         "commits": commits,
+        // Tests and builds go through the machine-wide job queue, so
+        // parallel sessions do not overload the machine.
+        "run": format!(
+            "{} run --project {} {} -- <command>",
+            sys::shoal_command(),
+            sys::shell_quote(&p.dir.to_string_lossy()),
+            sys::shell_quote(name)
+        ),
         "uncommitted_count": dirty.len(),
         "uncommitted": dirty.iter().take(50).collect::<Vec<_>>(),
         "idle_secs": idle,
