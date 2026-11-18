@@ -342,7 +342,7 @@ fn fork_name_is_sanitised_and_stays_inside_the_sessions_dir() {
         let env = setup(5409, backend);
         let sessions_dir = env.project_dir().join("sessions");
         let cases = [
-            ("My Feature!", "My-Feature"),
+            ("My Feature!", "my-feature"),
             ("../../etc/passwd", "etc-passwd"),
             ("a//b", "a-b"),
             (".hidden", "hidden"),

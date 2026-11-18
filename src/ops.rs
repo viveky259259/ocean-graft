@@ -145,6 +145,26 @@ pub struct InitReport {
     pub elapsed_ms: u64,
 }
 
+/// On a case-insensitive disk (macOS by default), a repository with paths
+/// that differ only in case cannot be checked out faithfully: one of each
+/// pair silently replaces the other, and landing would commit the damage.
+fn check_case_collisions(tree: &Path) -> Result<()> {
+    if !sys::case_insensitive(tree) {
+        return Ok(());
+    }
+    let files = git::git(tree, &["ls-files", "-z"])?;
+    let mut seen: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+    for f in files.split('\0').filter(|f| !f.is_empty()) {
+        if let Some(other) = seen.insert(f.to_lowercase(), f) {
+            bail!(
+                "the repository has paths that differ only in case ({other} and {f}), and {} does not tell them apart; put SHOAL_HOME on a case-sensitive volume",
+                tree.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Serialises everything that creates or deletes a whole project, so two
 /// agents starting at once cannot both build (or tear down) the template.
 fn init_lock(dir: &Path) -> Result<std::fs::File> {
@@ -224,7 +244,7 @@ pub fn init(o: InitOptions) -> Result<InitReport> {
     }
 
     let dir = project::project_dir_for(&source)?;
-    let _guard = init_lock(&dir)?;
+    let _guard = init_lock_within(&dir, o.setup_deadline)?;
     if dir.join("state.json").exists() {
         bail!(
             "{} already has a shoal project at {}",
@@ -233,7 +253,7 @@ pub fn init(o: InitOptions) -> Result<InitReport> {
         );
     }
     if dir.exists() {
-        std::fs::remove_dir_all(&dir).context("could not clear a half-built project")?;
+        sys::remove_tree(&dir).context("could not clear a half-built project")?;
     }
     for sub in ["layers", "templates", "sessions", "volumes", "checkpoints"] {
         std::fs::create_dir_all(dir.join(sub))?;
@@ -256,6 +276,7 @@ pub fn init(o: InitOptions) -> Result<InitReport> {
                 .arg(&source)
                 .arg(&template),
         )?;
+        check_case_collisions(&template)?;
         // Sessions share the template's packs; they must never repack them.
         git::git(&template, &["config", "gc.auto", "0"])?;
         git::git(&template, &["config", "maintenance.auto", "false"])?;
@@ -297,7 +318,7 @@ pub fn init(o: InitOptions) -> Result<InitReport> {
     let commit = match built {
         Ok(commit) => commit,
         Err(err) => {
-            let _ = std::fs::remove_dir_all(&dir);
+            let _ = sys::remove_tree(&dir);
             return Err(err);
         }
     };
@@ -587,7 +608,7 @@ pub fn refresh(dir: &Path, force: bool, limits: RefreshLimits) -> Result<Refresh
             }
             for d in [abs(&rel), work.clone()] {
                 if d.exists() {
-                    std::fs::remove_dir_all(&d)?;
+                    sys::remove_tree(&d)?;
                 }
                 std::fs::create_dir_all(&d)?;
             }
@@ -601,7 +622,7 @@ pub fn refresh(dir: &Path, force: bool, limits: RefreshLimits) -> Result<Refresh
             let rel = format!("templates/g{id}");
             let d = abs(&rel);
             if d.exists() {
-                std::fs::remove_dir_all(&d)?;
+                sys::remove_tree(&d)?;
             }
             sys::clone_tree(&abs(&latest.layers[0]), &d)?;
             (rel, d)
@@ -610,6 +631,7 @@ pub fn refresh(dir: &Path, force: bool, limits: RefreshLimits) -> Result<Refresh
     let result = (|| -> Result<(usize, bool, Option<String>, Vec<String>)> {
         git::git(&build, &["fetch", "-q", "origin", &branch])?;
         git::git(&build, &["reset", "-q", "--hard", "FETCH_HEAD"])?;
+        check_case_collisions(&build)?;
         let changed: Vec<String> = git::git(
             &build,
             &["diff", "--name-only", &latest.commit, &source_head],
@@ -642,13 +664,13 @@ pub fn refresh(dir: &Path, force: bool, limits: RefreshLimits) -> Result<Refresh
     })();
     if backend == Backend::Overlay {
         sys::unmount(&build)?;
-        std::fs::remove_dir_all(dir.join("build-work"))?;
+        sys::remove_tree(dir.join("build-work"))?;
         std::fs::remove_dir(&build)?;
     }
     let (changed, ran, setup, inputs) = match result {
         Ok(r) => r,
         Err(err) => {
-            let _ = std::fs::remove_dir_all(abs(&rel));
+            let _ = sys::remove_tree(abs(&rel));
             if err.downcast_ref::<OverBudget>().is_some() {
                 return Err(err);
             }
@@ -701,8 +723,10 @@ pub fn refresh(dir: &Path, force: bool, limits: RefreshLimits) -> Result<Refresh
 pub fn sanitize_name(raw: &str) -> String {
     let mut out = String::new();
     for c in raw.chars() {
+        // Lower case: names become directories and branches, and macOS
+        // matches file names (and loose git refs) without regard to case.
         let c = if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
-            c
+            c.to_ascii_lowercase()
         } else {
             '-'
         };
@@ -794,22 +818,41 @@ pub fn create_session(p: &mut Project, name: &str, origin: &Origin) -> Result<Se
     if project::RESERVED_SESSION_NAMES.contains(&name) {
         bail!("{name:?} is reserved (fork from \"main\" means the repository); pick another name");
     }
-    if p.state.sessions.contains_key(name) {
-        bail!("session {name} already exists");
+    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        bail!(
+            "session names are lower case (on macOS, names differing only in case are the same directory): use {:?}",
+            name.to_ascii_lowercase()
+        );
+    }
+    if let Some(other) = p
+        .state
+        .sessions
+        .keys()
+        .find(|k| k.eq_ignore_ascii_case(name))
+    {
+        bail!("session {other} already exists");
     }
     let path = p.session_path(name);
-    // A marker left by an earlier session of the same name is not ours.
-    let _ = std::fs::remove_file(interactive_marker(&p.dir, name));
-    let orphan_checkpoints = p.dir.join("checkpoints").join(name);
-    if orphan_checkpoints.exists() && !p.state.checkpoints.iter().any(|c| c.session == name) {
-        // Left by a removal that crashed after forgetting the session.
-        std::fs::remove_dir_all(&orphan_checkpoints)?;
-    }
+    // Check for leftovers before deleting anything (on a case-insensitive
+    // disk a differently-cased path is another session's).
     if path.symlink_metadata().is_ok() || p.volume_dir(name).exists() {
         bail!(
             "{} is left over from an earlier session; remove it first",
             path.display()
         );
+    }
+    // A marker left by an earlier session of the same name is not ours.
+    let _ = std::fs::remove_file(interactive_marker(&p.dir, name));
+    let orphan_checkpoints = p.dir.join("checkpoints").join(name);
+    if orphan_checkpoints.exists()
+        && !p
+            .state
+            .checkpoints
+            .iter()
+            .any(|c| c.session.eq_ignore_ascii_case(name))
+    {
+        // Left by a removal that crashed after forgetting the session.
+        sys::remove_tree(&orphan_checkpoints)?;
     }
     // Held until this function returns, by when the session is saved.
     let reservation = p.reserve_port()?;
@@ -827,7 +870,7 @@ pub fn create_session(p: &mut Project, name: &str, origin: &Origin) -> Result<Se
             i += 1;
         }
         if let Err(err) = sys::clone_tree(src, &p.abs(&layer)) {
-            let _ = std::fs::remove_dir_all(p.abs(&layer));
+            let _ = sys::remove_tree(p.abs(&layer));
             return Err(err);
         }
         Ok(layer)
@@ -913,7 +956,7 @@ pub fn create_session(p: &mut Project, name: &str, origin: &Origin) -> Result<Se
             // The directory did not exist before (checked above): a failed
             // or partial copy must not be left to block the name.
             if !sys::is_mounted(&path) {
-                let _ = std::fs::remove_dir_all(&path);
+                let _ = sys::remove_tree(&path);
             }
             return Err(err);
         }
@@ -1008,7 +1051,19 @@ pub struct CheckpointInfo {
 pub fn checkpoints_are_cheap(p: &Project) -> bool {
     match p.state.backend {
         Backend::Overlay => true,
-        Backend::Clone if cfg!(target_os = "macos") => true,
+        // APFS clones cost nothing; off APFS (HFS+, exFAT, a network home)
+        // clone_tree falls back to a full copy. Probe once and remember.
+        #[cfg(target_os = "macos")]
+        Backend::Clone => {
+            let marker = p.dir.join(".reflink");
+            if let Ok(v) = std::fs::read_to_string(&marker) {
+                return v.trim() == "yes";
+            }
+            let ok = sys::clones_supported(&p.dir);
+            let _ = std::fs::write(&marker, if ok { "yes\n" } else { "no\n" });
+            ok
+        }
+        #[cfg(not(target_os = "macos"))]
         Backend::Clone => {
             let marker = p.dir.join(".reflink");
             if let Ok(v) = std::fs::read_to_string(&marker) {
@@ -1104,11 +1159,16 @@ fn checkpoint_inner(
     if p.state
         .checkpoints
         .iter()
-        .any(|c| c.session == name && c.label == label)
+        // Ignoring case: on macOS "Before" and "before" are one directory.
+        .any(|c| c.session == name && c.label.eq_ignore_ascii_case(&label))
     {
-        bail!("{name} already has a checkpoint named {label}");
+        bail!("{name} already has a checkpoint named {label} (labels are compared without regard to case)");
     }
     let dst = p.checkpoint_dir(name, &label);
+    if dst.symlink_metadata().is_ok() {
+        // Not ours to delete: a leftover, or another label's files.
+        bail!("{} already exists; pick another label", dst.display());
+    }
     std::fs::create_dir_all(dst.parent().expect("checkpoint dir has a parent"))?;
     sys::sync();
     let copied = match p.state.backend {
@@ -1116,7 +1176,7 @@ fn checkpoint_inner(
         Backend::Clone => sys::clone_tree(&path, &dst),
     };
     if let Err(err) = copied {
-        let _ = std::fs::remove_dir_all(&dst);
+        let _ = sys::remove_tree(&dst);
         return Err(err);
     }
     let head = git::head(&path)?;
@@ -1171,16 +1231,20 @@ fn prune_auto(p: &mut Project, name: &str) -> Result<Vec<String>> {
         .iter()
         .map(|(_, _, l)| l.clone())
         .collect();
-    for label in &drop {
-        let dir = p.checkpoint_dir(name, label);
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir)?;
+    // Best effort: a checkpoint that cannot be deleted keeps its record
+    // (and is tried again next turn); the new checkpoint is never lost.
+    let mut dropped = Vec::new();
+    for label in drop {
+        let dir = p.checkpoint_dir(name, &label);
+        match sys::remove_tree(&dir) {
+            Ok(()) => dropped.push(label),
+            Err(err) => progress(format!("could not prune checkpoint {name}@{label}: {err}")),
         }
     }
     p.state
         .checkpoints
-        .retain(|c| !(c.session == name && c.auto && drop.contains(&c.label)));
-    Ok(drop)
+        .retain(|c| !(c.session == name && c.auto && dropped.contains(&c.label)));
+    Ok(dropped)
 }
 
 #[derive(Serialize, Debug)]
@@ -1367,18 +1431,47 @@ fn restore_in_place(p: &Project, session: &Session, saved: &Path) -> Result<()> 
                 upper.join(rel).symlink_metadata().is_err()
                     && saved.join(rel).symlink_metadata().is_err()
             };
-            let synced = sys::sync_tree(&view, &path, &identical);
+            let synced = sys::sync_tree(&view, &path, &identical, None);
             let _ = sys::unmount(&view);
             let _ = std::fs::remove_dir(&view);
             synced
         }
-        Backend::Clone => sys::sync_tree(saved, &path, &|_| false),
+        // The checkpoint directory was created when its copy started:
+        // live files not written since then match it without reading.
+        Backend::Clone => {
+            let started = saved.metadata().and_then(|m| m.created()).ok();
+            sys::sync_tree(saved, &path, &|_| false, started)
+        }
     }
+}
+
+/// Start the named services of a session again; returns those started and
+/// the errors of those that would not. Records their new state.
+fn restart_services(p: &mut Project, name: &str, which: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut restarted = Vec::new();
+    let mut errors = Vec::new();
+    let Ok(session) = p.session(name).cloned() else {
+        return (restarted, errors);
+    };
+    for (i, svc) in session.services.iter().enumerate() {
+        if which.contains(&svc.name) && services::state(svc) != services::State::Running {
+            let mut svc = svc.clone();
+            match services::start(p, &session, &mut svc) {
+                Ok(()) => restarted.push(svc.name.clone()),
+                Err(err) => errors.push(format!("{}: {err:#}", svc.name)),
+            }
+            if let Some(s) = p.state.sessions.get_mut(name) {
+                s.services[i] = svc;
+            }
+        }
+    }
+    let _ = p.save();
+    (restarted, errors)
 }
 
 /// Forget a checkpoint and delete its files (best effort).
 fn drop_checkpoint(p: &mut Project, name: &str, label: &str) {
-    let _ = std::fs::remove_dir_all(p.checkpoint_dir(name, label));
+    let _ = sys::remove_tree(p.checkpoint_dir(name, label));
     p.state
         .checkpoints
         .retain(|c| !(c.session == name && c.label == label));
@@ -1472,6 +1565,7 @@ pub fn rewind(p: &mut Project, name: &str, label: &str) -> Result<RewindInfo> {
     // Stop the session's own services first: they run in it, and must not
     // count as "a process working in the session".
     if let Err(err) = services::stop_session(p, name, None, false, true) {
+        let _ = restart_services(p, name, &restart);
         if let Some(l) = &saved_as {
             drop_checkpoint(p, name, l);
         }
@@ -1498,6 +1592,8 @@ pub fn rewind(p: &mut Project, name: &str, label: &str) -> Result<RewindInfo> {
         Err(err) => Err(err),
     };
     if let Err(err) = restored {
+        // Whatever happened, start again what the rewind stopped.
+        let _ = restart_services(p, name, &restart);
         // Drop this attempt's safety checkpoint only when the session is
         // provably unchanged (so retries do not push older states out);
         // otherwise it may be the only copy of what was there.
@@ -1518,23 +1614,7 @@ pub fn rewind(p: &mut Project, name: &str, label: &str) -> Result<RewindInfo> {
     let head = git::head(&path)?;
     // The rewind is done; a service that will not start again is reported,
     // not turned into a failure of the whole call.
-    let mut restarted = Vec::new();
-    let mut restart_errors = Vec::new();
-    let session = p.session(name)?.clone();
-    for (i, svc) in session.services.iter().enumerate() {
-        if restart.contains(&svc.name) {
-            let mut svc = svc.clone();
-            match services::start(p, &session, &mut svc) {
-                Ok(()) => restarted.push(svc.name.clone()),
-                Err(err) => restart_errors.push(format!("{}: {err:#}", svc.name)),
-            }
-            p.state
-                .sessions
-                .get_mut(name)
-                .expect("session exists")
-                .services[i] = svc;
-        }
-    }
+    let (restarted, restart_errors) = restart_services(p, name, &restart);
     p.mark_active(name)?;
     Ok(RewindInfo {
         session: name.to_string(),
@@ -1591,6 +1671,14 @@ pub(crate) fn save_branch(source: &Path, session: &Path, name: &str) -> Result<S
 
 /// `rev` of the session saved as `shoal/<name>` (or `-2`, `-3`...).
 fn save_rev(source: &Path, session: &Path, rev: &str, name: &str) -> Result<String> {
+    // Existing shoal/ branches, to skip names that differ only in case: on
+    // macOS a loose ref shoal/api would shadow a packed shoal/Api.
+    let existing: Vec<String> = git::git(
+        source,
+        &["for-each-ref", "--format=%(refname)", "refs/heads/shoal/"],
+    )
+    .map(|o| o.lines().map(str::to_string).collect())
+    .unwrap_or_default();
     let mut last_err = None;
     for i in 1..=50 {
         let branch = if i == 1 {
@@ -1598,6 +1686,13 @@ fn save_rev(source: &Path, session: &Path, rev: &str, name: &str) -> Result<Stri
         } else {
             format!("shoal/{name}-{i}")
         };
+        let full = format!("refs/heads/{branch}");
+        if existing
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case(&full) && *r != full)
+        {
+            continue;
+        }
         let fetched = git::git(
             source,
             &[
@@ -1849,7 +1944,7 @@ pub fn remove(p: &mut Project, name: &str, force: bool, save: bool) -> Result<Re
             progress(format!("kept {name}'s checkpoints in {}", keep.display()));
             kept_checkpoints = Some(keep);
         } else {
-            std::fs::remove_dir_all(&checkpoints)?;
+            sys::remove_tree(&checkpoints)?;
         }
     }
     Ok(RemoveInfo {
@@ -2078,7 +2173,14 @@ fn conflicted_files(path: &Path) -> Vec<String> {
 /// parents are git's business (it refuses if the user changed them).
 fn path_in_the_way(source: &Path, session: &Path, tip: &str, rel: &str) -> bool {
     if source.join(rel).symlink_metadata().is_ok() {
-        return true;
+        // On a case-insensitive disk this may be a tracked file under
+        // another case (a case-only rename): git's business, not in the way.
+        let on_disk = on_disk_name(source, rel);
+        let tracked = on_disk.as_deref().is_some_and(|actual| {
+            actual != rel
+                && git::git(session, &["cat-file", "-e", &format!("{tip}:{actual}")]).is_ok()
+        });
+        return !tracked;
     }
     let tracked_at_tip =
         |p: &str| git::git(session, &["cat-file", "-e", &format!("{tip}:{p}")]).is_ok();
@@ -2092,6 +2194,23 @@ fn path_in_the_way(source: &Path, session: &Path, tip: &str, rel: &str) -> bool 
         }
     }
     false
+}
+
+/// The path `rel` as it is spelled on disk under `root` (the case may differ
+/// from `rel` on a case-insensitive filesystem).
+fn on_disk_name(root: &Path, rel: &str) -> Option<String> {
+    let mut actual = Vec::new();
+    let mut dir = root.to_path_buf();
+    for part in rel.split('/') {
+        let entry = std::fs::read_dir(&dir)
+            .ok()?
+            .flatten()
+            .find(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(part))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        dir = dir.join(&name);
+        actual.push(name);
+    }
+    Some(actual.join("/"))
 }
 
 /// Serialises the final fast-forward of every land in one project.
@@ -2172,9 +2291,13 @@ pub fn land(project_dir: &Path, name: &str, o: &LandOptions) -> Result<LandRepor
                 None => LandReport {
                     status: "timed_out",
                     session: name.to_string(),
+                    // state.json is replaced atomically, so it can be read
+                    // without the lock the land just failed to get.
                     target: o.into.clone().unwrap_or_else(|| {
-                        Project::open_within(project_dir.to_path_buf(), Duration::from_millis(500))
-                            .map(|p| p.state.branch.clone())
+                        std::fs::read(project_dir.join("state.json"))
+                            .ok()
+                            .and_then(|raw| serde_json::from_slice::<project::State>(&raw).ok())
+                            .map(|s| s.branch)
                             .unwrap_or_default()
                     }),
                     commits: 0,

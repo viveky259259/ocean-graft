@@ -406,7 +406,7 @@ impl Project {
                     if pid.parse::<u32>().is_err() {
                         continue;
                     }
-                    std::fs::remove_dir_all(entry.path())
+                    sys::remove_tree(entry.path())
                 } else if let Some(pid) = file.strip_prefix("upper.rewind-") {
                     if pid.parse::<u32>().is_err() {
                         continue;
@@ -415,7 +415,7 @@ impl Project {
                         eprintln!("shoal: restoring session {name} after an interrupted rewind");
                         std::fs::rename(entry.path(), &upper)
                     } else {
-                        std::fs::remove_dir_all(entry.path())
+                        sys::remove_tree(entry.path())
                     }
                 } else {
                     continue;
@@ -449,7 +449,7 @@ impl Project {
                     .rsplit_once('-')
                     .is_some_and(|(_, pid)| pid.parse::<u32>().is_ok())
                 {
-                    let _ = std::fs::remove_dir_all(entry.path());
+                    let _ = sys::remove_tree(entry.path());
                 }
                 continue;
             }
@@ -467,7 +467,7 @@ impl Project {
                 eprintln!("shoal: restoring session {name} after an interrupted rewind");
                 std::fs::rename(entry.path(), &session)
             } else {
-                std::fs::remove_dir_all(entry.path())
+                sys::remove_tree(entry.path())
             };
             if let Err(err) = result {
                 eprintln!(
@@ -615,10 +615,7 @@ impl Project {
                 }
             }
         }
-        let bound = |port: u16| {
-            std::net::TcpListener::bind(("127.0.0.1", port)).is_err()
-                || std::net::TcpListener::bind(("0.0.0.0", port)).is_err()
-        };
+        let bound = sys::port_in_use;
         let block_busy = |base: u16| (base..=base + 9).any(bound);
         let base = u32::from(self.state.port_base);
         let port = (0u32..)
@@ -689,13 +686,13 @@ impl Project {
             }
             let volume = self.volume_dir(name);
             if volume.exists() {
-                std::fs::remove_dir_all(&volume)?;
+                sys::remove_tree(&volume)?;
             }
             if path.exists() {
                 std::fs::remove_dir(&path)?;
             }
         } else if path.exists() {
-            std::fs::remove_dir_all(&path)?;
+            sys::remove_tree(&path)?;
         }
         Ok(())
     }

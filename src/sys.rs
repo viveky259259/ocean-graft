@@ -297,6 +297,14 @@ pub fn is_mounted(_: &Path) -> bool {
 
 /// Bytes allocated on disk under `path`. Symlinks are not followed and mount
 /// points are not crossed, so mounted sessions are not counted twice.
+/// What sizes from `disk_usage` mean: on macOS clones share blocks the
+/// size does not see, so it is an upper bound, not space owned.
+pub const SIZE_NOTE: &str = if cfg!(target_os = "macos") {
+    " (logical size: APFS clones share most of it)"
+} else {
+    ""
+};
+
 pub fn disk_usage(path: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
     fn walk(path: &Path, dev: u64, total: &mut u64) {
@@ -375,10 +383,30 @@ pub fn process_start(pid: i32) -> Option<String> {
         let rest = &stat[stat.rfind(')')? + 1..];
         rest.split_whitespace().nth(19).map(str::to_string)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        // From the kernel, in microseconds since the epoch: unlike `ps -o
+        // lstart`, independent of the time zone and locale, so a trip or a
+        // different LANG never makes shoal disown its own services.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                &mut info as *mut _ as *mut libc::c_void,
+                size,
+            )
+        };
+        (n == size).then(|| format!("{}.{:06}", info.pbi_start_tvsec, info.pbi_start_tvusec))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let out = Command::new("ps")
             .args(["-o", "lstart=", "-p", &pid.to_string()])
+            .env("TZ", "UTC0")
+            .env("LC_ALL", "C")
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .output()
@@ -386,6 +414,58 @@ pub fn process_start(pid: i32) -> Option<String> {
         let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
         (!text.is_empty()).then_some(text)
     }
+}
+
+/// Whether something already listens on `port` on this machine: a test
+/// bind on 127.0.0.1 and 0.0.0.0, and a connection attempt on 127.0.0.1
+/// and ::1. The connection catches listeners a bind misses (on macOS a
+/// bind to 127.0.0.1 succeeds while another process listens on the
+/// wildcard address, and servers often listen on ::1 only).
+pub fn port_in_use(port: u16) -> bool {
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    let bound = TcpListener::bind(("127.0.0.1", port)).is_err()
+        || TcpListener::bind(("0.0.0.0", port)).is_err();
+    if bound {
+        return true;
+    }
+    let answers =
+        |addr: SocketAddr| TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok();
+    answers(SocketAddr::from(([127, 0, 0, 1], port)))
+        || answers(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port)))
+}
+
+/// Whether file names in `dir` are matched without regard to case (the
+/// default on macOS APFS and HFS+).
+pub fn case_insensitive(dir: &Path) -> bool {
+    let probe = dir.join(format!(".shoal-case-probe-{}", std::process::id()));
+    if std::fs::write(&probe, b"").is_err() {
+        return cfg!(target_os = "macos");
+    }
+    let upper = dir.join(format!(".SHOAL-CASE-PROBE-{}", std::process::id()));
+    let insensitive = upper.symlink_metadata().is_ok();
+    let _ = std::fs::remove_file(&probe);
+    insensitive
+}
+
+/// Whether the filesystem holding `dir` can clone files (APFS clonefile).
+#[cfg(target_os = "macos")]
+pub fn clones_supported(dir: &Path) -> bool {
+    let a = dir.join(format!(".shoal-clone-probe-a-{}", std::process::id()));
+    let b = dir.join(format!(".shoal-clone-probe-b-{}", std::process::id()));
+    let _ = std::fs::remove_file(&b);
+    if std::fs::write(&a, b"probe").is_err() {
+        return false;
+    }
+    let ok = match (cstring(&a), cstring(&b)) {
+        (Ok(sa), Ok(sb)) => {
+            let rc = unsafe { libc::clonefile(sa.as_ptr(), sb.as_ptr(), 0) };
+            rc == 0
+        }
+        _ => false,
+    };
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+    ok
 }
 
 /// The working directory of every process this user can see: on Linux
@@ -498,8 +578,9 @@ impl Drop for OwnedGroup {
 
 /// Delete a tree even where it holds read-only directories (which a
 /// normal user cannot empty without first making them writable).
-pub fn remove_tree(path: &Path) -> std::io::Result<()> {
+pub fn remove_tree(path: impl AsRef<Path>) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
+    let path = path.as_ref();
     let meta = match path.symlink_metadata() {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -565,11 +646,27 @@ fn same_contents(a: &Path, b: &Path) -> std::io::Result<bool> {
 /// known to be the same on both sides (for overlay sessions: neither layer
 /// on top of the shared lowers touches it); such entries, and whole
 /// directories, are skipped without reading them.
-pub fn sync_tree(src: &Path, dst: &Path, identical: &dyn Fn(&Path) -> bool) -> Result<()> {
-    sync_dir(src, dst, Path::new(""), identical)
+///
+/// `unchanged_before`: a file in `dst` whose size, mtime and mode match and
+/// whose ctime is earlier than this has not been written since `src` was
+/// copied from it (any write or chmod moves ctime on), so its bytes are not
+/// compared. Pass the time the copy in `src` was started, or None.
+pub fn sync_tree(
+    src: &Path,
+    dst: &Path,
+    identical: &dyn Fn(&Path) -> bool,
+    unchanged_before: Option<std::time::SystemTime>,
+) -> Result<()> {
+    sync_dir(src, dst, Path::new(""), identical, unchanged_before)
 }
 
-fn sync_dir(src: &Path, dst: &Path, rel: &Path, identical: &dyn Fn(&Path) -> bool) -> Result<()> {
+fn sync_dir(
+    src: &Path,
+    dst: &Path,
+    rel: &Path,
+    identical: &dyn Fn(&Path) -> bool,
+    unchanged_before: Option<std::time::SystemTime>,
+) -> Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let set_mode = |p: &Path, mode: u32| -> std::io::Result<()> {
         std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode))
@@ -609,7 +706,7 @@ fn sync_dir(src: &Path, dst: &Path, rel: &Path, identical: &dyn Fn(&Path) -> boo
                 remove(&to)?;
                 std::fs::create_dir(&to)?;
             }
-            sync_dir(&from, &to, &child_rel, identical)?;
+            sync_dir(&from, &to, &child_rel, identical, unchanged_before)?;
             let want = meta.mode() & 0o7777;
             if to.symlink_metadata()?.mode() & 0o7777 != want {
                 set_mode(&to, want)?;
@@ -627,13 +724,25 @@ fn sync_dir(src: &Path, dst: &Path, rel: &Path, identical: &dyn Fn(&Path) -> boo
         } else if ft.is_file() {
             // Same size, time and mode is not proof: package managers stamp
             // every file with one fixed time. Compare the bytes too.
-            let same = existing.as_ref().is_some_and(|m| {
+            let meta_same = existing.as_ref().is_some_and(|m| {
                 m.is_file()
                     && m.len() == meta.len()
                     && m.mtime() == meta.mtime()
                     && m.mtime_nsec() == meta.mtime_nsec()
                     && m.mode() == meta.mode()
-            }) && same_contents(&from, &to).unwrap_or(false);
+            });
+            let untouched = || {
+                let (Some(limit), Some(m)) = (unchanged_before, existing.as_ref()) else {
+                    return false;
+                };
+                let ctime = std::time::UNIX_EPOCH
+                    + std::time::Duration::new(
+                        m.ctime().max(0) as u64,
+                        m.ctime_nsec().max(0) as u32,
+                    );
+                ctime < limit
+            };
+            let same = meta_same && (untouched() || same_contents(&from, &to).unwrap_or(false));
             if !same {
                 remove(&to)?;
                 std::fs::copy(&from, &to)

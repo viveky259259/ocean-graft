@@ -573,3 +573,53 @@ fn timed_out_land_names_its_target() {
     assert_eq!(r["target"], "main", "{r}");
     assert!(r["message"].as_str().unwrap().contains("main"), "{r}");
 }
+
+// ---------------------------------------------------------------------------
+// Round 6: macOS-motivated fixes that can be checked on any platform
+// ---------------------------------------------------------------------------
+
+/// Session names are lower case (APFS matches names without regard to
+/// case): a mixed-case name is refused before anything is touched, and
+/// labels that differ only in case count as the same label.
+#[test]
+fn names_and_labels_are_case_insensitive() {
+    let env = Env::new(6182);
+    env.init("clone");
+    let s = fork(&env, "api");
+    env.api("checkpoint", json!({"session": "api", "label": "Before"}))
+        .unwrap();
+    let out = env.shoal_in(&env.repo(), &["new", "Api"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("lower case"), "{}", stderr(&out));
+    assert!(env.project_dir().join("checkpoints/api/Before").exists());
+    let e = env
+        .api("checkpoint", json!({"session": "api", "label": "before"}))
+        .unwrap_err();
+    assert!(e.contains("already has a checkpoint"), "{e}");
+    assert!(env.project_dir().join("checkpoints/api/Before").exists());
+    let r = env.api("fork", json!({"name": "Mixed-Case"})).unwrap();
+    assert_eq!(r["sessions"][0]["name"], "mixed-case");
+    let _ = s;
+}
+
+/// A read-only directory in a session (a module cache, chmod a-w output)
+/// does not stop discard or checkpoint pruning (macOS runs as a normal
+/// user, where such directories cannot simply be deleted).
+#[test]
+fn read_only_directories_do_not_block_removal() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new(6186);
+    env.init("clone");
+    let s = fork(&env, "ro");
+    let d = s.join("deps/cache/mod");
+    fs::create_dir_all(&d).unwrap();
+    fs::write(d.join("x.go"), "package x\n").unwrap();
+    fs::set_permissions(&d, fs::Permissions::from_mode(0o555)).unwrap();
+    fs::set_permissions(s.join("deps/cache"), fs::Permissions::from_mode(0o555)).unwrap();
+    env.api("checkpoint", json!({"session": "ro", "label": "a"}))
+        .unwrap();
+    let r = env.api("discard", json!({"session": "ro", "keep_work": false}));
+    assert!(r.is_ok(), "{r:?}");
+    assert!(!s.exists(), "session files left");
+    assert!(!env.project_dir().join("checkpoints/ro").exists());
+}

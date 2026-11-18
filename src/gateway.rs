@@ -30,8 +30,30 @@ pub fn free_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
+/// The loopback addresses a service may listen on: dev servers bound to
+/// "localhost" listen on ::1 only on macOS (Node 17 and later).
+fn loopbacks(port: u16) -> [std::net::SocketAddr; 2] {
+    [
+        std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port)),
+    ]
+}
+
 fn answers(port: u16) -> bool {
-    TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_millis(200)).is_ok()
+    loopbacks(port)
+        .iter()
+        .any(|a| TcpStream::connect_timeout(a, Duration::from_millis(200)).is_ok())
+}
+
+fn connect_upstream(port: u16) -> std::io::Result<TcpStream> {
+    let mut last = None;
+    for addr in loopbacks(port) {
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.expect("two addresses tried"))
 }
 
 struct Gateway {
@@ -113,7 +135,7 @@ impl Gateway {
             let _ = client.shutdown(Shutdown::Both);
             return;
         }
-        let upstream = match TcpStream::connect(("127.0.0.1", self.internal_port)) {
+        let upstream = match connect_upstream(self.internal_port) {
             Ok(s) => s,
             Err(err) => {
                 eprintln!(
@@ -155,6 +177,9 @@ fn pipe(mut from: TcpStream, mut to: TcpStream) {
 pub fn run(project_dir: &Path, session: &str, public_port: u16, internal_port: u16) -> Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", public_port))
         .with_context(|| format!("could not listen on port {public_port}"))?;
+    // Browsers try ::1 first for http://localhost; answer there too when
+    // the machine has IPv6 loopback.
+    let listener6 = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, public_port)).ok();
     eprintln!("gateway: port {public_port} -> {internal_port} for {session}, waking it on demand");
     let gateway = Arc::new(Gateway {
         project_dir: project_dir.to_path_buf(),
@@ -164,14 +189,21 @@ pub fn run(project_dir: &Path, session: &str, public_port: u16, internal_port: u
         waking: Mutex::new(()),
         last_touch: Mutex::new(Instant::now() - Duration::from_secs(60)),
     });
-    for stream in listener.incoming() {
-        match stream {
-            Ok(client) => {
-                let gateway = Arc::clone(&gateway);
-                std::thread::spawn(move || gateway.relay(client));
+    let serve = |listener: TcpListener, gateway: Arc<Gateway>| {
+        for stream in listener.incoming() {
+            match stream {
+                Ok(client) => {
+                    let gateway = Arc::clone(&gateway);
+                    std::thread::spawn(move || gateway.relay(client));
+                }
+                Err(err) => eprintln!("gateway: accept failed: {err}"),
             }
-            Err(err) => eprintln!("gateway: accept failed: {err}"),
         }
+    };
+    if let Some(l6) = listener6 {
+        let g = Arc::clone(&gateway);
+        std::thread::spawn(move || serve(l6, g));
     }
+    serve(listener, gateway);
     Ok(())
 }

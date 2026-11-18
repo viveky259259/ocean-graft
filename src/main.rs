@@ -1172,10 +1172,11 @@ fn cmd_checkpoint(p: &mut Project, name: &str, label: Option<String>) -> Result<
     let r = ops::checkpoint(p, name, label.as_deref(), false)?;
     let label = r.label.unwrap_or_default();
     println!(
-        "Checkpoint {name}@{label} at {} in {} ({} stored)",
+        "Checkpoint {name}@{label} at {} in {} ({} stored{})",
         git::short(r.head.as_deref().unwrap_or_default()),
         sys::human_duration(std::time::Duration::from_millis(r.elapsed_ms)),
-        sys::human_bytes(sys::disk_usage(&p.checkpoint_dir(name, &label)))
+        sys::human_bytes(sys::disk_usage(&p.checkpoint_dir(name, &label))),
+        sys::SIZE_NOTE
     );
     Ok(())
 }
@@ -1337,6 +1338,11 @@ fn cmd_gc(p: &mut Project) -> Result<()> {
             continue;
         };
         for entry in entries.flatten() {
+            // Only generation and layer directories (not .DS_Store and the
+            // like that Finder leaves behind).
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
             let file_name = entry.file_name().to_string_lossy().into_owned();
             let rel = format!("{parent}/{file_name}");
             // A generation newer than the latest is being built by a refresh
@@ -1346,9 +1352,14 @@ fn cmd_gc(p: &mut Project) -> Result<()> {
                 .and_then(|n| n.parse::<u32>().ok())
                 .is_some_and(|n| n > latest_id);
             if !keep.contains(&rel) && !building {
-                freed += sys::disk_usage(&entry.path());
-                std::fs::remove_dir_all(entry.path())?;
-                println!("Removed {rel}");
+                let size = sys::disk_usage(&entry.path());
+                match sys::remove_tree(entry.path()) {
+                    Ok(()) => {
+                        freed += size;
+                        println!("Removed {rel}");
+                    }
+                    Err(err) => eprintln!("could not remove {rel}: {err}"),
+                }
             }
         }
     }
@@ -1356,7 +1367,7 @@ fn cmd_gc(p: &mut Project) -> Result<()> {
         .generations
         .retain(|g| keep_generations.contains(&g.id));
     p.save()?;
-    println!("Freed {}", sys::human_bytes(freed));
+    println!("Freed {}{}", sys::human_bytes(freed), sys::SIZE_NOTE);
     Ok(())
 }
 
@@ -1390,8 +1401,9 @@ fn cmd_info(p: &Project) -> Result<()> {
     }
     println!();
     println!(
-        "disk used by the whole project: {}",
-        sys::human_bytes(sys::disk_usage(&p.dir))
+        "disk used by the whole project: {}{}",
+        sys::human_bytes(sys::disk_usage(&p.dir)),
+        sys::SIZE_NOTE
     );
     Ok(())
 }

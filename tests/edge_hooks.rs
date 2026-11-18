@@ -362,7 +362,7 @@ fn create_sanitises_names() {
         (json!("../../etc/passwd"), "etc-passwd".into()),
         (json!("  spaced   name  "), "spaced-name".into()),
         (json!("tab\tnew\nline"), "tab-new-line".into()),
-        (json!("UPPER_case.v2"), "UPPER_case.v2".into()),
+        (json!("UPPER_case.v2"), "upper_case.v2".into()),
         (json!("name;rm -rf ~"), "name-rm-rf".into()),
         (json!("$(touch pwned)"), "touch-pwned".into()),
         (json!(long.clone()), "a".repeat(40)),

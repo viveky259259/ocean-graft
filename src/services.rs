@@ -80,16 +80,12 @@ pub fn describe(service: &Service) -> &'static str {
 /// Fail early, with a clear reason, when another process already listens on
 /// `port`; otherwise a service or gateway would die after we report success.
 pub fn ensure_port_free(port: u16) -> Result<()> {
-    match std::net::TcpListener::bind(("127.0.0.1", port)) {
-        Ok(listener) => {
-            drop(listener);
-            Ok(())
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => bail!(
+    if sys::port_in_use(port) {
+        bail!(
             "port {port} is already in use by another process; stop it, or check `lsof -i :{port}`"
-        ),
-        Err(err) => Err(err).with_context(|| format!("could not check port {port}")),
+        );
     }
+    Ok(())
 }
 
 /// Start the gateway that owns an on-demand service's public port.

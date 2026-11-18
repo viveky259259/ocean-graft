@@ -16,9 +16,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// The most a WorktreeCreate may spend refreshing the template (waiting for
-/// another refresh, running setup), well inside the hook's 900 s timeout in
-/// hooks.json; past it, the session starts from the last good template.
+/// The most a WorktreeCreate may spend preparing the template (first-time
+/// setup, waiting for another refresh, running setup), all together, well
+/// inside the hook's 900 s timeout in hooks.json; past it, the session
+/// starts from the last good template.
 const WORKTREE_REFRESH_BUDGET: Duration = Duration::from_secs(600);
 
 /// How long a WorktreeCreate waits for a refresh another process is running
@@ -92,7 +93,10 @@ pub fn worktree_create(input: &Value) -> Result<PathBuf> {
                 .map(PathBuf::from)
                 .filter(|d| d.is_dir())
                 .unwrap_or(cwd);
-            let dir = match ops::ensure_project_within(&repo, Some(WORKTREE_REFRESH_BUDGET)) {
+            // One budget for everything below, not one per step.
+            let deadline = std::time::Instant::now() + WORKTREE_REFRESH_BUDGET;
+            let left = || deadline.saturating_duration_since(std::time::Instant::now());
+            let dir = match ops::ensure_project_within(&repo, Some(left())) {
                 Ok(dir) => dir,
                 Err(err) if err.downcast_ref::<ops::OverBudget>().is_some() => {
                     // First use, and setup is slower than a hook may wait:
@@ -106,8 +110,8 @@ pub fn worktree_create(input: &Value) -> Result<PathBuf> {
                 Err(err) => return Err(err),
             };
             let limits = ops::RefreshLimits {
-                lock_wait: Some(REFRESH_LOCK_WAIT),
-                setup: Some(WORKTREE_REFRESH_BUDGET),
+                lock_wait: Some(REFRESH_LOCK_WAIT.min(left())),
+                setup: Some(left()),
             };
             match ops::refresh(&dir, false, limits) {
                 Ok(r) if !r.up_to_date => ops::progress(format!(

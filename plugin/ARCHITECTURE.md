@@ -156,3 +156,35 @@ The session is locked for the whole land: `rewind`, `checkpoint`, `fork`
 and `discard` of it fail with a clear message until the land finishes. If
 `timeout_secs` runs out anywhere (a lock, the queue, the tests) the status
 is `timed_out`.
+
+## macOS
+
+shoal ships for macOS first; there it uses the clone backend (APFS
+`clonefile`) and runs as the user, not root. Rules that follow from that:
+
+- **Names are lower case.** APFS matches file names, and git matches loose
+  refs, without regard to case by default. Session names are lower-cased
+  (a mixed-case name is refused), checkpoint labels are compared ignoring
+  case, saved `shoal/` branches skip names that differ only in case, and a
+  repository with paths that differ only in case is refused on a
+  case-insensitive SHOAL_HOME rather than checked out wrongly. A case-only
+  rename is landed normally.
+- **Trees are removed with `remove_tree`,** which opens read-only
+  directories first (Go module caches, `chmod a-w` output): without root,
+  `remove_dir_all` cannot empty them.
+- **Clones are probed, not assumed.** Automatic checkpoints are on only if
+  `clonefile` works where SHOAL_HOME lives (not on HFS+, exFAT or a network
+  home); sizes printed on macOS are logical, since clones share blocks.
+- **Process start times come from the kernel** (`proc_pidinfo`), not from
+  `ps` text, which changes with the time zone and locale.
+- **Loopback means both 127.0.0.1 and ::1.** Dev servers bound to
+  `localhost` listen on ::1 only with recent Node on macOS; the gateway
+  listens and connects on both, and port checks also try to connect,
+  because on macOS a test bind can succeed while another process listens on
+  the wildcard address.
+- **No /proc.** Working directories of processes come from one `lsof` run;
+  if that fails, every session counts as in use.
+
+None of this has run on a Mac yet: the code compiles and passes clippy for
+`aarch64-apple-darwin` and `x86_64-apple-darwin`, and `demo/mac-test.sh`
+(also the `shoal macOS` GitHub workflow) runs the whole test suite there.
