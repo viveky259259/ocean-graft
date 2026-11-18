@@ -186,8 +186,8 @@ shoal ships for macOS first; there it uses the clone backend (APFS
   (`proc_listallpids` and `proc_pidinfo`, as Activity Monitor uses them),
   not from parsing `lsof`; if that fails, every session counts as in use.
 
-None of this has run on a Mac yet. The code compiles and passes clippy for
-`aarch64-apple-darwin` and `x86_64-apple-darwin`; the whole suite passes on
-Linux both as root and as an unprivileged user (as on a Mac, where
-permissions apply); and `demo/mac-test.sh` (also the `shoal macOS` GitHub
-workflow) runs the whole suite on a Mac.
+Verified on a real Mac (macOS 27, Apple Silicon, APFS, as a normal user):
+the whole suite and `demo/mac-test.sh` pass, including the four-session
+demo, the 100-session scale test and the APFS benchmark. CI lints for
+`aarch64-apple-darwin` and `x86_64-apple-darwin` and runs the Mac test on
+macOS.

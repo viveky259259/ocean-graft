@@ -22,6 +22,31 @@ shoal conflicts                            # overlaps and real conflicts, before
 shoal import --all                         # commits come back as shoal/<name> branches
 ```
 
+## Claude Code plugin
+
+[`plugin/`](plugin/) makes shoal something Claude uses on its own. Claude is
+the operator: it forks, checkpoints, rewinds, previews and lands through MCP
+tools, and hooks give every `claude --worktree` session and every subagent
+with `isolation: worktree` its own shoal session automatically.
+
+```bash
+cargo build --release                      # the plugin runs target/release/shoal
+claude --plugin-dir ./plugin               # or install it from a marketplace
+```
+
+| Tool | What Claude uses it for |
+|---|---|
+| `status` | Where it is: the project, every session, checkpoints, services, overlaps |
+| `fork` | New sessions from the repository, a session, or a checkpoint; `count` for best-of-N |
+| `checkpoint` / `rewind` | Save a state before a risky step; go back (a rewind can itself be undone) |
+| `conflicts` | Which sessions would collide, before landing any |
+| `land` | Rebase onto the user's branch, run the tests, fast-forward; never force |
+| `preview` | Start the session's dev server and hand the user a URL |
+| `discard` | Remove a session, saving its work to a branch first |
+
+How the plugin keeps Claude Code safe (exit codes, stdout, locks, crash
+recovery, the macOS rules) is in [`plugin/ARCHITECTURE.md`](plugin/ARCHITECTURE.md).
+
 ## Commands
 
 | Command | What it does |
@@ -53,12 +78,16 @@ shoal import --all                         # commits come back as shoal/<name> b
 | Backend | Platform | How a session is made | Tested |
 |---|---|---|---|
 | `overlay` | Linux, as root | overlayfs: template layers are read-only lowers, the session is the upper dir. Constant time, stores only changes. | Yes: end-to-end tests and the live run below |
-| `clone` | macOS | One `clonefile(2)` call on the template directory (APFS copy-on-write). Grows with the number of entries. | Type-checked for `aarch64-apple-darwin`; **not yet run on a Mac** |
+| `clone` | macOS | One `clonefile(2)` call on the template directory (APFS copy-on-write). Grows with the number of entries. | Yes: the whole suite and `demo/mac-test.sh` on macOS 27 (Apple Silicon) |
 | `clone` | Linux, any user | `cp -a --reflink=auto`: shares blocks on XFS and btrfs, full copy elsewhere | Yes: end-to-end tests |
 
 `--sandbox` uses bubblewrap on Linux. Everything outside the session becomes
 read-only, the command gets a private `/tmp`, and other sessions and the
 template are hidden. It is not available on macOS yet.
+
+On macOS shoal follows a few extra rules (lower-case session names for the
+case-insensitive APFS, kernel process data instead of `ps`/`lsof`, IPv6
+loopback for previews); see [`plugin/ARCHITECTURE.md`](plugin/ARCHITECTURE.md#macos).
 
 ## How it works
 
@@ -88,7 +117,8 @@ template are hidden. It is not available on macOS yet.
 - **Templates are never modified.** Sessions set `gc.auto=0` so they never
   repack shared objects. `refresh` builds a new generation on top of the old
   one; running sessions keep theirs.
-- **Ports.** Session *n* gets `4100 + 10n` as `SHOAL_PORT`, and as `PORT`
+- **Ports.** Each session gets a block of ten from `port_base` (4100 by
+  default), unique on the machine; its first port is `SHOAL_PORT`, and `PORT`
   unless `PORT` is already set.
 
 ## Live test: four agents on one repo
@@ -216,30 +246,46 @@ Measured with [`demo/resources.py`](demo/resources.py) on the notes app
 The queue does not make this workload faster. It cuts peak memory by about
 four times, which is what lets many sessions share a laptop.
 
+## On a Mac
+
+[`demo/mac-test.sh`](demo/mac-test.sh) runs everything above on a Mac: the
+test suite on APFS, the four-session demo replaying the agents' work, the
+100-session scale test and the APFS benchmark. On macOS 27 (10-core Apple
+Silicon, 16 GB) every step passed:
+
+| What | Result |
+|---|---|
+| Create a session | 13–15 ms (one `clonefile` of the template), no slowdown up to 100 sessions |
+| Disk for 100 sessions | 99 MB really used (9.8 GB logical, shared by APFS clones) |
+| Copy strategies, demo app (1,517 files) | one directory `clonefile` 9.9 ms, per-file `cp -Rc` 186 ms, cloned disk image 224 ms plus attach ([results](bench/results/macos-27-arm64-demo-app.json)) |
+| 40 test runs at once | all passed, 335 runs/min |
+| Automatic checkpoint at the end of a turn | about 90 ms |
+
 ## Tests
 
 ```bash
 cargo test --release
 ```
 
-The tests drive the real binary against a throwaway repository. They cover
-the full lifecycle on both backends: isolation, status, diff, ports,
-conflicts, checkpoint and rewind, fork, import, refresh, rm safety, remount
-and gc. They also cover sandbox confinement, the queue never running more
-jobs than it has slots, and idle shutdown, which stops the idle session's
-server, keeps the busy one, then wakes, stops and removes them. Two more
-cover the incremental conflict check and wake on request with a real HTTP
-server. The overlay test needs root and is skipped otherwise.
+336 tests drive the real binary against throwaway repositories, on both
+backends where they apply. Beyond the lifecycle (isolation, status, diff,
+ports, conflicts, checkpoint and rewind, fork, import, refresh, rm safety,
+remount, gc, sandbox, queue, idle shutdown, wake on request), they cover the
+plugin end to end: the MCP protocol, every hook, every land outcome,
+concurrency and crash recovery, and configuration. They pass on Linux as
+root and as a normal user, and on macOS. The overlay tests need root and are
+skipped otherwise.
 
 ## Limitations
 
 - The overlay backend needs root. As an ordinary user on Linux, `clone` is
-  used instead; it copies files unless the filesystem supports reflinks.
-- macOS support has been type-checked but not run.
+  used instead; it copies files unless the filesystem supports reflinks, and
+  that copy is made while the project is locked.
 - A checkpoint or fork of a session that is being written to is not atomic.
-  Take them between agent turns.
-- Rewinding an overlay session unmounts it, so nothing may be running inside
-  it at the time.
+  Take them between agent turns (the plugin's automatic checkpoints are).
+- A session someone is working in is rewound in place, file by file; if that
+  is interrupted, the `pre-rewind-N` checkpoint it took first is the way back.
+- `--sandbox` is Linux only (bubblewrap).
 - Ports are allocated in blocks of ten that do not overlap any other
   session's block on the machine, and a block something already listens on
   is skipped; a port taken later by another program is not noticed.
