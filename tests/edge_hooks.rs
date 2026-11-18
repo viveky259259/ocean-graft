@@ -2187,12 +2187,14 @@ fn worktree_hooks_wait_for_the_project_lock() {
 /// forks with the parent's work, WorktreeRemove saves the work first.
 #[test]
 fn overlay_hooks_work_after_unmount() {
-    if !overlay_available() {
+    // Overlay only: it checks what happens once `down` unmounts a session,
+    // which clone sessions (macOS) never are.
+    if !backends().contains(&"overlay") {
         eprintln!("skipping: needs the overlay backend");
         return;
     }
     let env = Env::new(5288);
-    env.init(cheap_backend().unwrap());
+    env.init("overlay");
     let repo = env.repo();
     let s = fork(&env, "s");
     fs::write(s.join("src/app.txt"), "before unmount\n").unwrap();

@@ -785,8 +785,14 @@ fn test_timeout_kills_the_whole_process_group() {
         assert_eq!(r["tests"]["timed_out"], true, "{r}");
         assert_eq!(r["tests"]["passed"], false);
         assert!(r["tests"]["exit_code"].is_null(), "{r}");
+        // timeout_secs bounds the whole land (rebase and queue included), so
+        // the tests themselves may get a little under a second of it.
         let ms = r["tests"]["duration_ms"].as_u64().unwrap();
-        assert!((1000..10_000).contains(&ms), "duration {ms}ms");
+        assert!(ms < 10_000, "duration {ms}ms");
+        assert!(
+            took >= Duration::from_secs(1),
+            "land ended before its time limit: {took:?}"
+        );
         assert!(took < Duration::from_secs(20), "land took {took:?}");
         for f in [&bg, &fg] {
             let pid: i32 = read(f).trim().parse().unwrap();

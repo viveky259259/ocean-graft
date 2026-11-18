@@ -544,10 +544,12 @@ fn mcp_initialize_negotiates_a_known_revision() {
 #[test]
 fn mcp_children_get_the_default_sigpipe_disposition() {
     // Passes only if SIGPIPE (signal 13, bit 0x1000) is not ignored.
-    // Linux: SigIgn in /proc; macOS: ps's sigignore column (both hex masks).
+    // Linux: the SigIgn mask in /proc. Elsewhere (macOS, whose ps has no
+    // such column and whose sh does not list it in `trap`): perl reports the
+    // inherited disposition as $SIG{PIPE} eq "IGNORE" (checked on a Mac).
     let check = "if [ -r /proc/$$/status ]; then ign=$(sed -n 's/^SigIgn:[[:space:]]*//p' /proc/$$/status); \
-                 else ign=$(ps -o sigignore= -p $$ | tr -d ' '); fi; \
-                 [ $(( 0x$ign & 0x1000 )) -eq 0 ] || { echo \"SIGPIPE ignored: $ign\"; exit 1; }";
+                 [ $(( 0x$ign & 0x1000 )) -eq 0 ] || { echo \"SIGPIPE ignored: $ign\"; exit 1; }; \
+                 else perl -e 'exit((defined $SIG{PIPE} && $SIG{PIPE} eq q(IGNORE)) ? 1 : 0)' || { echo 'SIGPIPE ignored'; exit 1; }; fi";
     for backend in backends() {
         let env = Env::new(6000);
         env.init(backend);
