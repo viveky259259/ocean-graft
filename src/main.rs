@@ -133,6 +133,8 @@ enum Cmd {
     /// Run a command in a session (sets SHOAL_SESSION, SHOAL_PORT and PORT)
     Exec {
         /// Linux: make everything outside the session read-only and hide other sessions
+        /// Let the command write only inside the session, and hide the rest
+        /// of the project (bubblewrap on Linux, sandbox-exec on macOS)
         #[arg(long)]
         sandbox: bool,
         name: String,
@@ -146,6 +148,8 @@ enum Cmd {
         /// Queue slots this job needs (a build that uses every core can take more)
         #[arg(long, default_value_t = 1)]
         slots: usize,
+        /// Let the command write only inside the session, and hide the rest
+        /// of the project (bubblewrap on Linux, sandbox-exec on macOS)
         #[arg(long)]
         sandbox: bool,
         #[arg(last = true, required = true)]
@@ -206,6 +210,8 @@ enum Cmd {
     Touch { name: String },
     /// Open a shell in a session
     Shell {
+        /// Let the command write only inside the session, and hide the rest
+        /// of the project (bubblewrap on Linux, sandbox-exec on macOS)
         #[arg(long)]
         sandbox: bool,
         name: String,
@@ -802,9 +808,32 @@ fn cmd_diff(p: &Project, name: &str, stat: bool) -> Result<i32> {
     sys::interactive(&mut cmd)
 }
 
-fn sandbox_command(project_dir: &Path, session: &Path, command: &[String]) -> Result<Command> {
+/// A directory removed when this is dropped: a sandboxed command's own
+/// temporary directory, which lives as long as the command.
+struct TempDir(Option<PathBuf>);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        if let Some(dir) = self.0.take() {
+            let _ = sys::remove_tree(&dir);
+        }
+    }
+}
+
+/// `command`, confined: it can write only to the session (and a temporary
+/// directory of its own), and cannot see the template, the other sessions
+/// or the checkpoints. bubblewrap on Linux, Seatbelt (sandbox-exec) on
+/// macOS.
+fn sandbox_command(
+    project_dir: &Path,
+    session: &Path,
+    command: &[String],
+) -> Result<(Command, TempDir)> {
+    if cfg!(target_os = "macos") {
+        return seatbelt_command(project_dir, session, command);
+    }
     if !cfg!(target_os = "linux") {
-        bail!("--sandbox is only available on Linux for now");
+        bail!("--sandbox is only available on Linux and macOS");
     }
     if Command::new("bwrap").arg("--version").output().is_err() {
         bail!("--sandbox needs bubblewrap (bwrap) on PATH");
@@ -825,10 +854,72 @@ fn sandbox_command(project_dir: &Path, session: &Path, command: &[String]) -> Re
         .arg(session)
         .arg("--")
         .args(command);
-    Ok(cmd)
+    Ok((cmd, TempDir(None)))
 }
 
-/// The command to run in a session, with its working directory and environment.
+/// A string in a Seatbelt profile.
+fn sbpl_string(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// The Seatbelt profile for a sandboxed command: everything is allowed
+/// except writing outside the session, its temporary directory and /dev,
+/// and reading the rest of the project. Later rules win over earlier ones.
+fn seatbelt_profile(project_dir: &Path, session: &Path, tmp: &Path) -> String {
+    let (project, sessions) = (
+        sbpl_string(project_dir),
+        sbpl_string(&project_dir.join("sessions")),
+    );
+    let (session, tmp) = (sbpl_string(session), sbpl_string(tmp));
+    format!(
+        "(version 1)\n\
+         (allow default)\n\
+         (deny file-write*)\n\
+         (allow file-write* (subpath {session}) (subpath {tmp}) (subpath \"/dev\"))\n\
+         (deny file-read* (subpath {project}))\n\
+         (allow file-read* (subpath {session}) (subpath {tmp}))\n\
+         (allow file-read-metadata (literal {project}) (literal {sessions}))\n"
+    )
+}
+
+fn seatbelt_command(
+    project_dir: &Path,
+    session: &Path,
+    command: &[String],
+) -> Result<(Command, TempDir)> {
+    const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+    if !Path::new(SANDBOX_EXEC).exists() {
+        bail!("--sandbox needs {SANDBOX_EXEC}, which this macOS does not have");
+    }
+    // Seatbelt matches real paths (/private/var, not /var).
+    let project_dir = project_dir
+        .canonicalize()
+        .with_context(|| format!("{} does not exist", project_dir.display()))?;
+    let session = session
+        .canonicalize()
+        .with_context(|| format!("{} does not exist", session.display()))?;
+    let name = session
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = project_dir
+        .join("sandbox-tmp")
+        .join(format!("{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).with_context(|| format!("could not create {}", tmp.display()))?;
+    let guard = TempDir(Some(tmp.clone()));
+    let mut cmd = Command::new(SANDBOX_EXEC);
+    cmd.arg("-p")
+        .arg(seatbelt_profile(&project_dir, &session, &tmp))
+        .args(command)
+        .env("TMPDIR", &tmp)
+        .env("XDG_CACHE_HOME", tmp.join(".cache"))
+        .env("npm_config_cache", tmp.join(".npm"));
+    Ok((cmd, guard))
+}
+
+/// The command to run in a session, with its working directory and
+/// environment, and what to keep until it has finished.
 fn session_command(
     project_dir: &Path,
     path: &Path,
@@ -836,13 +927,13 @@ fn session_command(
     port: u16,
     sandbox: bool,
     command: &[String],
-) -> Result<Command> {
-    let mut cmd = if sandbox {
+) -> Result<(Command, TempDir)> {
+    let (mut cmd, tmp) = if sandbox {
         sandbox_command(project_dir, path, command)?
     } else {
         let mut cmd = Command::new(&command[0]);
         cmd.args(&command[1..]);
-        cmd
+        (cmd, TempDir(None))
     };
     cmd.current_dir(path)
         .env("SHOAL_SESSION", name)
@@ -851,7 +942,7 @@ fn session_command(
     if std::env::var_os("PORT").is_none() {
         cmd.env("PORT", port.to_string());
     }
-    Ok(cmd)
+    Ok((cmd, tmp))
 }
 
 fn cmd_exec(mut p: Project, name: &str, sandbox: bool, command: Vec<String>) -> Result<i32> {
@@ -860,7 +951,7 @@ fn cmd_exec(mut p: Project, name: &str, sandbox: bool, command: Vec<String>) -> 
     p.mark_active(name)?;
     let project_dir = p.dir.clone();
     drop(p); // release the project lock while the command runs
-    let mut cmd = session_command(&project_dir, &path, name, port, sandbox, &command)?;
+    let (mut cmd, _tmp) = session_command(&project_dir, &path, name, port, sandbox, &command)?;
     sys::supervised(&mut cmd)
 }
 
@@ -906,7 +997,7 @@ fn cmd_run(
     if waited.as_millis() >= 100 {
         eprintln!("shoal: got a slot after {}", sys::human_duration(waited));
     }
-    let mut cmd = session_command(&project_dir, &path, &name, port, sandbox, &command)?;
+    let (mut cmd, _tmp) = session_command(&project_dir, &path, &name, port, sandbox, &command)?;
     let code = sys::supervised(&mut cmd);
     drop(held);
     // The job counts as activity too; best effort, the job's result matters more.
@@ -1371,6 +1462,23 @@ fn cmd_gc(p: &mut Project) -> Result<()> {
             }
         }
     }
+    // Temporary directories of sandboxed commands that did not clean up
+    // (killed), named <session>-<pid>.
+    if let Ok(entries) = std::fs::read_dir(p.dir.join("sandbox-tmp")) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            let pid = file_name
+                .rsplit_once('-')
+                .and_then(|(_, pid)| pid.parse::<i32>().ok());
+            let running = pid.is_some_and(|pid| {
+                (unsafe { libc::kill(pid, 0) } == 0)
+                    || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+            });
+            if !running && sys::remove_tree(entry.path()).is_ok() {
+                println!("Removed sandbox-tmp/{file_name}");
+            }
+        }
+    }
     p.state
         .generations
         .retain(|g| keep_generations.contains(&g.id));
@@ -1414,4 +1522,41 @@ fn cmd_info(p: &Project) -> Result<()> {
         sys::SIZE_NOTE
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seatbelt_strings_escape_quotes_and_backslashes() {
+        assert_eq!(sbpl_string(Path::new("/a b/c")), "\"/a b/c\"");
+        assert_eq!(
+            sbpl_string(Path::new("/it's \"x\"\\y")),
+            "\"/it's \\\"x\\\"\\\\y\""
+        );
+    }
+
+    #[test]
+    fn seatbelt_profile_denies_then_allows_the_session() {
+        let profile = seatbelt_profile(
+            Path::new("/p"),
+            Path::new("/p/sessions/a"),
+            Path::new("/p/sandbox-tmp/a-1"),
+        );
+        // Later rules win: each allow comes after the deny it narrows.
+        let at = |needle: &str| {
+            profile
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} missing:\n{profile}"))
+        };
+        assert!(at("(deny file-write*)") < at("(allow file-write* (subpath \"/p/sessions/a\")"));
+        assert!(
+            at("(deny file-read* (subpath \"/p\"))")
+                < at("(allow file-read* (subpath \"/p/sessions/a\")")
+        );
+        assert!(profile.contains("(subpath \"/p/sandbox-tmp/a-1\")"));
+        assert!(profile.contains("(literal \"/p/sessions\")"));
+        assert!(profile.starts_with("(version 1)\n(allow default)\n"));
+    }
 }

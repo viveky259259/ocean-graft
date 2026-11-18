@@ -103,9 +103,13 @@ MIT; see [`LICENSE`](LICENSE).
 | `clone` | macOS | One `clonefile(2)` call on the template directory (APFS copy-on-write). Grows with the number of entries. | Yes: the whole suite and `demo/mac-test.sh` on macOS 27 (Apple Silicon) |
 | `clone` | Linux, any user | `cp -a --reflink=auto`: shares blocks on XFS and btrfs, full copy elsewhere | Yes: end-to-end tests |
 
-`--sandbox` uses bubblewrap on Linux. Everything outside the session becomes
-read-only, the command gets a private `/tmp`, and other sessions and the
-template are hidden. It is not available on macOS yet.
+`--sandbox` (on `exec` and `run`) confines a command to its session:
+everything outside it is read-only, the command gets a private temporary
+directory, and the other sessions, the template and the checkpoints are
+hidden. On Linux it uses bubblewrap, with a private `/tmp`. On macOS it uses
+Seatbelt (`sandbox-exec`): writes outside the session, its `$TMPDIR` and
+`/dev` are refused, and the rest of the project cannot be read. A tool that
+writes to `/tmp` directly instead of `$TMPDIR` is refused there.
 
 On macOS shoal follows a few extra rules (lower-case session names for the
 case-insensitive APFS, kernel process data instead of `ps`/`lsof`, IPv6
@@ -311,7 +315,10 @@ skipped otherwise.
   session is retried, and after three tries kept with a `warning`.
 - A session someone is working in is rewound in place, file by file; if that
   is interrupted, the `pre-rewind-N` checkpoint it took first is the way back.
-- `--sandbox` is Linux only (bubblewrap).
+- `--sandbox` is not a security boundary against a hostile program: it
+  keeps an agent's commands from writing outside its session by mistake.
+  It does not restrict the network. On macOS, `sandbox-exec` is deprecated
+  by Apple, though still shipped and used by build tools.
 - Ports are allocated in blocks of ten that do not overlap any other
   session's block on the machine, and a block something already listens on
   is skipped; a port taken later by another program is not noticed.

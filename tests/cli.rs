@@ -256,8 +256,13 @@ extern "C" {
 
 #[test]
 fn sandbox_confines_writes() {
-    if !cfg!(target_os = "linux") || Command::new("bwrap").arg("--version").output().is_err() {
-        eprintln!("skipped: needs bubblewrap on Linux");
+    let available = if cfg!(target_os = "macos") {
+        Path::new("/usr/bin/sandbox-exec").exists()
+    } else {
+        cfg!(target_os = "linux") && Command::new("bwrap").arg("--version").output().is_ok()
+    };
+    if !available {
+        eprintln!("skipped: needs bubblewrap on Linux or sandbox-exec on macOS");
         return;
     }
     let env = Env::new();
@@ -270,7 +275,10 @@ fn sandbox_confines_writes() {
     let script = format!(
         "echo ok > inside.txt; \
          (echo x > {outside}) 2>/dev/null && echo OUTSIDE=written || echo OUTSIDE=denied; \
-         [ -e {b} ] && echo SIBLING=visible || echo SIBLING=hidden",
+         [ -e {b} ] && echo SIBLING=visible || echo SIBLING=hidden; \
+         (echo t > \"${{TMPDIR:-/tmp}}/scratch\") 2>/dev/null && echo TMP=writable || echo TMP=denied; \
+         echo TMPDIR=${{TMPDIR:-/tmp}}; \
+         echo x 2>/dev/null > /dev/null && echo DEVNULL=ok",
         outside = outside.display(),
         b = b.display()
     );
@@ -281,8 +289,25 @@ fn sandbox_confines_writes() {
         assert!(out.contains("OUTSIDE=denied"), "{out}");
     }
     assert!(out.contains("SIBLING=hidden"), "{out}");
+    assert!(out.contains("TMP=writable"), "{out}");
+    assert!(out.contains("DEVNULL=ok"), "{out}");
     assert!(env.path("a").join("inside.txt").exists());
     assert!(!outside.exists());
+    // The command's temporary directory went with it.
+    let tmpdir = out
+        .lines()
+        .find_map(|l| l.strip_prefix("TMPDIR="))
+        .unwrap()
+        .to_string();
+    if cfg!(target_os = "macos") {
+        assert!(!Path::new(&tmpdir).exists(), "{tmpdir} was left behind");
+    }
+    // A shell's own exit code comes through.
+    let out = env.shoal_in(
+        &env.repo(),
+        &["exec", "--sandbox", "a", "--", "sh", "-c", "exit 3"],
+    );
+    assert_eq!(out.status.code(), Some(3));
 }
 
 extern "C" {
