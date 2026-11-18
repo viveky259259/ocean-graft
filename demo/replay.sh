@@ -7,6 +7,11 @@
 #
 # BASE_REPO defaults to ~/shoal-demo/notes-app. Exits non-zero if any check fails.
 set -euo pipefail
+# Plain test output, whatever the caller's terminal settings (a Mac shell
+# often sets FORCE_COLOR or CLICOLOR_FORCE): results are matched as text.
+export NO_COLOR=1
+unset FORCE_COLOR CLICOLOR_FORCE
+strip_colors() { sed -e $'s/\x1b\\[[0-9;]*m//g'; }
 set -m # each background job gets its own process group, so servers can be stopped cleanly
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -32,7 +37,7 @@ echo "== Tests and typecheck in every session"
 expected=(7 8 6 11)
 for i in "${!sessions[@]}"; do
   s="${sessions[$i]}"
-  result="$(shoal exec "$s" -- npx vitest run 2>&1 | grep -E 'Tests ' | tr -s ' ')"
+  result="$(shoal exec "$s" -- npx vitest run 2>&1 | strip_colors | grep -E 'Tests ' | tr -s ' ')"
   shoal exec "$s" -- npx tsc --noEmit || fail "$s: typecheck"
   printf '  %-11s %s, typecheck ok\n' "$s" "$result"
   [[ "$result" == *"${expected[$i]} passed (${expected[$i]})"* ]] || fail "$s: expected ${expected[$i]} passing tests"

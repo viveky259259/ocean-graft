@@ -10,6 +10,11 @@
 # on Linux, clone otherwise).
 # Needs: shoal on PATH (cargo build --release in tools/shoal), git, node 22.12+.
 set -euo pipefail
+# Plain test output, whatever the caller's terminal settings (a Mac shell
+# often sets FORCE_COLOR or CLICOLOR_FORCE): results are matched as text.
+export NO_COLOR=1
+unset FORCE_COLOR CLICOLOR_FORCE
+strip_colors() { sed -e $'s/\x1b\\[[0-9;]*m//g'; }
 
 here="$(cd "$(dirname "$0")" && pwd)"
 work="${1:-$HOME/shoal-demo}"
@@ -42,7 +47,7 @@ echo
 echo "Running the test suite in every session (no install step):"
 for s in "${sessions[@]}"; do
   printf '  %-11s ' "$s"
-  shoal exec "$s" -- npx vitest run 2>&1 | grep -E "Tests " | tr -s ' '
+  shoal exec "$s" -- npx vitest run 2>&1 | strip_colors | grep -E "Tests " | tr -s ' '
   shoal checkpoint "$s" start >/dev/null
 done
 
