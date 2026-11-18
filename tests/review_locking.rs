@@ -122,17 +122,6 @@ fn wait_for(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
     }
 }
 
-/// Gone, or a zombie nobody has reaped yet (it no longer runs).
-fn pid_gone(pid: i32) -> bool {
-    match fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Err(_) => true,
-        Ok(stat) => stat
-            .rsplit_once(')')
-            .map(|(_, rest)| rest.trim_start().starts_with('Z'))
-            .unwrap_or(false),
-    }
-}
-
 fn tip(env: &Env, branch: &str) -> String {
     env.git(&env.repo(), &["rev-parse", branch])
         .trim()

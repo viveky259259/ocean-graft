@@ -768,6 +768,7 @@ fn parallel_stop_hooks_on_one_session_take_at_most_one_checkpoint() {
         }
         let state = check_invariants(&env);
         let cheap = backend == "overlay"
+            || cfg!(target_os = "macos")
             || fs::read_to_string(env.project_dir().join(".reflink"))
                 .map(|v| v.trim() == "yes")
                 .unwrap_or(false);

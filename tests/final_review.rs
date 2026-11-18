@@ -162,7 +162,7 @@ fn rewind_of_a_busy_session_restores_in_place() {
             "[{backend}]"
         );
         // The process's cwd is still the live session, not a deleted copy.
-        let cwd = fs::read_link(format!("/proc/{}/cwd", shell.id())).unwrap();
+        let cwd = process_cwd(shell.id()).expect("the shell's cwd");
         assert!(
             !cwd.to_string_lossy().contains("(deleted)"),
             "[{backend}] {cwd:?}"

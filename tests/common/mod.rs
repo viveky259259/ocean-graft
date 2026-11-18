@@ -46,6 +46,55 @@ pub fn backends() -> Vec<&'static str> {
     v
 }
 
+/// The backend on which checkpoints are cheap here, so the Stop hook takes
+/// them: overlay on Linux as root, clone on macOS (APFS clonefile).
+pub fn cheap_backend() -> Option<&'static str> {
+    if cfg!(target_os = "linux") && is_root() {
+        Some("overlay")
+    } else if cfg!(target_os = "macos") {
+        Some("clone")
+    } else {
+        None
+    }
+}
+
+/// Gone, or a zombie waiting to be reaped (kill(pid, 0) succeeds on those).
+pub fn pid_gone(pid: i32) -> bool {
+    if !alive(pid) {
+        return true;
+    }
+    if cfg!(target_os = "linux") {
+        return match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat
+                .rsplit_once(')')
+                .map(|(_, rest)| rest.trim_start().starts_with('Z'))
+                .unwrap_or(false),
+            Err(_) => true,
+        };
+    }
+    // macOS and the BSDs: ps reports a zombie's state as Z.
+    let out = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    let st = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    st.is_empty() || st.starts_with('Z')
+}
+
+/// The working directory of process `pid`.
+pub fn process_cwd(pid: u32) -> Option<PathBuf> {
+    if cfg!(target_os = "linux") {
+        return fs::read_link(format!("/proc/{pid}/cwd")).ok();
+    }
+    let out = Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix('n').map(PathBuf::from))
+}
+
 pub fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }

@@ -544,7 +544,9 @@ fn mcp_initialize_negotiates_a_known_revision() {
 #[test]
 fn mcp_children_get_the_default_sigpipe_disposition() {
     // Passes only if SIGPIPE (signal 13, bit 0x1000) is not ignored.
-    let check = "ign=$(sed -n 's/^SigIgn:[[:space:]]*//p' /proc/$$/status); \
+    // Linux: SigIgn in /proc; macOS: ps's sigignore column (both hex masks).
+    let check = "if [ -r /proc/$$/status ]; then ign=$(sed -n 's/^SigIgn:[[:space:]]*//p' /proc/$$/status); \
+                 else ign=$(ps -o sigignore= -p $$ | tr -d ' '); fi; \
                  [ $(( 0x$ign & 0x1000 )) -eq 0 ] || { echo \"SIGPIPE ignored: $ign\"; exit 1; }";
     for backend in backends() {
         let env = Env::new(6000);
@@ -1029,14 +1031,15 @@ fn reused_pid_is_never_reported_running_or_signalled() {
         env.api("fork", json!({"name": "reuse"})).unwrap();
         let mut other = Unrelated::start();
         let pid = other.pid();
-        // Its real start time is not "1".
-        let stat = read(format!("/proc/{pid}/stat"));
-        let real_start = stat[stat.rfind(')').unwrap() + 1..]
-            .split_whitespace()
-            .nth(19)
-            .unwrap()
-            .to_string();
-        assert_ne!(real_start, "1");
+        // Its real start time is not "1" (checked where /proc says so).
+        if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+            let real_start = stat[stat.rfind(')').unwrap() + 1..]
+                .split_whitespace()
+                .nth(19)
+                .unwrap()
+                .to_string();
+            assert_ne!(real_start, "1");
+        }
 
         plant_reused_pid(&env, "reuse", pid);
         let status = env.api("status", json!({})).unwrap();

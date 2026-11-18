@@ -249,8 +249,9 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// Whether the Stop hook takes checkpoints here (see cheap_backend).
 fn overlay_available() -> bool {
-    backends().contains(&"overlay")
+    cheap_backend().is_some()
 }
 
 /// A helper process holding the project's flock until dropped.
@@ -1508,7 +1509,7 @@ fn stop_checkpoints_only_when_something_changed() {
         return;
     }
     let env = Env::new(5260);
-    env.init("overlay");
+    env.init(cheap_backend().unwrap());
     let s = fork(&env, "s");
     let stop = |cwd: &Path, event: &str| {
         let r = hook(&env, "stop", &turn_input(event, cwd), cwd, None);
@@ -1566,7 +1567,7 @@ fn stop_checkpoints_a_change_to_an_ignored_file() {
         return;
     }
     let env = Env::new(5262);
-    env.init("overlay");
+    env.init(cheap_backend().unwrap());
     let s = fork(&env, "s");
     assert_eq!(
         hook(&env, "stop", &turn_input("Stop", &s), &s, None).code,
@@ -1594,7 +1595,7 @@ fn stop_keeps_the_newest_twenty_and_never_prunes_manual() {
         return;
     }
     let env = Env::new(5264);
-    env.init("overlay");
+    env.init(cheap_backend().unwrap());
     let s = fork(&env, "s");
     env.api("checkpoint", json!({"session": "s", "label": "before"}))
         .unwrap();
@@ -1647,7 +1648,7 @@ fn stop_concurrent_hooks_make_one_checkpoint() {
         return;
     }
     let env = Env::new(5266);
-    env.init("overlay");
+    env.init(cheap_backend().unwrap());
     let s = fork(&env, "s");
     fs::write(s.join("src/app.txt"), "changed\n").unwrap();
     let results: Vec<HookResult> = std::thread::scope(|sc| {
@@ -1744,11 +1745,7 @@ fn turn_hooks_outside_a_session_are_silent_noops() {
 /// within ~6 seconds, exits 0 and prints nothing; nothing is checkpointed.
 #[test]
 fn turn_hooks_give_up_when_the_project_is_locked() {
-    let backend = if overlay_available() {
-        "overlay"
-    } else {
-        "clone"
-    };
+    let backend = cheap_backend().unwrap_or("clone");
     let env = Env::new(5274);
     env.init(backend);
     let s = fork(&env, "s");
@@ -2195,7 +2192,7 @@ fn overlay_hooks_work_after_unmount() {
         return;
     }
     let env = Env::new(5288);
-    env.init("overlay");
+    env.init(cheap_backend().unwrap());
     let repo = env.repo();
     let s = fork(&env, "s");
     fs::write(s.join("src/app.txt"), "before unmount\n").unwrap();

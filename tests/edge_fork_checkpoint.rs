@@ -1617,7 +1617,7 @@ fn rewind_restarts_running_services_and_leaves_stopped_ones() {
         );
         // The new process started after the files were restored, in the session.
         assert_eq!(read(&seen), "checkpointed\n", "{backend}");
-        let cwd = fs::read_link(format!("/proc/{new}/cwd")).unwrap();
+        let cwd = process_cwd(new as u32).expect("the service's cwd");
         assert_eq!(cwd, a.canonicalize().unwrap(), "{backend}");
         let st = ok(env.api("status", json!({"session": "a"})), "status");
         let svc = &st["sessions"][0]["services"][0];

@@ -100,21 +100,6 @@ fn land(env: &Env, args: Value) -> Value {
         .unwrap_or_else(|e| panic!("land {args} failed: {e}"))
 }
 
-/// Gone, or a zombie waiting to be reaped (kill(pid, 0) succeeds on zombies).
-fn pid_gone(pid: i32) -> bool {
-    if !alive(pid) {
-        return true;
-    }
-    match fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(stat) => stat
-            .rsplit(')')
-            .next()
-            .map(|rest| rest.trim_start().starts_with('Z'))
-            .unwrap_or(false),
-        Err(_) => true,
-    }
-}
-
 fn wait_for(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
