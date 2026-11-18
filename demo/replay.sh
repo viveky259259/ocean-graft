@@ -3,7 +3,7 @@
 # into the sessions run.sh created, then checks the result end to end:
 # tests in every session, conflicts, all four servers at once, and import.
 #
-#   tools/shoal/demo/replay.sh [BASE_REPO]
+#   demo/replay.sh [BASE_REPO]
 #
 # BASE_REPO defaults to ~/shoal-demo/notes-app. Exits non-zero if any check fails.
 set -euo pipefail

@@ -2,13 +2,13 @@
 # Sets up the four-session demo: a base repository made from notes-app, a warm
 # template, and four sessions that are each checked with the test suite.
 #
-#   tools/shoal/demo/run.sh [WORK_DIR]
+#   demo/run.sh [WORK_DIR]
 #
 # WORK_DIR defaults to ~/shoal-demo. The base repository is created at
 # WORK_DIR/notes-app; shoal keeps its data under SHOAL_HOME (~/.shoal).
 # SHOAL_BACKEND=clone or overlay picks the backend (default: overlay as root
 # on Linux, clone otherwise).
-# Needs: shoal on PATH (cargo build --release in tools/shoal), git, node 22.12+.
+# Needs: shoal on PATH (cargo build --release in this repository), git, node 22.12+.
 set -euo pipefail
 # Plain test output, whatever the caller's terminal settings (a Mac shell
 # often sets FORCE_COLOR or CLICOLOR_FORCE): results are matched as text.

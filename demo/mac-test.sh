@@ -5,10 +5,10 @@
 #      tests, conflicts, all four servers at once, and import
 #   3. a 100-session scale test
 #   4. the APFS session benchmark (cp -Rc vs one directory clonefile vs a
-#      cloned disk image, plus several cloned images attached at once) on a
-#      fresh clone of this repository with its node_modules
+#      cloned disk image, plus several cloned images attached at once) on the
+#      demo app with its node_modules
 #
-#   tools/shoal/demo/mac-test.sh [--keep]
+#   demo/mac-test.sh [--keep]
 #
 # Everything is created in a new folder in your home directory and deleted at
 # the end unless you pass --keep. Your checkout and ~/.shoal are not modified.
@@ -24,7 +24,7 @@ if [ "$(uname -s)" != Darwin ]; then
   exit 1
 fi
 
-root="$(cd "$(dirname "$0")/../../.." && pwd)"
+root="$(cd "$(dirname "$0")/.." && pwd)"
 keep=0
 [ "${1:-}" = "--keep" ] && keep=1
 stamp="$(date +%Y%m%d-%H%M%S)"
@@ -55,23 +55,19 @@ node --version
 cargo --version
 
 section "Build and end-to-end tests"
-(cd "$root/tools/shoal" && cargo build --release && cargo test --release -- --nocapture)
-export PATH="$root/tools/shoal/target/release:$PATH"
+(cd "$root" && cargo build --release && cargo test --release -- --nocapture)
+export PATH="$root/target/release:$PATH"
 
 section "Four sessions, replaying the agents' work"
-"$root/tools/shoal/demo/run.sh" "$work/demo"
-"$root/tools/shoal/demo/replay.sh" "$work/demo/notes-app"
+"$root/demo/run.sh" "$work/demo"
+"$root/demo/replay.sh" "$work/demo/notes-app"
 
 section "Scale test: 100 sessions"
-(cd "$work/demo/notes-app" && python3 "$root/tools/shoal/demo/scale.py" --sessions 100)
+(cd "$work/demo/notes-app" && python3 "$root/demo/scale.py" --sessions 100)
 
-section "APFS benchmark on a fresh clone of this repository"
-# Tracked files plus node_modules: a realistic tree without build output.
-git clone -q --local "$root" "$work/bench-src"
-if [ -d "$root/node_modules" ]; then
-  cp -Rc "$root/node_modules" "$work/bench-src/node_modules"
-else
-  (cd "$work/bench-src" && npm ci --ignore-scripts --no-audit --no-fund)
-fi
-python3 "$root/benchmarks/session-volume-bench/bench_macos.py" "$work/bench-src" \
+section "APFS benchmark on the demo app with its node_modules"
+# A real tree with dependencies installed: the demo app after npm ci.
+cp -R "$root/demo/notes-app" "$work/bench-src"
+(cd "$work/bench-src" && rm -rf node_modules && npm ci --ignore-scripts --no-audit --no-fund --loglevel=error)
+python3 "$root/bench/bench_macos.py" "$work/bench-src" \
   --runs 3 --work-parent "$work"

@@ -83,7 +83,7 @@ fn run_bytes_in(env: &Env, dir: &Path, input: Vec<u8>, limit: Duration) -> Run {
     let mut child = env
         .command(BIN, dir)
         .arg("mcp")
-        // target/tmp lives inside the ocean checkout; stop git discovery at
+        // target/tmp may live inside another git checkout; stop git discovery at
         // the test root so "not a repository" really is one.
         .env("GIT_CEILING_DIRECTORIES", env.root.path())
         .stdin(Stdio::piped())

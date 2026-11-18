@@ -275,7 +275,11 @@ fn sandbox_confines_writes() {
         b = b.display()
     );
     let out = env.shoal(&["exec", "--sandbox", "a", "--", "sh", "-c", &script]);
-    assert!(out.contains("OUTSIDE=denied"), "{out}");
+    // Under /tmp the sandbox's own empty tmpfs takes the write; what matters
+    // is that nothing reaches the real file (checked below).
+    if !outside.starts_with("/tmp") {
+        assert!(out.contains("OUTSIDE=denied"), "{out}");
+    }
     assert!(out.contains("SIBLING=hidden"), "{out}");
     assert!(env.path("a").join("inside.txt").exists());
     assert!(!outside.exists());

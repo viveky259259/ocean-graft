@@ -9,7 +9,7 @@
 //! which records ports near 65535 on purpose and still listens on nothing.
 //!
 //! Every shoal call runs with GIT_CEILING_DIRECTORIES at the test's
-//! temporary root: target/tmp lives inside the ocean git repository, and a
+//! temporary root: target/tmp may live inside another git repository, and a
 //! "non-git directory" would otherwise resolve to that enclosing repository.
 
 mod common;

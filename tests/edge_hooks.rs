@@ -7,7 +7,7 @@
 //! port_base inside the range.
 //!
 //! Every hook is run with GIT_CEILING_DIRECTORIES at the test's temporary
-//! root: target/tmp lives inside the ocean git repository, and a "non-git
+//! root: target/tmp may live inside another git repository, and a "non-git
 //! directory" would otherwise resolve to that enclosing repository.
 
 mod common;

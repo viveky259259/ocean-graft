@@ -13,7 +13,7 @@
 //! than 20-port blocks.
 //!
 //! Commands that may run outside a repository set GIT_CEILING_DIRECTORIES to
-//! the test's temporary root: target/tmp lives inside the ocean repository,
+//! the test's temporary root: target/tmp may live inside another git repository,
 //! and a "non-git directory" would otherwise resolve to it.
 
 mod common;

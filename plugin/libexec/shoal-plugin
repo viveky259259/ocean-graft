@@ -21,7 +21,7 @@ if [ -z "$bin" ] && command -v shoal >/dev/null 2>&1; then
   bin=shoal
 fi
 if [ -z "$bin" ]; then
-  echo "shoal plugin: the shoal binary was not found. Build it (cargo build --release in tools/shoal), put it on PATH, or set SHOAL_BIN." >&2
+  echo "shoal plugin: the shoal binary was not found. Build it (cargo build --release in the shoal repository), put it on PATH, or set SHOAL_BIN." >&2
 fi
 case "$1 $2" in
   "hook worktree-create" | "hook worktree-remove")

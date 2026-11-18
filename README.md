@@ -1,8 +1,7 @@
 # shoal
 
-Copy-on-write session volumes for running coding agents in parallel. It is a
-standalone CLI with no dependency on Ocean, and it implements the design in
-[`docs/specs/session-volumes.md`](../../docs/specs/session-volumes.md).
+Copy-on-write session volumes for running coding agents in parallel, as a
+standalone CLI and a Claude Code plugin ([`plugin/`](plugin/)).
 
 `shoal init` builds a **template** from a git repository and runs a setup
 command in it once, for example `npm ci`. `shoal new` then gives each agent a
@@ -11,7 +10,7 @@ checkout with its own `.git`, its own branch, installed dependencies and its
 own port. It is ready in milliseconds and stores only what it changes.
 
 ```bash
-cd tools/shoal && cargo build --release    # binary: target/release/shoal
+cargo build --release    # binary: target/release/shoal
 
 cd ~/code/my-app
 shoal init --setup "npm ci"                # once: clone + install into the template
@@ -241,11 +240,11 @@ server. The overlay test needs root and is skipped otherwise.
   Take them between agent turns.
 - Rewinding an overlay session unmounts it, so nothing may be running inside
   it at the time.
-- Ports are handed out, not reserved; `shoal` does not check whether a port
-  is free.
+- Ports are allocated in blocks of ten that do not overlap any other
+  session's block on the machine, and a block something already listens on
+  is skipped; a port taken later by another program is not noticed.
 - The queue only governs commands started with `shoal run`. An agent that
-  runs `npm test` directly bypasses it, so agents have to be told to use it
-  (Ocean can wrap their commands).
+  runs `npm test` directly bypasses it, so agents have to be told to use it.
 - Wake on request is opt-in (`--on-demand`), because the server then sees a
   different port than the one users open. Most dev servers handle this, but
   one that prints or redirects to its own port would show the private one.

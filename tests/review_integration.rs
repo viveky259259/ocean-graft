@@ -15,7 +15,7 @@ use common::*;
 // the same base, one after the other (the previous one is dropped first).
 //
 // Hooks run with GIT_CEILING_DIRECTORIES at the test's temporary root, since
-// target/tmp lives inside the ocean git repository.
+// target/tmp may live inside another git repository.
 
 use serde_json::{json, Value};
 use std::fs;
