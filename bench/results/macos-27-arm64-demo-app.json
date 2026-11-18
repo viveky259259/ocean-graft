@@ -1,0 +1,55 @@
+{
+  "macos": "27.0.1",
+  "machine": "arm64",
+  "rows": [
+    {
+      "strategy": "cp-Rc",
+      "create_ms": 186.0,
+      "create_ms_all": [
+        214.5,
+        185.1,
+        186.0
+      ],
+      "walk_ms": 11.1,
+      "discard_ms": 62.9
+    },
+    {
+      "strategy": "clonefile-dir",
+      "create_ms": 9.9,
+      "create_ms_all": [
+        10.0,
+        9.8,
+        9.9
+      ],
+      "walk_ms": 16.3,
+      "discard_ms": 59.3
+    },
+    {
+      "strategy": "image-clone",
+      "create_ms": 223.8,
+      "create_ms_all": [
+        188.5,
+        243.3,
+        223.8
+      ],
+      "walk_ms": 29.2,
+      "discard_ms": 431.4
+    }
+  ],
+  "files": 1517,
+  "native_walk_ms": 8.8,
+  "template_build_ms": 421.1,
+  "concurrent_images": {
+    "requested": 4,
+    "mounted": 4,
+    "attach_ms": [
+      215.7,
+      340.6,
+      343.5,
+      375.3
+    ],
+    "writes_isolated": true,
+    "error": null
+  },
+  "note": "demo/mac-test.sh on a 10-core Apple Silicon Mac with 16 GB, APFS; source: demo/notes-app after npm ci"
+}
