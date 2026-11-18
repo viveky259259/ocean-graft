@@ -496,7 +496,8 @@ pub fn process_cwds() -> Option<Vec<std::path::PathBuf>> {
         let mut pids: Vec<libc::c_int> = vec![0; 4096];
         let n = loop {
             let bytes = (pids.len() * std::mem::size_of::<libc::c_int>()) as libc::c_int;
-            let n = unsafe { libc::proc_listallpids(pids.as_mut_ptr() as *mut libc::c_void, bytes) };
+            let n =
+                unsafe { libc::proc_listallpids(pids.as_mut_ptr() as *mut libc::c_void, bytes) };
             if n < 0 {
                 return None;
             }
