@@ -3,8 +3,22 @@ name: macOS
 # The whole Mac test, as a developer runs it locally (demo/mac-test.sh): the
 # test suite on APFS, the four-session demo replaying the agents' commits,
 # a 100-session scale test, and the APFS session benchmark.
+#
+# macOS runners cost ten times a Linux one, so this runs only when something
+# that can change the Mac's behaviour does: the code, the tests, the demo,
+# the plugin or this file. A release.txt commit from the release workflow
+# does not count.
 on:
   push:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "demo/**"
+      - "plugin/**"
+      - "!plugin/libexec/release.txt"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/macos.yml"
   workflow_dispatch:
 
 concurrency:
