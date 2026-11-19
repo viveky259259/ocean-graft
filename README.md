@@ -29,10 +29,10 @@ the operator: it forks, checkpoints, rewinds, previews and lands through MCP
 tools, and hooks give every `claude --worktree` session and every subagent
 with `isolation: worktree` its own shoal session automatically.
 
-In Claude Code:
+In a terminal:
 
-```text
-/plugin install shoal --marketplace viveky259259/ocean_fs
+```bash
+claude plugin install shoal --marketplace viveky259259/ocean_fs
 ```
 
 On first use the plugin downloads the shoal binary for your machine (macOS
