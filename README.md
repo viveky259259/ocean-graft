@@ -284,8 +284,21 @@ Silicon, 16 GB) every step passed:
 | Create a session | 13–15 ms (one `clonefile` of the template), no slowdown up to 100 sessions |
 | Disk for 100 sessions | 99 MB really used (9.8 GB logical, shared by APFS clones) |
 | Copy strategies, demo app (1,517 files) | one directory `clonefile` 9.9 ms, per-file `cp -Rc` 186 ms, cloned disk image 224 ms plus attach ([results](bench/results/macos-27-arm64-demo-app.json)) |
+| Copy strategies, a real web app (42,243 files, 782 MB) | one directory `clonefile` 476 ms, per-file `cp -Rc` 5.3 s, cloned disk image 248 ms including attach, after an 18 s image build per template ([results](bench/results/macos-27-arm64-large-app.json)) |
 | 40 test runs at once | all passed, 335 runs/min |
 | Automatic checkpoint at the end of a turn | about 90 ms |
+
+**No disk-image backend, for now.** A directory `clonefile` costs about
+11 µs per file; a cloned disk image costs about 250 ms whatever the size,
+so the image only wins above roughly 20,000 files, and then by about a
+quarter of a second (476 ms against 248 ms at 42,000 files). Against that,
+an image needs an 18-second build for every template generation, every
+session is a mounted volume to manage (attach, detach, crash recovery),
+reading a whole tree from it is 1.7 times slower (708 against 412 ms), and
+`hdiutil` is deprecated from macOS 27. Its real advantages, a faster
+discard (560 ms against 1.8 s) and a faster first `git status` (47 against
+179 ms), do not justify that. Revisit for trees of several hundred
+thousand files, where one `clonefile` would take seconds.
 
 ## Tests
 
@@ -293,7 +306,7 @@ Silicon, 16 GB) every step passed:
 cargo test --release
 ```
 
-352 tests drive the real binary against throwaway repositories, on both
+354 tests drive the real binary against throwaway repositories, on both
 backends where they apply. Beyond the lifecycle (isolation, status, diff,
 ports, conflicts, checkpoint and rewind, fork, import, refresh, rm safety,
 remount, gc, sandbox, queue, idle shutdown, wake on request), they cover the

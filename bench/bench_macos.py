@@ -5,7 +5,9 @@ On APFS, what does it cost to give a session a warm copy of a project tree,
 and how fast is a disk-image volume for small-file work? A run on macOS 27
 (Apple Silicon) is in results/macos-27-arm64-demo-app.json: one directory
 clonefile took 9.9 ms, a per-file cp -Rc 186 ms, and a cloned disk image
-224 ms plus attach.
+224 ms plus attach. On a 42,243-file web app
+(results/macos-27-arm64-large-app.json): 476 ms, 5.3 s and 248 ms
+including attach, after an 18 s image build.
 
 Strategies
   cp-Rc          per-file clonefile driven from user space (a plain `cp -Rc`)

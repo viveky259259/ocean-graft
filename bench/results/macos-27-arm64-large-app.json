@@ -1,0 +1,64 @@
+{
+  "macos": "27.0.1",
+  "machine": "arm64",
+  "rows": [
+    {
+      "strategy": "cp-Rc",
+      "create_ms": 5304.6,
+      "create_ms_all": [
+        6537.7,
+        5185.0,
+        5325.3,
+        5264.2,
+        5304.6
+      ],
+      "walk_ms": 243.2,
+      "discard_ms": 1810.0,
+      "first_status_ms": 178.2
+    },
+    {
+      "strategy": "clonefile-dir",
+      "create_ms": 476.4,
+      "create_ms_all": [
+        476.4,
+        480.8,
+        471.9,
+        464.5,
+        498.4
+      ],
+      "walk_ms": 412.1,
+      "discard_ms": 1816.5,
+      "first_status_ms": 179.3
+    },
+    {
+      "strategy": "image-clone",
+      "create_ms": 247.8,
+      "create_ms_all": [
+        258.4,
+        242.2,
+        275.6,
+        247.8,
+        221.2
+      ],
+      "walk_ms": 707.6,
+      "discard_ms": 560.2,
+      "first_status_ms": 46.9
+    }
+  ],
+  "files": 42243,
+  "native_walk_ms": 1107.7,
+  "template_build_ms": 17930.3,
+  "concurrent_images": {
+    "requested": 4,
+    "mounted": 4,
+    "attach_ms": [
+      259.9,
+      288.3,
+      274.9,
+      283.2
+    ],
+    "writes_isolated": true,
+    "error": null
+  },
+  "note": "bench/bench_macos.py --runs 5 on a 10-core Apple Silicon Mac with 16 GB, APFS; source: a real web app checkout (782 MB) with its node_modules installed"
+}
