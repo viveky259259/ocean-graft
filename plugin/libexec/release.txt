@@ -1,6 +1,6 @@
 # ocean-graft release binaries; the plugin launcher verifies downloads against this file.
-version 0.1.0
-sha256 ocean-graft-darwin-arm64 2c43b7db3cd5b7944f72401a069db1d5060f595f2c5dafad8495eea49c5d3a2a
-sha256 ocean-graft-darwin-x86_64 a92454eb9836e0504d8d4dafa214ccd63d586f64af18cf4ad3a5ced157fc4078
-sha256 ocean-graft-linux-aarch64 af15faf210ec6393c0cbdda8a961e6d7f0ae4ac15ce602adbff364ca61f614bb
-sha256 ocean-graft-linux-x86_64 28839650e467b3eb073b1d909e6a2000f5f049723bfd348f759cc4e940c3be89
+version 0.2.0
+sha256 ocean-graft-darwin-arm64 df6f5f96e94cc116677604ff18743064b414cd33d4e1fc1c09d88c513fbb1d7b
+sha256 ocean-graft-darwin-x86_64 5f8c28e343f91657ee18e53fdc62f717a17a75271ca39d6224b593dd3ef762e7
+sha256 ocean-graft-linux-aarch64 0377a5d1ba4ac4e76ce7bf3cc51c990dba52436ba776987a62622e6572ac9e9d
+sha256 ocean-graft-linux-x86_64 fc4ffa3059787c55c1f94a36ba7351322d9d251a794418839bed3a3d26e2866d
