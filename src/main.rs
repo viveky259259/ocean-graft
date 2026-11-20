@@ -16,6 +16,7 @@ macro_rules! eprintln {
     }};
 }
 
+mod agents;
 mod config;
 mod conflicts;
 mod gateway;
@@ -98,8 +99,16 @@ enum Cmd {
         /// JSON object of arguments (default: {})
         args: Option<String>,
     },
-    /// Serve the tools over MCP on stdin/stdout (for Claude Code)
+    /// Serve the tools over MCP on stdin/stdout (for Claude Code, Codex,
+    /// Cursor, Gemini CLI, OpenCode or any other MCP client)
     Mcp,
+    /// Make shoal available to Codex, Cursor, Gemini CLI or OpenCode: register
+    /// its MCP server in each agent's config and add its instructions to the
+    /// repository's AGENTS.md (GEMINI.md for Gemini CLI)
+    Setup(agents::SetupArgs),
+    /// Print shoal's instructions for agents other than Claude Code: what
+    /// `shoal setup` writes to AGENTS.md
+    Instructions,
     /// Handle a Claude Code hook event, reading its JSON from stdin
     Hook {
         /// worktree-create, worktree-remove, stop, session-start or prompt
@@ -317,6 +326,11 @@ fn run(cli: Cli) -> Result<i32> {
             return Ok(0);
         }
         Cmd::Hook { event } => return Ok(hook::run(&event)),
+        Cmd::Setup(args) => return agents::setup(args),
+        Cmd::Instructions => {
+            print!("{}", agents::instructions());
+            return Ok(0);
+        }
         Cmd::Prepare { repo } => {
             let dir = ops::ensure_project(&repo)?;
             ops::refresh(&dir, false, ops::RefreshLimits::default())?;
@@ -338,7 +352,13 @@ fn run(cli: Cli) -> Result<i32> {
     };
     let mut p = Project::open(project::locate(cli.project.as_deref())?)?;
     match command {
-        Cmd::Init(_) | Cmd::Api { .. } | Cmd::Mcp | Cmd::Hook { .. } | Cmd::Prepare { .. } => {
+        Cmd::Init(_)
+        | Cmd::Api { .. }
+        | Cmd::Mcp
+        | Cmd::Hook { .. }
+        | Cmd::Prepare { .. }
+        | Cmd::Setup(_)
+        | Cmd::Instructions => {
             unreachable!()
         }
         Cmd::New { name, from, at } => cmd_new(&mut p, &name, from, at)?,

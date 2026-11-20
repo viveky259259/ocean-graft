@@ -65,6 +65,52 @@ the commit and publishes the binaries.
 How the plugin keeps Claude Code safe (exit codes, stdout, locks, crash
 recovery, the macOS rules) is in [`plugin/ARCHITECTURE.md`](plugin/ARCHITECTURE.md).
 
+## Codex, Cursor, Gemini CLI, OpenCode and other agents
+
+Everything Claude does with shoal goes through its MCP server, `shoal mcp`,
+which any MCP client can start. Install the binary, then register it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/viveky259259/ocean_fs/main/install.sh | sh
+cd your-repository
+shoal setup all
+```
+
+The installer downloads the binary for your machine from the latest release,
+checks it against that release's `release.txt`, and puts it in
+`~/.local/bin` (`SHOAL_INSTALL_DIR` to change it, `SHOAL_VERSION` for a
+particular release). A binary that does not match is never installed.
+
+`shoal setup` then does two things for each agent:
+
+| Agent | MCP server registered in | Instructions written to |
+|---|---|---|
+| Codex | `~/.codex/config.toml` (`$CODEX_HOME`) | `AGENTS.md` |
+| Cursor | `~/.cursor/mcp.json` | `AGENTS.md` |
+| Gemini CLI | `~/.gemini/settings.json` | `GEMINI.md` |
+| OpenCode | `~/.config/opencode/opencode.json` | `AGENTS.md` |
+
+`all` means every one of these installed here; name agents to choose
+(`shoal setup codex cursor`). The instructions go into the repository you
+run it in, between `<!-- shoal:start -->` and `<!-- shoal:end -->` markers
+that a later run replaces; `--global` writes them to each agent's own global
+file instead (`~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md`,
+`~/.config/opencode/AGENTS.md`; Cursor has none), and `--no-instructions`
+skips them. `--dry-run` shows what would change.
+
+Setup only adds. An agent that already has a `shoal` server keeps it; the
+rest of each config file keeps its text and order; a linked dotfile is
+written through and stays a link; and a config shoal cannot edit safely (JSON
+with comments, `opencode.jsonc`, TOML that does not parse) is left alone,
+with the entry to add by hand. `shoal instructions` prints the instructions
+on their own: they are the plugin's skill, without the parts only Claude
+Code has, derived when shoal runs so the two cannot drift.
+
+What other agents do not get is the plugin's hooks: Claude Code's
+checkpoint at the end of every turn, and its worktree and subagent
+integration. Without them, an agent checkpoints before risky steps itself,
+as the instructions tell it to.
+
 ## Licence
 
 MIT; see [`LICENSE`](LICENSE).
@@ -94,6 +140,9 @@ MIT; see [`LICENSE`](LICENSE).
 | `rm NAME [--force]` | Remove a session; refuses if it would lose uncommitted or unimported work |
 | `up` / `down` | Mount or unmount every session, for example after a reboot |
 | `gc` / `info` | Delete unused layers; show generations and disk use |
+| `setup AGENT... [--global] [--no-instructions] [--dry-run]` | Register shoal's MCP server with Codex, Cursor, Gemini CLI or OpenCode (`all`: those installed) and add its instructions to AGENTS.md or GEMINI.md |
+| `instructions` | Print those instructions |
+| `mcp` | Serve the tools over MCP on stdin and stdout, for any MCP client |
 
 ## Backends
 

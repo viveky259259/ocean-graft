@@ -19,7 +19,7 @@ fn session_props() -> Value {
     json!({
         "session": {"type": "string", "description": "Session name (see status)."},
         "path": {"type": "string", "description": "Any path inside the session, such as your working directory. Use instead of session."},
-        "project": {"type": "string", "description": "Path to the repository, when it is not the directory Claude Code was started in."}
+        "project": {"type": "string", "description": "Path to the repository, when it is not the directory the agent (or this MCP server) was started in."}
     })
 }
 
