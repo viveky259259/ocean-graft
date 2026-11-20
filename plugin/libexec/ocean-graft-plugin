@@ -13,46 +13,67 @@
 # version that does not know the event, a crash), turn hooks always exit 0
 # and worktree hooks exit 0 or 1. Nothing here writes to stdout: it belongs
 # to the MCP protocol and to the worktree path.
-here=$(cd "$(dirname "$0")" && pwd)
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 os=$(uname -s | tr '[:upper:]' '[:lower:]')
 arch=$(uname -m)
 asset="ocean-graft-$os-$arch"
 bin=
 
-say() { echo "ocean-graft plugin: $*" >&2; }
+say() { printf 'ocean-graft plugin: %s\n' "$*" >&2; }
 
 sha256_of() {
   if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$1" | awk '{print $1}'
+    shasum -a 256 < "$1" | awk '{print $1}'
   elif command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | awk '{print $1}'
+    sha256sum < "$1" | awk '{print $1}'
   else
     return 1
   fi
 }
 
 # The release binary for this plugin version: cached, or downloaded and
-# verified now. Prints its path on success.
+# verified now. Prints its path on success. Returns 2 on checksum mismatch so
+# callers never fall back to an untrusted binary on PATH.
 release_binary() {
   release="$here/release.txt"
   [ -r "$release" ] || return 1
-  version=$(awk '$1 == "version" {print $2}' "$release")
-  want=$(awk -v a="$asset" '$1 == "sha256" && $2 == a {print $3}' "$release")
+  version=$(awk '$1 == "version" {sub(/\r$/, "", $2); print $2; exit}' "$release")
+  want=$(awk -v a="$asset" '$1 == "sha256" && $2 == a {sub(/\r$/, "", $3); print $3; exit}' "$release")
   [ -n "$version" ] && [ -n "$want" ] || return 1
-  data="${CLAUDE_PLUGIN_DATA:-${HOME:-/tmp}/.ocean-graft/plugin}"
+  if [ -n "${CLAUDE_PLUGIN_DATA:-}" ]; then
+    data="$CLAUDE_PLUGIN_DATA"
+  elif [ -n "${HOME:-}" ]; then
+    data="$HOME/.ocean-graft/plugin"
+  else
+    say "neither CLAUDE_PLUGIN_DATA nor HOME is set; refusing to cache in /tmp"
+    return 1
+  fi
   dir="$data/bin/$version"
   cached="$dir/$asset"
-  if [ -x "$cached" ]; then
-    echo "$cached"
-    return 0
+  if [ -f "$cached" ] && [ -x "$cached" ]; then
+    got=$(sha256_of "$cached") || got=
+    if [ "$got" = "$want" ]; then
+      printf '%s\n' "$cached"
+      return 0
+    fi
+    say "cached binary does not match release.txt; re-downloading"
+    rm -f "$cached"
   fi
   base="${OCEAN_GRAFT_RELEASE_BASE:-https://github.com/viveky259259/ocean-graft/releases/download}"
   url="$base/v$version/$asset"
   mkdir -p "$dir" 2>/dev/null || return 1
   tmp="$dir/.download.$$"
+  trap 'rm -f "$tmp"' INT TERM HUP
   say "downloading ocean-graft $version for $os/$arch (first use)"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --connect-timeout 10 --max-time 120 -o "$tmp" "$url" >&2 || { rm -f "$tmp"; say "download failed: $url"; return 1; }
+    case "$url" in
+      https://*)
+        curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 10 --max-time 120 -o "$tmp" "$url" >&2 || { rm -f "$tmp"; say "download failed: $url"; return 1; }
+        ;;
+      *)
+        curl -fsSL --connect-timeout 10 --max-time 120 -o "$tmp" "$url" >&2 || { rm -f "$tmp"; say "download failed: $url"; return 1; }
+        ;;
+    esac
   elif command -v wget >/dev/null 2>&1; then
     wget -q -T 60 -O "$tmp" "$url" >&2 || { rm -f "$tmp"; say "download failed: $url"; return 1; }
   else
@@ -63,22 +84,31 @@ release_binary() {
   if [ "$got" != "$want" ]; then
     rm -f "$tmp"
     say "the downloaded binary does not match release.txt (got $got, want $want); not using it"
-    return 1
+    return 2
   fi
   chmod 755 "$tmp" && mv -f "$tmp" "$cached" || { rm -f "$tmp"; return 1; }
-  echo "$cached"
+  printf '%s\n' "$cached"
 }
 
 for candidate in "${OCEAN_GRAFT_BIN:-}" "$here/$asset" "$here/../../target/release/ocean-graft"; do
-  if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+  if [ -n "$candidate" ] && [ -f "$candidate" ] && [ -x "$candidate" ]; then
     bin=$candidate
     break
   fi
 done
+checksum_failed=0
 if [ -z "$bin" ]; then
-  bin=$(release_binary) || bin=
+  if bin=$(release_binary); then
+    :
+  else
+    rc=$?
+    bin=
+    if [ "$rc" -eq 2 ]; then
+      checksum_failed=1
+    fi
+  fi
 fi
-if [ -z "$bin" ] && command -v ocean-graft >/dev/null 2>&1; then
+if [ -z "$bin" ] && [ "$checksum_failed" -eq 0 ] && command -v ocean-graft >/dev/null 2>&1; then
   bin=ocean-graft
 fi
 if [ -z "$bin" ]; then

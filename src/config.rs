@@ -81,9 +81,21 @@ pub fn read_file(repo: &Path) -> Result<FileConfig> {
         toml::from_str(&text).with_context(|| format!("{} is not valid", path.display()))?;
     for item in &parsed.copy {
         let rel = Path::new(item);
-        if item.is_empty() || rel.is_absolute() || rel.components().any(|c| c.as_os_str() == "..") {
+        let mut normal_comps = Vec::new();
+        let mut bad = item.is_empty() || rel.is_absolute();
+        for c in rel.components() {
+            match c {
+                std::path::Component::Normal(s) => normal_comps.push(s),
+                std::path::Component::CurDir => {}
+                _ => bad = true,
+            }
+        }
+        let first_is_git = normal_comps
+            .first()
+            .is_some_and(|c| c.to_string_lossy().eq_ignore_ascii_case(".git"));
+        if bad || normal_comps.is_empty() || first_is_git {
             bail!(
-                "{}: copy entries must be paths inside the repository, got {item:?}",
+                "{}: copy entries must be paths inside the repository (not .git), got {item:?}",
                 path.display()
             );
         }
@@ -115,7 +127,7 @@ fn js_runner(repo: &Path) -> Option<&'static str> {
 }
 
 fn package_scripts(repo: &Path) -> Vec<String> {
-    let Ok(text) = std::fs::read_to_string(repo.join("package.json")) else {
+    let Ok(Some(text)) = read_config_text(&repo.join("package.json")) else {
         return Vec::new();
     };
     let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -162,6 +174,12 @@ pub fn detect_test(repo: &Path) -> Option<String> {
         return Some("go test ./...".into());
     }
     if repo.join("pyproject.toml").exists() || repo.join("pytest.ini").exists() {
+        if repo.join("uv.lock").exists() {
+            return Some("uv run pytest".into());
+        }
+        if repo.join("poetry.lock").exists() {
+            return Some("poetry run pytest".into());
+        }
         return Some("pytest".into());
     }
     None
@@ -260,7 +278,7 @@ mod tests {
         let py = repo(&[("pyproject.toml", ""), ("uv.lock", "")]);
         let c = load(py.path()).unwrap();
         assert_eq!(c.setup.as_deref(), Some("uv sync --frozen"));
-        assert_eq!(c.test.as_deref(), Some("pytest"));
+        assert_eq!(c.test.as_deref(), Some("uv run pytest"));
     }
 
     #[test]

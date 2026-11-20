@@ -72,11 +72,27 @@ pub fn slot_count() -> Result<usize> {
     }
 }
 
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "tmp".into());
+    let tmp = path.with_file_name(format!(".{name}.tmp.{}.{n}", std::process::id()));
+    std::fs::write(&tmp, bytes)?;
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err.into());
+    }
+    Ok(())
+}
+
 pub fn set_slot_count(n: usize) -> Result<()> {
     if n == 0 {
         bail!("the queue needs at least one slot");
     }
-    std::fs::write(dir()?.join("slots"), format!("{n}\n"))?;
+    write_atomic(&dir()?.join("slots"), format!("{n}\n").as_bytes())?;
     Ok(())
 }
 
@@ -94,8 +110,10 @@ fn try_lock(file: &File) -> bool {
 }
 
 pub fn process_alive(pid: u32) -> bool {
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
 /// Wait for `job.slots` slots and hold them until the returned value is dropped.
@@ -111,6 +129,9 @@ pub fn acquire_until(
     mut on_wait: impl FnMut(&Status),
 ) -> Result<Held> {
     let too_late = || deadline.is_some_and(|d| Instant::now() >= d);
+    if too_late() {
+        bail!("gave up waiting for a queue slot (time limit reached)");
+    }
     let dir = dir()?;
     let total = slot_count()?;
     let want = job.slots.clamp(1, total);
@@ -118,11 +139,12 @@ pub fn acquire_until(
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let waiting_file = dir.join("waiting").join(format!("{}-{n}.json", job.pid));
-    std::fs::write(&waiting_file, serde_json::to_vec(job)?)?;
+    write_atomic(&waiting_file, &serde_json::to_vec(job)?)?;
 
     let result = (|| -> Result<Held> {
         let room = open_lock(dir.join("room.lock"))?;
         let mut announced = false;
+        let start = Instant::now();
         // Waiters line up here. Everyone polls, so a waiter with a deadline
         // is not starved by ones blocked in the kernel.
         loop {
@@ -136,13 +158,18 @@ pub fn acquire_until(
                     if too_late() {
                         bail!("gave up waiting for a queue slot (time limit reached)");
                     }
+                    if !announced && start.elapsed() > Duration::from_millis(50) {
+                        announced = true;
+                        if let Ok(status) = status() {
+                            on_wait(&status);
+                        }
+                    }
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 _ => return Err(err).context("could not join the queue"),
             }
         }
         let mut locks: Vec<(usize, File)> = Vec::new();
-        let start = Instant::now();
         loop {
             for i in 0..total {
                 if locks.len() == want {
@@ -153,6 +180,10 @@ pub fn acquire_until(
                 }
                 let file = open_lock(dir.join(format!("slot-{i}.lock")))?;
                 if try_lock(&file) {
+                    // Clear any description left by a SIGKILLed holder before
+                    // waiting for additional slots, so `queue` never shows the
+                    // dead job as running while we hold this lock.
+                    let _ = std::fs::remove_file(dir.join(format!("slot-{i}.json")));
                     locks.push((i, file));
                 }
             }
@@ -177,7 +208,7 @@ pub fn acquire_until(
         let mut metadata = Vec::new();
         for (i, _) in &locks {
             let path = dir.join(format!("slot-{i}.json"));
-            std::fs::write(&path, serde_json::to_vec(&running)?)?;
+            write_atomic(&path, &serde_json::to_vec(&running)?)?;
             metadata.push(path);
         }
         Ok(Held {
@@ -214,12 +245,27 @@ pub fn status() -> Result<Status> {
             }
         }
     }
-    let mut waiting: Vec<Job> = std::fs::read_dir(dir.join("waiting"))?
-        .flatten()
-        .filter_map(|e| std::fs::read(e.path()).ok())
-        .filter_map(|raw| serde_json::from_slice::<Job>(&raw).ok())
-        .filter(|job| process_alive(job.pid))
-        .collect();
+    let mut waiting = Vec::new();
+    for entry in std::fs::read_dir(dir.join("waiting"))?.flatten() {
+        let path = entry.path();
+        if path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+        {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(job) = serde_json::from_slice::<Job>(&raw) else {
+            continue;
+        };
+        if process_alive(job.pid) {
+            waiting.push(job);
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
     waiting.sort_by_key(|j| (j.queued_at, j.pid));
     Ok(Status {
         slots,

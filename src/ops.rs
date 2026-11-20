@@ -280,6 +280,7 @@ pub fn init(o: InitOptions) -> Result<InitReport> {
         // Sessions share the template's packs; they must never repack them.
         git::git(&template, &["config", "gc.auto", "0"])?;
         git::git(&template, &["config", "maintenance.auto", "false"])?;
+        let template_canon = template.canonicalize()?;
         for item in &o.copy {
             let from = source.join(item);
             if from.symlink_metadata().is_err() {
@@ -300,12 +301,49 @@ pub fn init(o: InitOptions) -> Result<InitReport> {
                     resolved.display()
                 );
             }
+            // Reject .git targets and any template-side symlink along the
+            // destination path (which could otherwise write outside the template).
+            let rel_item = Path::new(item);
+            let mut normal_comps = Vec::new();
+            let mut bad = item.is_empty() || rel_item.is_absolute();
+            for c in rel_item.components() {
+                match c {
+                    std::path::Component::Normal(s) => normal_comps.push(s),
+                    std::path::Component::CurDir => {}
+                    _ => bad = true,
+                }
+            }
+            let first_is_git = normal_comps
+                .first()
+                .is_some_and(|c| c.to_string_lossy().eq_ignore_ascii_case(".git"));
+            if bad || normal_comps.is_empty() || first_is_git {
+                bail!("copy entry {item:?} must be a path inside the repository (not .git)");
+            }
+            let mut walk = template.clone();
+            for comp in &normal_comps {
+                walk.push(comp);
+                if let Ok(m) = walk.symlink_metadata() {
+                    if m.file_type().is_symlink() {
+                        bail!(
+                            "copy entry {item} traverses symlink {} in the template",
+                            walk.display()
+                        );
+                    }
+                }
+            }
             let to = template.join(item);
             if to.symlink_metadata().is_ok() {
                 bail!("{item} is tracked by git, so it is already in the template");
             }
             if let Some(parent) = to.parent() {
                 std::fs::create_dir_all(parent)?;
+                let parent_canon = parent.canonicalize()?;
+                if !parent_canon.starts_with(&template_canon) {
+                    bail!(
+                        "copy entry {item} destination parent {} escapes the template",
+                        parent_canon.display()
+                    );
+                }
             }
             sys::clone_tree(&from, &to)?;
         }
@@ -564,7 +602,10 @@ pub fn refresh(dir: &Path, force: bool, limits: RefreshLimits) -> Result<Refresh
     let deadline = limits.setup.map(|b| Instant::now() + b);
     let (latest, branch, backend, old_setup, old_inputs, source_head) = {
         let p = Project::open(dir.to_path_buf())?;
-        let source_head = git::git_trim(&p.state.source, &["rev-parse", &p.state.branch])?;
+        let source_head = git::git_trim(
+            &p.state.source,
+            &["rev-parse", &format!("refs/heads/{}", p.state.branch)],
+        )?;
         if let Some(failed) = &p.state.refresh_failure {
             let age = sys::now().saturating_sub(failed.at);
             if !force && failed.commit == source_head && age < REFRESH_RETRY_AFTER {
@@ -628,13 +669,24 @@ pub fn refresh(dir: &Path, force: bool, limits: RefreshLimits) -> Result<Refresh
             (rel, d)
         }
     };
-    let result = (|| -> Result<(usize, bool, Option<String>, Vec<String>)> {
+    struct BuiltRefresh {
+        head: String,
+        changed: usize,
+        ran: bool,
+        setup: Option<String>,
+        inputs: Vec<String>,
+    }
+    let result = (|| -> Result<BuiltRefresh> {
         git::git(&build, &["fetch", "-q", "origin", &branch])?;
         git::git(&build, &["reset", "-q", "--hard", "FETCH_HEAD"])?;
+        // Use the commit actually fetched (the source branch may have advanced
+        // while we were cloning the template) so Generation.commit and setup
+        // input detection stay consistent with the template contents.
+        let actual_head = git::head(&build)?;
         check_case_collisions(&build)?;
         let changed: Vec<String> = git::git(
             &build,
-            &["diff", "--name-only", &latest.commit, &source_head],
+            &["diff", "--name-only", &latest.commit, &actual_head],
         )?
         .lines()
         .map(str::to_string)
@@ -660,14 +712,26 @@ pub fn refresh(dir: &Path, force: bool, limits: RefreshLimits) -> Result<Refresh
             }
         }
         git::git(&build, &["status", "--porcelain"])?;
-        Ok((changed.len(), ran, setup, inputs))
+        Ok(BuiltRefresh {
+            head: actual_head,
+            changed: changed.len(),
+            ran,
+            setup,
+            inputs,
+        })
     })();
     if backend == Backend::Overlay {
         sys::unmount(&build)?;
         sys::remove_tree(dir.join("build-work"))?;
         std::fs::remove_dir(&build)?;
     }
-    let (changed, ran, setup, inputs) = match result {
+    let BuiltRefresh {
+        head: actual_head,
+        changed,
+        ran,
+        setup,
+        inputs,
+    } = match result {
         Ok(r) => r,
         Err(err) => {
             let _ = sys::remove_tree(abs(&rel));
@@ -698,7 +762,7 @@ pub fn refresh(dir: &Path, force: bool, limits: RefreshLimits) -> Result<Refresh
     p.state.setup_inputs = inputs;
     p.state.generations.push(Generation {
         id,
-        commit: source_head.clone(),
+        commit: actual_head.clone(),
         created_at: sys::now(),
         layers,
     });
@@ -707,7 +771,7 @@ pub fn refresh(dir: &Path, force: bool, limits: RefreshLimits) -> Result<Refresh
         up_to_date: false,
         generation: id,
         from: latest.commit,
-        to: source_head,
+        to: actual_head,
         changed_files: changed,
         setup_ran: ran,
         elapsed_ms: ms(start.elapsed()),
@@ -1882,13 +1946,38 @@ pub fn rewind(p: &mut Project, name: &str, label: &str) -> Result<RewindInfo> {
             saved.display()
         );
     }
+    let path = p.session_path(name);
     // Nothing lost: keep the current state as a checkpoint first, so the
     // rewind can be undone. Always: no cheap fingerprint sees everything a
     // rewind replaces (stashes, other branches, deep inside ignored trees).
+    // If `.git` itself was deleted or corrupted, still snapshot the directory
+    // so rewind can rescue the session rather than failing on `git rev-parse`.
     let safety = next_label(p, name, "pre-rewind-");
-    let saved_as = checkpoint_inner(p, name, Some(&safety), false, false)?.label;
+    let saved_as = if git::head(&path).is_ok() {
+        checkpoint_inner(p, name, Some(&safety), false, false)?.label
+    } else {
+        let dst = p.checkpoint_dir(name, &safety);
+        std::fs::create_dir_all(dst.parent().expect("checkpoint dir has a parent"))?;
+        let src = match p.state.backend {
+            Backend::Overlay => p.volume_dir(name).join("upper"),
+            Backend::Clone => path.clone(),
+        };
+        if dst.symlink_metadata().is_err() && sys::clone_tree(&src, &dst).is_ok() {
+            p.state.checkpoints.push(Checkpoint {
+                session: name.to_string(),
+                label: safety.clone(),
+                created_at: sys::now(),
+                head: String::new(),
+                auto: false,
+                fingerprint: None,
+            });
+            p.save()?;
+            Some(safety)
+        } else {
+            None
+        }
+    };
     let start = Instant::now();
-    let path = p.session_path(name);
     // Stop the session's own services first: they run in it, and must not
     // count as "a process working in the session".
     if let Err(err) = services::stop_session(p, name, None, false, true) {
@@ -1937,11 +2026,14 @@ pub fn rewind(p: &mut Project, name: &str, label: &str) -> Result<RewindInfo> {
     }
     // Only now, and never the checkpoint just restored.
     prune_pre_rewind(p, name, &label)?;
+    // Rewinding replaces `.git/objects` (which may have held a cached conflict
+    // snapshot commit), so invalidate this session's entry in conflicts-cache.
+    conflicts::forget(&p.dir, name);
     let elapsed = start.elapsed();
-    let head = git::head(&path)?;
-    // The rewind is done; a service that will not start again is reported,
-    // not turned into a failure of the whole call.
+    // The rewind is done; restart services before querying HEAD so they are
+    // never left stopped if the restored checkpoint has an unusual git state.
     let (restarted, restart_errors) = restart_services(p, name, &restart);
+    let head = git::head(&path).unwrap_or_default();
     p.mark_active(name)?;
     Ok(RewindInfo {
         session: name.to_string(),
@@ -1961,17 +2053,18 @@ pub fn rewind(p: &mut Project, name: &str, label: &str) -> Result<RewindInfo> {
 /// A git command in `dir` with the repository's identity, or ocean-graft's when
 /// none is configured (so commits and rebases never fail for want of one).
 fn git_with_identity(dir: &Path) -> Command {
-    let has_identity = git::git_trim(dir, &["config", "user.email"])
+    let has_name = git::git_trim(dir, &["config", "user.name"])
+        .map(|n| !n.is_empty())
+        .unwrap_or(false);
+    let has_email = git::git_trim(dir, &["config", "user.email"])
         .map(|e| !e.is_empty())
         .unwrap_or(false);
     let mut cmd = git::command(dir);
-    if !has_identity {
-        cmd.args([
-            "-c",
-            "user.name=ocean-graft",
-            "-c",
-            "user.email=ocean-graft@localhost",
-        ]);
+    if !has_name {
+        cmd.args(["-c", "user.name=ocean-graft"]);
+    }
+    if !has_email {
+        cmd.args(["-c", "user.email=ocean-graft@localhost"]);
     }
     cmd
 }
@@ -1982,6 +2075,35 @@ fn commit_all(dir: &Path, message: &str) -> Result<()> {
     cmd.args(["commit", "-q", "--no-verify", "-m", message]);
     sys::output(&mut cmd)?;
     Ok(())
+}
+
+/// Commit any stageable changes as an automated WIP save (never blocked by
+/// `commit.gpgsign` or dirty-only submodules). Returns whether a commit was made.
+fn commit_wip(dir: &Path, message: &str) -> Result<bool> {
+    git::git(dir, &["add", "-A"])?;
+    if git::git(dir, &["diff", "--cached", "--quiet"]).is_ok() {
+        return Ok(false);
+    }
+    let mut cmd = git_with_identity(dir);
+    cmd.args([
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-q",
+        "--no-verify",
+        "-m",
+        message,
+    ]);
+    sys::output(&mut cmd)?;
+    Ok(true)
+}
+
+/// Whether `commit` is reachable from at least one ref in `source` (not merely
+/// a dangling object waiting for `git gc`).
+fn commit_in_source(source: &Path, commit: &str) -> bool {
+    git::git(source, &["for-each-ref", "--contains", commit])
+        .map(|out| !out.trim().is_empty())
+        .unwrap_or(false)
 }
 
 #[derive(Serialize, Debug, Default)]
@@ -2003,15 +2125,12 @@ pub(crate) fn save_branch(source: &Path, session: &Path, name: &str) -> Result<S
 
 /// `rev` of the session saved as `ocean-graft/<name>` (or `-2`, `-3`...).
 fn save_rev(source: &Path, session: &Path, rev: &str, name: &str) -> Result<String> {
-    // Existing ocean-graft/ branches, to skip names that differ only in case: on
-    // macOS a loose ref ocean-graft/api would shadow a packed ocean-graft/Api.
+    // List every branch so we skip names that collide only in case (macOS
+    // loose vs packed refs, including uppercase OCEAN-GRAFT/) or in directory/
+    // file ref hierarchy (e.g. `ocean-graft/api/v1` blocks `ocean-graft/api`).
     let existing: Vec<String> = git::git(
         source,
-        &[
-            "for-each-ref",
-            "--format=%(refname)",
-            "refs/heads/ocean-graft/",
-        ],
+        &["for-each-ref", "--format=%(refname)", "refs/heads/"],
     )
     .map(|o| o.lines().map(str::to_string).collect())
     .unwrap_or_default();
@@ -2023,10 +2142,15 @@ fn save_rev(source: &Path, session: &Path, rev: &str, name: &str) -> Result<Stri
             format!("ocean-graft/{name}-{i}")
         };
         let full = format!("refs/heads/{branch}");
-        if existing
-            .iter()
-            .any(|r| r.eq_ignore_ascii_case(&full) && *r != full)
-        {
+        let full_lower = full.to_ascii_lowercase();
+        let prefix = format!("{full_lower}/");
+        let clashes = existing.iter().any(|r| {
+            let rl = r.to_ascii_lowercase();
+            (rl == full_lower && *r != full)
+                || rl.starts_with(&prefix)
+                || full_lower.starts_with(&format!("{rl}/"))
+        });
+        if clashes {
             continue;
         }
         let fetched = git::git(
@@ -2060,9 +2184,14 @@ fn save_rev(source: &Path, session: &Path, rev: &str, name: &str) -> Result<Stri
             }
         }
     }
-    Err(last_err.expect("at least one attempt")).with_context(|| {
-        format!("could not save the work of {name} to any ocean-graft/{name}-N branch")
-    })
+    match last_err {
+        Some(err) => Err(err).with_context(|| {
+            format!("could not save the work of {name} to any ocean-graft/{name}-N branch")
+        }),
+        None => bail!(
+            "could not save the work of {name} to any ocean-graft/{name}-N branch (all 50 names collide with existing refs)"
+        ),
+    }
 }
 
 /// Copy the session's commits into the source repository as `ocean-graft/<name>`.
@@ -2121,6 +2250,15 @@ fn operation_in_progress(path: &Path) -> Option<&'static str> {
     .map(|(_, what)| what)
 }
 
+fn abort_hint(what: &str) -> &'static str {
+    match what {
+        "a merge" => "git merge --abort",
+        "a cherry-pick" => "git cherry-pick --abort",
+        "a revert" => "git revert --abort",
+        _ => "git rebase --abort",
+    }
+}
+
 /// Make sure nothing in the session is lost: commit uncommitted work as WIP,
 /// import the branch into the source repository, and save any other local
 /// branches and stashes too. Ignored files (dependencies, build output) are
@@ -2128,18 +2266,18 @@ fn operation_in_progress(path: &Path) -> Option<&'static str> {
 pub fn save_work(p: &Project, name: &str) -> Result<SaveInfo> {
     let path = p.ensure_ready(name)?;
     if let Some(what) = operation_in_progress(&path) {
+        let hint = abort_hint(what);
         bail!(
-            "{name} is in the middle of {what}; finish it or abort it (for example `git rebase --abort` in {}) before removing the session",
+            "{name} is in the middle of {what}; finish it or abort it (for example `{hint}` in {}) before removing the session",
             path.display()
         );
     }
     let mut committed_wip = false;
     if !git::status_lines(&path)?.is_empty() {
-        commit_all(
+        committed_wip = commit_wip(
             &path,
             &format!("WIP: work saved from ocean-graft session {name}"),
         )?;
-        committed_wip = true;
     }
     let import = import(p, name)?;
     let mut extra_branches = Vec::new();
@@ -2182,14 +2320,9 @@ pub fn save_work(p: &Project, name: &str) -> Result<SaveInfo> {
         extras.push((extra_name(&format!("stash-{i}")), h.to_string()));
     }
     for (branch_name, commit) in extras {
-        // Already in the source repository (the template's own branches):
-        // nothing to save.
-        if git::git(
-            &p.state.source,
-            &["cat-file", "-e", &format!("{commit}^{{commit}}")],
-        )
-        .is_ok()
-        {
+        // Already reachable from a ref in the source repository (e.g. the
+        // template's own branches): nothing to save.
+        if commit_in_source(&p.state.source, &commit) {
             continue;
         }
         extra_branches.push(save_rev(&p.state.source, &path, &commit, &branch_name)?);
@@ -2241,13 +2374,26 @@ pub fn remove(p: &mut Project, name: &str, force: bool, save: bool) -> Result<Re
             );
         }
         let head = git::head(&path)?;
-        let in_source = git::git(
-            &p.state.source,
-            &["cat-file", "-e", &format!("{head}^{{commit}}")],
-        )
-        .is_ok();
-        if head != s.base_commit && !in_source {
+        if head != s.base_commit && !commit_in_source(&p.state.source, &head) {
             bail!("{name} has commits that are not in the source repository; land or import them, or remove with force to discard them");
+        }
+        let stashes = git::git(&path, &["stash", "list", "--format=%H"]).unwrap_or_default();
+        if stashes
+            .lines()
+            .any(|h| !h.is_empty() && !commit_in_source(&p.state.source, h))
+        {
+            bail!("{name} has stashed changes that are not in the source repository; drop them or remove with force to discard them");
+        }
+        let branches = git::git(
+            &path,
+            &["for-each-ref", "--format=%(objectname)", "refs/heads/"],
+        )
+        .unwrap_or_default();
+        if branches
+            .lines()
+            .any(|h| !h.is_empty() && h != s.base_commit && !commit_in_source(&p.state.source, h))
+        {
+            bail!("{name} has local branches with commits not in the source repository; import them or remove with force to discard them");
         }
     }
     services::stop_session(p, name, None, false, false)?;
@@ -2672,16 +2818,27 @@ fn land_inner(project_dir: &Path, name: &str, o: &LandOptions) -> Result<LandRep
     let deadline = Instant::now() + o.test_timeout;
     // A copy of the session (minutes, on filesystems that cannot clone) is
     // waited for, within the deadline; another land is not.
+    let mut unknown = 0u32;
     let _busy = loop {
         {
             let p = open_by(project_dir, deadline)?;
             p.session(name)?;
             match take_session_lock(project_dir, name, "land")? {
                 Ok(lock) => break lock,
-                Err(holder) if holder == "land" || holder.is_empty() => {
+                Err(holder) if holder == "land" => {
                     bail!("{name} is already being landed")
                 }
-                Err(_) => {}
+                Err(holder) if holder.is_empty() => {
+                    // Another process may be mid-write or releasing its lock;
+                    // retry briefly before assuming it is another land.
+                    unknown += 1;
+                    if unknown >= 20 {
+                        bail!("{name} is already being landed");
+                    }
+                }
+                Err(_) => {
+                    unknown = 0;
+                }
             }
         }
         if Instant::now() >= deadline {
@@ -2698,7 +2855,9 @@ fn land_inner(project_dir: &Path, name: &str, o: &LandOptions) -> Result<LandRep
         let test = match &o.test {
             Some(t) if t.trim().is_empty() => None,
             Some(t) => Some(t.clone()),
-            None => config::load(&p.state.source)?.test,
+            None => config::load(&p.state.source)?
+                .test
+                .filter(|t| !t.trim().is_empty()),
         };
         (path, p.state.source.clone(), target, s.port, test)
     };
@@ -2720,6 +2879,14 @@ fn land_inner(project_dir: &Path, name: &str, o: &LandOptions) -> Result<LandRep
         bail!("the source repository has no branch {target}");
     }
 
+    if let Some(what) = operation_in_progress(&path) {
+        let hint = abort_hint(what);
+        bail!(
+            "{name} is in the middle of {what}; finish it or abort it (for example `{hint}` in {}) before landing",
+            path.display()
+        );
+    }
+
     // 1. Uncommitted work.
     let dirty = git::status_paths(&path)?;
     if !dirty.is_empty() {
@@ -2735,6 +2902,9 @@ fn land_inner(project_dir: &Path, name: &str, o: &LandOptions) -> Result<LandRep
     }
     for attempt in 1..=3 {
         report.attempts = attempt;
+        report.tests = None;
+        report.commits = 0;
+        report.files.clear();
         // 2. Bring the target's tip into the session.
         git::git(
             &path,
@@ -2837,6 +3007,13 @@ fn land_inner(project_dir: &Path, name: &str, o: &LandOptions) -> Result<LandRep
         let saved = save_branch(&source, &path, name)?;
         let _land_guard =
             land_lock(project_dir, deadline).map_err(|e| with_progress(e, &report))?;
+        // Verify the target branch did not move (including backward via reset)
+        // while tests were running, before checking ignored files or merging.
+        let current_tip = git::git_trim(&source, &["rev-parse", &target_ref]).unwrap_or_default();
+        if current_tip != tip {
+            progress(format!("{target} moved while landing; trying again"));
+            continue;
+        }
         let checked_out = git::git_trim(&source, &["symbolic-ref", "-q", "HEAD"])
             .map(|r| r == target_ref)
             .unwrap_or(false);

@@ -35,6 +35,10 @@ impl State {
 }
 
 pub fn group_alive(pgid: i32) -> bool {
+    // Never signal 0 (our own process group) or -1 (every process on the host).
+    if pgid <= 1 {
+        return false;
+    }
     // A long-lived ocean-graft (the MCP server) is the parent of the services it
     // starts. Reap the group leader if it has exited, or it stays a zombie
     // and kill(-pgid, 0) keeps reporting the group alive. For a group we did
@@ -42,10 +46,9 @@ pub fn group_alive(pgid: i32) -> bool {
     unsafe {
         libc::waitpid(pgid, std::ptr::null_mut(), libc::WNOHANG);
     }
-    if unsafe { libc::kill(-pgid, 0) } == 0 {
-        return true;
-    }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    // Our own services run under our UID; EPERM means the pid/pgid now belongs
+    // to another user (e.g. root after PID reuse), never to us.
+    unsafe { libc::kill(-pgid, 0) == 0 }
 }
 
 /// Whether process group `pgid`, started at `start`, is still ours and
@@ -54,6 +57,9 @@ pub fn group_alive(pgid: i32) -> bool {
 /// the leader is gone, the remaining members are ours: a pid is never
 /// handed out while a process group of that id exists.)
 pub fn owned_group_alive(pgid: i32, start: Option<&str>) -> bool {
+    if pgid <= 1 {
+        return false;
+    }
     if let (Some(start), Some(now)) = (start, sys::process_start(pgid)) {
         if now != start {
             return false;
@@ -377,11 +383,12 @@ pub fn parse_duration(text: &str) -> Result<Duration> {
         .parse()
         .with_context(|| format!("not a duration: {text:?} (try 30s, 15m or 2h)"))?;
     let secs = match unit {
-        "s" => n,
-        "m" => n * 60,
-        "h" => n * 3600,
+        "s" => Some(n),
+        "m" => n.checked_mul(60),
+        "h" => n.checked_mul(3600),
         _ => bail!("not a duration: {text:?} (try 30s, 15m or 2h)"),
-    };
+    }
+    .with_context(|| format!("duration is too large: {text:?}"))?;
     Ok(Duration::from_secs(secs))
 }
 
@@ -416,17 +423,27 @@ pub fn stop_session(
         if state(svc) == State::Running {
             svc.stopped_for_idle = for_idle;
             running.push(svc);
-        } else if svc.pid.is_some() {
-            svc.pid = None; // it had exited on its own
+        } else {
+            if svc.pid.is_some() {
+                svc.pid = None; // it had exited on its own
+                svc.pid_start = None;
+            }
+            if !for_idle {
+                svc.stopped_for_idle = false;
+            }
         }
     }
-    let count = running.len();
+    let mut count = running.len();
     let kb = stop_all(running)?.iter().sum();
     if !keep_gateways {
         let session = p.state.sessions.get_mut(name).expect("session exists");
         for svc in session.services.iter_mut() {
             if only.is_none_or(|o| o == svc.name) {
+                let gw_was_up = gateway_running(svc);
                 stop_gateway(svc);
+                if gw_was_up && count == 0 {
+                    count += 1;
+                }
             }
         }
     }
@@ -477,13 +494,18 @@ pub fn serve(
         gateway_start: existing.as_ref().and_then(|e| e.gateway_start.clone()),
     };
     if on_demand {
-        svc.internal_port = match existing.as_ref().and_then(|e| e.internal_port) {
+        svc.internal_port = match existing
+            .as_ref()
+            .filter(|e| gateway_running(e))
+            .and_then(|e| e.internal_port)
+        {
             Some(port) => Some(port),
             None => Some(crate::gateway::free_port()?),
         };
     } else if let Some(mut old) = existing {
         stop_gateway(&mut old); // switching back to a plain service
         svc.gateway = None;
+        svc.gateway_start = None;
     }
     start(p, &session, &mut svc)?;
     if on_demand && !gateway_running(&svc) {

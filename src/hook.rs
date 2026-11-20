@@ -102,7 +102,7 @@ pub fn worktree_create(input: &Value) -> Result<PathBuf> {
                 Err(err) if err.downcast_ref::<ops::OverBudget>().is_some() => {
                     // First use, and setup is slower than a hook may wait:
                     // finish it in the background; the next worktree works.
-                    spawn_detached(&["prepare".as_ref(), repo.as_os_str()]);
+                    spawn_detached(&["prepare".as_ref(), "--".as_ref(), repo.as_os_str()]);
                     bail!(
                         "the first-time setup of {} takes longer than a worktree may wait; it goes on in the background, so try again in a few minutes",
                         repo.display()
@@ -210,11 +210,20 @@ fn start_background_sweep(dir: &Path, keep: &str) {
 pub fn worktree_remove(input: &Value) -> Result<()> {
     let path = field(input, "worktree_path").context("no worktree_path in the hook input")?;
     let path = Path::new(path);
-    if path.symlink_metadata().is_err() {
-        // Already gone. If it was a ocean-graft session, clear its record too, so
-        // status does not keep reporting a broken session.
-        forget_missing_session(path);
-        return Ok(());
+    let meta = match path.symlink_metadata() {
+        Ok(m) => m,
+        Err(_) => {
+            // Already gone. If it was a ocean-graft session, clear its record too, so
+            // status does not keep reporting a broken session.
+            forget_missing_session(path);
+            return Ok(());
+        }
+    };
+    if meta.file_type().is_symlink() {
+        bail!(
+            "{} is a symlink, so ocean-graft will not delete its target",
+            path.display()
+        );
     }
     let Some((mut p, name)) = session_at(path, None)? else {
         if path.symlink_metadata().is_err() {

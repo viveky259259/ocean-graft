@@ -460,9 +460,12 @@ fn preview(args: &Value) -> Result<Value> {
     }
     let command = match opt_str(args, "command")? {
         Some(c) if !c.trim().is_empty() => c,
-        _ => config::load(&p.state.source)?.preview.context(
-            "no preview command: pass command (it must listen on $PORT), or set preview in ocean-graft.toml",
-        )?,
+        _ => config::load(&p.state.source)?
+            .preview
+            .filter(|c| !c.trim().is_empty())
+            .context(
+                "no preview command: pass command (it must listen on $PORT), or set preview in ocean-graft.toml",
+            )?,
     };
     let svc = services::serve(
         &mut p,

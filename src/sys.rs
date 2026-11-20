@@ -140,14 +140,14 @@ pub fn clone_tree(src: &Path, dst: &Path) -> Result<()> {
                 .with_context(|| format!("clonefile {} -> {}", src.display(), dst.display()));
         }
         // Not APFS, or a different volume: fall back to a plain copy.
-        output(Command::new("cp").arg("-RPp").arg(src).arg(dst))?;
+        output(Command::new("cp").args(["-RPp", "--"]).arg(src).arg(dst))?;
         Ok(())
     }
     #[cfg(not(target_os = "macos"))]
     {
         output(
             Command::new("cp")
-                .args(["-a", "--reflink=auto"])
+                .args(["-a", "--reflink=auto", "--"])
                 .arg(src)
                 .arg(dst),
         )?;
@@ -461,11 +461,19 @@ pub fn port_in_use(port: u16) -> bool {
 /// Whether file names in `dir` are matched without regard to case (the
 /// default on macOS APFS and HFS+).
 pub fn case_insensitive(dir: &Path) -> bool {
-    let probe = dir.join(format!(".ocean-graft-case-probe-{}", std::process::id()));
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let probe = dir.join(format!(
+        ".ocean-graft-case-probe-{}-{n}",
+        std::process::id()
+    ));
     if std::fs::write(&probe, b"").is_err() {
         return cfg!(target_os = "macos");
     }
-    let upper = dir.join(format!(".OCEAN-GRAFT-CASE-PROBE-{}", std::process::id()));
+    let upper = dir.join(format!(
+        ".OCEAN-GRAFT-CASE-PROBE-{}-{n}",
+        std::process::id()
+    ));
     let insensitive = upper.symlink_metadata().is_ok();
     let _ = std::fs::remove_file(&probe);
     insensitive
@@ -474,8 +482,16 @@ pub fn case_insensitive(dir: &Path) -> bool {
 /// Whether the filesystem holding `dir` can clone files (APFS clonefile).
 #[cfg(target_os = "macos")]
 pub fn clones_supported(dir: &Path) -> bool {
-    let a = dir.join(format!(".ocean-graft-clone-probe-a-{}", std::process::id()));
-    let b = dir.join(format!(".ocean-graft-clone-probe-b-{}", std::process::id()));
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let a = dir.join(format!(
+        ".ocean-graft-clone-probe-a-{}-{n}",
+        std::process::id()
+    ));
+    let b = dir.join(format!(
+        ".ocean-graft-clone-probe-b-{}-{n}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_file(&b);
     if std::fs::write(&a, b"probe").is_err() {
         return false;
@@ -747,32 +763,46 @@ fn sync_dir(
     let set_mode = |p: &Path, mode: u32| -> std::io::Result<()> {
         std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode))
     };
-    // A read-only directory cannot be changed: open it up for the sync and
-    // give it its final mode at the end.
+    // A read-only or unreadable directory cannot be synced: open it up for the
+    // sync (read + write + search) and give it its final mode at the end.
     let dst_mode = dst.symlink_metadata()?.mode() & 0o7777;
-    if dst_mode & 0o300 != 0o300 {
+    if dst_mode & 0o700 != 0o700 {
         set_mode(dst, dst_mode | 0o700)?;
     }
     let remove = |p: &Path| -> Result<()> {
         remove_tree(p).with_context(|| format!("could not remove {}", p.display()))
     };
+    // Compare exact directory entry names (not path probes) so case-only
+    // renames (Foo.txt <-> foo.txt) are restored properly on case-insensitive
+    // filesystems such as macOS APFS.
+    let src_entries: Vec<_> = std::fs::read_dir(src)
+        .with_context(|| format!("could not read {}", src.display()))?
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let src_names: std::collections::HashSet<std::ffi::OsString> =
+        src_entries.iter().map(|e| e.file_name()).collect();
+    let mut dst_names: std::collections::HashSet<std::ffi::OsString> =
+        std::collections::HashSet::new();
     for entry in
         std::fs::read_dir(dst).with_context(|| format!("could not read {}", dst.display()))?
     {
         let entry = entry?;
-        if src.join(entry.file_name()).symlink_metadata().is_err() {
+        let name = entry.file_name();
+        if !src_names.contains(&name) {
             remove(&entry.path())?;
+        } else {
+            dst_names.insert(name);
         }
     }
-    for entry in
-        std::fs::read_dir(src).with_context(|| format!("could not read {}", src.display()))?
-    {
-        let entry = entry?;
+    for entry in src_entries {
+        let name = entry.file_name();
         let from = entry.path();
-        let to = dst.join(entry.file_name());
-        let child_rel = rel.join(entry.file_name());
+        let to = dst.join(&name);
+        let child_rel = rel.join(&name);
         let meta = from.symlink_metadata()?;
-        let existing = to.symlink_metadata().ok();
+        let existing = dst_names
+            .contains(&name)
+            .then(|| to.symlink_metadata().ok())
+            .flatten();
         let ft = meta.file_type();
         if existing.is_some() && identical(&child_rel) {
             continue;
@@ -829,7 +859,7 @@ fn sync_dir(
         }
         // Sockets, FIFOs and devices are not part of a working tree.
     }
-    if dst_mode & 0o300 != 0o300 {
+    if dst_mode & 0o700 != 0o700 {
         set_mode(dst, dst_mode)?;
     }
     Ok(())
