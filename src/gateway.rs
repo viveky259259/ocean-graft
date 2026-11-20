@@ -13,11 +13,14 @@
 //! by `stop`, `rm` and `down`. `reap` leaves it running.
 
 use anyhow::{bail, Context, Result};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
+
+const MAX_CONNECTIONS: usize = 128;
 
 /// The file whose modification time records a session's latest request.
 pub fn activity_file(project_dir: &Path, session: &str) -> PathBuf {
@@ -63,16 +66,26 @@ struct Gateway {
     ocean_graft: PathBuf,
     /// Only one connection at a time wakes the service; the rest wait for it.
     waking: Mutex<()>,
-    last_touch: Mutex<Instant>,
+    last_touch: Mutex<Option<Instant>>,
+    active: AtomicUsize,
+}
+
+struct ConnGuard(Arc<Gateway>);
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl Gateway {
     fn touch(&self) {
-        let mut last = self.last_touch.lock().expect("touch lock");
-        if last.elapsed() < Duration::from_secs(1) {
+        let mut last = self.last_touch.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
             return;
         }
-        *last = Instant::now();
+        *last = Some(Instant::now());
+        drop(last);
         let path = activity_file(&self.project_dir, &self.session);
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -91,7 +104,7 @@ impl Gateway {
         if answers(self.internal_port) {
             return Ok(());
         }
-        let _guard = self.waking.lock().expect("waking lock");
+        let _guard = self.waking.lock().unwrap_or_else(|e| e.into_inner());
         if answers(self.internal_port) {
             return Ok(()); // another connection woke it while we waited
         }
@@ -128,42 +141,59 @@ impl Gateway {
         )
     }
 
-    fn relay(&self, client: TcpStream) {
+    fn relay(self: &Arc<Self>, client: TcpStream) {
         self.touch();
-        if let Err(err) = self.ensure_up() {
-            eprintln!("gateway: {err:#}");
-            let _ = client.shutdown(Shutdown::Both);
-            return;
-        }
+        // Try connecting directly first to avoid a redundant probe connection on
+        // every request; only wake the service if nothing is listening.
         let upstream = match connect_upstream(self.internal_port) {
             Ok(s) => s,
-            Err(err) => {
-                eprintln!(
-                    "gateway: could not reach port {}: {err}",
-                    self.internal_port
-                );
-                return;
+            Err(_) => {
+                if let Err(err) = self.ensure_up() {
+                    eprintln!("gateway: {err:#}");
+                    let _ = client.shutdown(Shutdown::Both);
+                    return;
+                }
+                match connect_upstream(self.internal_port) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        eprintln!(
+                            "gateway: could not reach port {}: {err}",
+                            self.internal_port
+                        );
+                        let _ = client.shutdown(Shutdown::Both);
+                        return;
+                    }
+                }
             }
         };
         let _ = client.set_nodelay(true);
         let _ = upstream.set_nodelay(true);
-        let (Ok(client_read), Ok(upstream_write)) = (client.try_clone(), upstream.try_clone())
-        else {
+        let client = Arc::new(client);
+        let upstream = Arc::new(upstream);
+        let c_in = Arc::clone(&client);
+        let u_out = Arc::clone(&upstream);
+        let gw_fwd = Arc::clone(self);
+        let forward = std::thread::Builder::new().spawn(move || pipe(&c_in, &u_out, &gw_fwd));
+        let Ok(forward) = forward else {
+            let _ = client.shutdown(Shutdown::Both);
+            let _ = upstream.shutdown(Shutdown::Both);
             return;
         };
-        let forward = std::thread::spawn(move || pipe(client_read, upstream_write));
-        pipe(upstream, client);
+        pipe(&upstream, &client, self);
         let _ = forward.join();
     }
 }
 
 /// Copy one direction until it closes, then close the other side's writer.
-fn pipe(mut from: TcpStream, mut to: TcpStream) {
+fn pipe(mut from: &TcpStream, mut to: &TcpStream, gateway: &Gateway) {
     let mut buf = [0u8; 16 * 1024];
     loop {
         match from.read(&mut buf) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => break,
             Ok(n) => {
+                gateway.touch();
                 if to.write_all(&buf[..n]).is_err() {
                     break;
                 }
@@ -187,22 +217,41 @@ pub fn run(project_dir: &Path, session: &str, public_port: u16, internal_port: u
         internal_port,
         ocean_graft: std::env::current_exe().context("could not locate the ocean-graft binary")?,
         waking: Mutex::new(()),
-        last_touch: Mutex::new(Instant::now() - Duration::from_secs(60)),
+        last_touch: Mutex::new(None),
+        active: AtomicUsize::new(0),
     });
     let serve = |listener: TcpListener, gateway: Arc<Gateway>| {
         for stream in listener.incoming() {
             match stream {
                 Ok(client) => {
-                    let gateway = Arc::clone(&gateway);
-                    std::thread::spawn(move || gateway.relay(client));
+                    let prev = gateway.active.fetch_add(1, Ordering::Relaxed);
+                    if prev >= MAX_CONNECTIONS {
+                        gateway.active.fetch_sub(1, Ordering::Relaxed);
+                        let _ = client.shutdown(Shutdown::Both);
+                        continue;
+                    }
+                    let gw = Arc::clone(&gateway);
+                    let guard = ConnGuard(Arc::clone(&gateway));
+                    if std::thread::Builder::new()
+                        .spawn(move || {
+                            let _guard = guard;
+                            gw.relay(client);
+                        })
+                        .is_err()
+                    {
+                        eprintln!("gateway: could not spawn connection worker");
+                    }
                 }
-                Err(err) => eprintln!("gateway: accept failed: {err}"),
+                Err(err) => {
+                    eprintln!("gateway: accept failed: {err}");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
             }
         }
     };
     if let Some(l6) = listener6 {
         let g = Arc::clone(&gateway);
-        std::thread::spawn(move || serve(l6, g));
+        let _ = std::thread::Builder::new().spawn(move || serve(l6, g));
     }
     serve(listener, gateway);
     Ok(())

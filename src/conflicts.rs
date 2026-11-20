@@ -79,6 +79,7 @@ pub fn fingerprint(dir: &Path) -> Result<String> {
             "-z",
             "--untracked-files=all",
         ])
+        .stdin(std::process::Stdio::null())
         .output()?;
     if !out.status.success() {
         bail!(
@@ -198,15 +199,25 @@ fn merge_tree(hub: &Path, a: &SessionEntry, b: &SessionEntry) -> Result<Vec<Stri
             &a.snapshot,
             &b.snapshot,
         ])
+        .stdin(std::process::Stdio::null())
         .output()?;
     match out.status.code() {
         Some(0) => Ok(Vec::new()),
-        Some(1) => Ok(String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .skip(1)
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .collect()),
+        Some(1) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if stdout.trim().is_empty() {
+                bail!(
+                    "git merge-tree failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            Ok(stdout
+                .lines()
+                .skip(1)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect())
+        }
         _ => bail!(
             "git merge-tree failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
@@ -267,7 +278,13 @@ pub fn check(p: &Project) -> Result<Report> {
         |(name, path, base)| -> Result<(SessionEntry, bool)> {
             let fp = fingerprint(path)?;
             if let Some(old) = cache.sessions.get(name) {
-                if old.fingerprint == fp {
+                if old.fingerprint == fp
+                    && git::git(
+                        path,
+                        &["cat-file", "-e", &format!("{}^{{commit}}", old.snapshot)],
+                    )
+                    .is_ok()
+                {
                     return Ok((old.clone(), false));
                 }
             }
@@ -291,11 +308,19 @@ pub fn check(p: &Project) -> Result<Report> {
         current.insert(name.clone(), entry);
     }
 
-    // 2. Only pairs that change a file in common can conflict.
+    // 2. Only pairs that change a file in common — or where one changes a path
+    // that is a parent directory of another's changed path (file/directory
+    // conflict) — can conflict.
     let mut by_file: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut by_dir: BTreeMap<&str, Vec<(&str, &str)>> = BTreeMap::new();
     for (name, entry) in &current {
         for f in &entry.files {
-            by_file.entry(f).or_default().push(name);
+            by_file.entry(f.as_str()).or_default().push(name);
+            let mut prefix = f.as_str();
+            while let Some((dir, _)) = prefix.rsplit_once('/') {
+                by_dir.entry(dir).or_default().push((name, f.as_str()));
+                prefix = dir;
+            }
         }
     }
     let mut candidates: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
@@ -305,7 +330,24 @@ pub fn check(p: &Project) -> Result<Report> {
                 candidates
                     .entry((a.to_string(), b.to_string()))
                     .or_default()
-                    .insert(file.to_string());
+                    .insert((*file).to_string());
+            }
+        }
+        if let Some(children) = by_dir.get(file) {
+            for a in names {
+                for (b, child_path) in children {
+                    if a == b {
+                        continue;
+                    }
+                    let pair = if a < b {
+                        (a.to_string(), b.to_string())
+                    } else {
+                        (b.to_string(), a.to_string())
+                    };
+                    let set = candidates.entry(pair).or_default();
+                    set.insert((*file).to_string());
+                    set.insert((*child_path).to_string());
+                }
             }
         }
     }
@@ -384,6 +426,9 @@ pub fn forget(project_dir: &Path, name: &str) {
     };
     cache.sessions.remove(name);
     if let Ok(bytes) = serde_json::to_vec(&cache) {
-        let _ = std::fs::write(&path, bytes);
+        let tmp = project_dir.join(format!("conflicts-cache.json.tmp.{}", std::process::id()));
+        if std::fs::write(&tmp, bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 }

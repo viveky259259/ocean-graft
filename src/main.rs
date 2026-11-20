@@ -859,21 +859,29 @@ fn sandbox_command(
         bail!("--sandbox needs bubblewrap (bwrap) on PATH");
     }
     let mut cmd = Command::new("bwrap");
-    cmd.args(["--die-with-parent", "--ro-bind", "/", "/"])
-        .args(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"])
-        // Hide the template, the other sessions and the checkpoints...
-        .arg("--tmpfs")
-        .arg(project_dir)
-        // ...then bring back only this session, writable.
-        .arg("--bind")
-        .arg(session)
-        .arg(session)
-        .args(["--setenv", "XDG_CACHE_HOME", "/tmp/.cache"])
-        .args(["--setenv", "npm_config_cache", "/tmp/.npm"])
-        .arg("--chdir")
-        .arg(session)
-        .arg("--")
-        .args(command);
+    cmd.args([
+        "--die-with-parent",
+        "--unshare-pid",
+        "--cap-drop",
+        "ALL",
+        "--ro-bind",
+        "/",
+        "/",
+    ])
+    .args(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"])
+    // Hide the template, the other sessions and the checkpoints...
+    .arg("--tmpfs")
+    .arg(project_dir)
+    // ...then bring back only this session, writable.
+    .arg("--bind")
+    .arg(session)
+    .arg(session)
+    .args(["--setenv", "XDG_CACHE_HOME", "/tmp/.cache"])
+    .args(["--setenv", "npm_config_cache", "/tmp/.npm"])
+    .arg("--chdir")
+    .arg(session)
+    .arg("--")
+    .args(command);
     Ok((cmd, TempDir(None)))
 }
 
@@ -887,9 +895,10 @@ fn sbpl_string(path: &Path) -> String {
 /// except writing outside the session, its temporary directory and /dev,
 /// and reading the rest of the project. Later rules win over earlier ones.
 fn seatbelt_profile(project_dir: &Path, session: &Path, tmp: &Path) -> String {
-    let (project, sessions) = (
+    let (project, sessions, sandbox_tmp) = (
         sbpl_string(project_dir),
         sbpl_string(&project_dir.join("sessions")),
+        sbpl_string(&project_dir.join("sandbox-tmp")),
     );
     let (session, tmp) = (sbpl_string(session), sbpl_string(tmp));
     format!(
@@ -899,7 +908,7 @@ fn seatbelt_profile(project_dir: &Path, session: &Path, tmp: &Path) -> String {
          (allow file-write* (subpath {session}) (subpath {tmp}) (subpath \"/dev\"))\n\
          (deny file-read* (subpath {project}))\n\
          (allow file-read* (subpath {session}) (subpath {tmp}))\n\
-         (allow file-read-metadata (literal {project}) (literal {sessions}))\n"
+         (allow file-read-metadata (literal {project}) (literal {sessions}) (literal {sandbox_tmp}))\n"
     )
 }
 
@@ -931,6 +940,7 @@ fn seatbelt_command(
     let mut cmd = Command::new(SANDBOX_EXEC);
     cmd.arg("-p")
         .arg(seatbelt_profile(&project_dir, &session, &tmp))
+        .arg("--")
         .args(command)
         .env("TMPDIR", &tmp)
         .env("XDG_CACHE_HOME", tmp.join(".cache"))
@@ -1186,6 +1196,9 @@ fn cmd_wake(p: &mut Project, name: &str) -> Result<()> {
             .get_mut(name)
             .expect("session exists")
             .services[i] = svc;
+        // Persist each started service immediately so a failure starting a
+        // later service never leaves an earlier one orphaned and untracked.
+        p.save()?;
         woken += 1;
     }
     p.mark_active(name)?;
@@ -1239,7 +1252,13 @@ fn reap_once(idle: u64) -> Result<()> {
                 }
             }
         }
-        let freed = services::stop_all(targets)?;
+        let freed = match services::stop_all(targets) {
+            Ok(freed) => freed,
+            Err(err) => {
+                eprintln!("ocean-graft: could not reap {}: {err:#}", dir.display());
+                continue;
+            }
+        };
         p.save()?;
         for (name, idle_for) in due {
             let mine: Vec<u64> = owners
@@ -1266,6 +1285,9 @@ fn cmd_reap(idle: &str, watch: Option<&str>) -> Result<()> {
         None => reap_once(idle),
         Some(interval) => {
             let interval = services::parse_duration(interval)?;
+            if interval.is_zero() {
+                bail!("--watch interval must be greater than 0s");
+            }
             println!(
                 "Stopping services idle for {} or more; checking every {}",
                 services::human_secs(idle),
@@ -1493,10 +1515,7 @@ fn cmd_gc(p: &mut Project) -> Result<()> {
             let pid = file_name
                 .rsplit_once('-')
                 .and_then(|(_, pid)| pid.parse::<i32>().ok());
-            let running = pid.is_some_and(|pid| {
-                (unsafe { libc::kill(pid, 0) } == 0)
-                    || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-            });
+            let running = pid.is_some_and(|pid| pid > 0 && unsafe { libc::kill(pid, 0) } == 0);
             if !running && sys::remove_tree(entry.path()).is_ok() {
                 println!("Removed sandbox-tmp/{file_name}");
             }
@@ -1529,11 +1548,16 @@ fn cmd_info(p: &Project) -> Result<()> {
             .values()
             .filter(|s| s.generation == g.id)
             .count();
+        let size = g
+            .layers
+            .first()
+            .map(|l| sys::disk_usage(&p.abs(l)))
+            .unwrap_or(0);
         println!(
             "g{:<3} {}  {:>9}  {} session(s)  {}",
             g.id,
             git::short(&g.commit),
-            sys::human_bytes(sys::disk_usage(&p.abs(&g.layers[0]))),
+            sys::human_bytes(size),
             users,
             sys::human_age(g.created_at)
         );

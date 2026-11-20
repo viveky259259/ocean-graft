@@ -64,8 +64,14 @@ jobs:
           cargo build --release --locked --target ${{ matrix.target }}
           mkdir -p dist
           cp target/${{ matrix.target }}/release/ocean-graft dist/${{ matrix.asset }}
-          strip dist/${{ matrix.asset }} || true
-          ./dist/${{ matrix.asset }} --version || true
+          strip dist/${{ matrix.asset }}
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            codesign --force --sign - dist/${{ matrix.asset }}
+            codesign --verify --strict dist/${{ matrix.asset }}
+          fi
+          if [ "${{ matrix.target }}" != "x86_64-apple-darwin" ]; then
+            ./dist/${{ matrix.asset }} --version
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
@@ -90,11 +96,13 @@ jobs:
         run: |
           set -eu
           cd dist
+          expected="ocean-graft-darwin-arm64 ocean-graft-darwin-x86_64 ocean-graft-linux-aarch64 ocean-graft-linux-x86_64"
           {
             echo "# ocean-graft release binaries; the plugin launcher verifies downloads against this file."
             echo "version $VERSION"
-            for f in ocean-graft-*; do
-              echo "sha256 $f $(sha256sum "$f" | awk '{print $1}')"
+            for f in $expected; do
+              [ -s "$f" ] || { echo "missing or empty asset: $f" >&2; exit 1; }
+              echo "sha256 $f $(LC_ALL=C sha256sum "$f" | awk '{print $1}')"
             done
           } > ../plugin/libexec/release.txt
           cd ..
@@ -104,7 +112,7 @@ jobs:
           git add plugin/libexec/release.txt
           git commit -m "release: v$VERSION"
           git tag "v$VERSION"
-          git push origin "HEAD:${GITHUB_REF_NAME}" "v$VERSION"
+          git push --atomic origin "HEAD:${GITHUB_REF_NAME}" "v$VERSION"
           gh release create "v$VERSION" dist/ocean-graft-* plugin/libexec/release.txt \
             --title "ocean-graft v$VERSION" \
             --notes "Binaries for the ocean-graft CLI and its Claude Code plugin. The plugin downloads the one for your machine on first use and checks it against plugin/libexec/release.txt."

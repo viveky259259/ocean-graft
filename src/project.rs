@@ -188,8 +188,10 @@ impl Pending {
 
     /// Whether the process doing the copy is still running.
     pub fn alive(&self) -> bool {
-        let exists = unsafe { libc::kill(self.pid, 0) } == 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+        if self.pid <= 0 {
+            return false;
+        }
+        let exists = unsafe { libc::kill(self.pid, 0) } == 0;
         exists
             && match (&self.pid_start, sys::process_start(self.pid)) {
                 (Some(then), Some(now)) => *then == now,
@@ -413,6 +415,12 @@ impl Project {
     }
 
     fn open_with(dir: PathBuf, wait: Option<std::time::Duration>) -> Result<Project> {
+        // Check for state.json before creating the lock file, so pointing
+        // --project at a non-project directory (such as a git repository) does
+        // not leave an untracked `lock` file behind.
+        if !dir.join("state.json").is_file() {
+            bail!("no project state in {}", dir.display());
+        }
         let lock = lock(&dir, wait)?;
         let state = read_state(&dir)?;
         let mut project = Project {
@@ -673,8 +681,28 @@ impl Project {
             }
         }
         let mut used: HashSet<u16> = self.state.sessions.values().map(|s| s.port).collect();
+        // Scan in-flight reservations *before* reading other projects' state.json:
+        // a creator writes state.json before dropping its PortReservation, so
+        // checking reservations first guarantees every allocated port is seen in
+        // at least one of the two scans.
+        if let Ok(entries) = std::fs::read_dir(&reservations) {
+            for entry in entries.flatten() {
+                let Ok(port) = entry.file_name().to_string_lossy().parse::<u16>() else {
+                    continue;
+                };
+                let owner = std::fs::read_to_string(entry.path())
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i32>().ok());
+                let alive = owner.is_some_and(|pid| pid > 0 && unsafe { libc::kill(pid, 0) } == 0);
+                if alive {
+                    used.insert(port);
+                } else {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
         // Other projects' sessions, read without their locks: their
-        // in-flight creations are covered by the reservations below.
+        // in-flight creations were captured above.
         for dir in all_projects().unwrap_or_default() {
             if dir == self.dir {
                 continue;
@@ -684,27 +712,6 @@ impl Project {
                 .and_then(|raw| serde_json::from_slice::<State>(&raw).ok())
             {
                 used.extend(state.sessions.values().map(|s| s.port));
-            }
-        }
-        // Reservations of creations in progress; stale ones (their process
-        // is gone) are cleared.
-        if let Ok(entries) = std::fs::read_dir(&reservations) {
-            for entry in entries.flatten() {
-                let Ok(port) = entry.file_name().to_string_lossy().parse::<u16>() else {
-                    continue;
-                };
-                let owner = std::fs::read_to_string(entry.path())
-                    .ok()
-                    .and_then(|s| s.trim().parse::<i32>().ok());
-                let alive = owner.is_some_and(|pid| {
-                    let rc = unsafe { libc::kill(pid, 0) };
-                    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-                });
-                if alive {
-                    used.insert(port);
-                } else {
-                    let _ = std::fs::remove_file(entry.path());
-                }
             }
         }
         let bound = sys::port_in_use;
