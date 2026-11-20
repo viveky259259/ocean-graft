@@ -1,5 +1,5 @@
 //! A project is one source repository's templates, sessions and checkpoints,
-//! stored under `$SHOAL_HOME/projects/<name>-<hash>/`:
+//! stored under `$OCEAN_GRAFT_HOME/projects/<name>-<hash>/`:
 //!
 //! ```text
 //! state.json      what exists (this file is the source of truth)
@@ -80,7 +80,7 @@ pub struct Service {
     /// The service runs as its own process group; this is the group id.
     pub pid: Option<i32>,
     pub started_at: u64,
-    /// Stopped by `shoal reap` because the session went idle.
+    /// Stopped by `ocean-graft reap` because the session went idle.
     #[serde(default)]
     pub stopped_for_idle: bool,
     /// On-demand services listen here; a gateway owns `port` and wakes them.
@@ -111,12 +111,12 @@ pub struct Session {
     pub lowers: Vec<String>,
     #[serde(default)]
     pub services: Vec<Service>,
-    /// Last time shoal ran something in the session (exec, run, serve, touch...).
+    /// Last time ocean-graft ran something in the session (exec, run, serve, touch...).
     #[serde(default)]
     pub last_active: u64,
     /// Made by the WorktreeCreate hook. Claude Code never sends
     /// WorktreeRemove for the worktrees of subagents and workflow agents, so
-    /// shoal removes hook-made sessions itself (saving their work) once idle
+    /// ocean-graft removes hook-made sessions itself (saving their work) once idle
     /// for a long time, unless they are `interactive`.
     #[serde(default)]
     pub hook_created: bool,
@@ -237,12 +237,12 @@ pub struct Project {
     _lock: File,
 }
 
-pub fn shoal_home() -> Result<PathBuf> {
-    if let Some(home) = std::env::var_os("SHOAL_HOME") {
+pub fn ocean_graft_home() -> Result<PathBuf> {
+    if let Some(home) = std::env::var_os("OCEAN_GRAFT_HOME") {
         return Ok(PathBuf::from(home));
     }
-    let home = std::env::var_os("HOME").context("HOME is not set; set SHOAL_HOME")?;
-    Ok(PathBuf::from(home).join(".shoal"))
+    let home = std::env::var_os("HOME").context("HOME is not set; set OCEAN_GRAFT_HOME")?;
+    Ok(PathBuf::from(home).join(".ocean-graft"))
 }
 
 fn fnv1a(bytes: &[u8]) -> u32 {
@@ -271,7 +271,7 @@ pub fn project_dir_for(source: &Path) -> Result<PathBuf> {
         })
         .collect();
     let hash = fnv1a(source.as_os_str().as_bytes());
-    Ok(shoal_home()?
+    Ok(ocean_graft_home()?
         .join("projects")
         .join(format!("{name}-{hash:08x}")))
 }
@@ -285,7 +285,7 @@ pub fn locate(explicit: Option<&Path>) -> Result<PathBuf> {
             .with_context(|| format!("project {} does not exist", dir.display()));
     }
     let cwd = std::env::current_dir()?.canonicalize()?;
-    if let Ok(projects) = shoal_home()?.join("projects").canonicalize() {
+    if let Ok(projects) = ocean_graft_home()?.join("projects").canonicalize() {
         if let Ok(rest) = cwd.strip_prefix(&projects) {
             if let Some(first) = rest.components().next() {
                 return Ok(projects.join(first));
@@ -296,7 +296,7 @@ pub fn locate(explicit: Option<&Path>) -> Result<PathBuf> {
     let dir = project_dir_for(&source)?;
     if !dir.join("state.json").exists() {
         bail!(
-            "{} has no shoal project yet; run `shoal init` there first",
+            "{} has no ocean-graft project yet; run `ocean-graft init` there first",
             source.display()
         );
     }
@@ -327,7 +327,7 @@ fn lock(dir: &Path, wait: Option<std::time::Duration>) -> Result<File> {
             return Ok(file);
         }
         if std::time::Instant::now() >= deadline {
-            bail!("the project is busy (another shoal command holds its lock)");
+            bail!("the project is busy (another ocean-graft command holds its lock)");
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
@@ -343,9 +343,9 @@ fn read_state(dir: &Path) -> Result<State> {
     Ok(state)
 }
 
-/// Every initialised project under SHOAL_HOME.
+/// Every initialised project under OCEAN_GRAFT_HOME.
 pub fn all_projects() -> Result<Vec<PathBuf>> {
-    let projects = shoal_home()?.join("projects");
+    let projects = ocean_graft_home()?.join("projects");
     let Ok(entries) = std::fs::read_dir(&projects) else {
         return Ok(Vec::new());
     };
@@ -373,7 +373,7 @@ impl Drop for PortReservation {
 /// Session names that mean something else to `fork`.
 pub const RESERVED_SESSION_NAMES: &[&str] = &["main", "template"];
 
-/// Names become directory names and part of the git branch `shoal/<name>`,
+/// Names become directory names and part of the git branch `ocean-graft/<name>`,
 /// so they must be safe as both.
 pub fn validate_name(kind: &str, name: &str) -> Result<()> {
     let ok = !name.is_empty()
@@ -426,7 +426,7 @@ impl Project {
     }
 
     /// Run `f` with the project lock released, then take it again and
-    /// re-read the state, which other shoal commands may have changed
+    /// re-read the state, which other ocean-graft commands may have changed
     /// meanwhile. For copies that can take minutes: what they read must be
     /// protected some other way (a session lock, or a `Pending` entry).
     pub fn without_lock<R>(&mut self, f: impl FnOnce() -> R) -> Result<R> {
@@ -502,7 +502,9 @@ impl Project {
                         continue;
                     }
                     if upper.symlink_metadata().is_err() {
-                        eprintln!("shoal: restoring session {name} after an interrupted rewind");
+                        eprintln!(
+                            "ocean-graft: restoring session {name} after an interrupted rewind"
+                        );
                         std::fs::rename(entry.path(), &upper)
                     } else {
                         sys::remove_tree(entry.path())
@@ -512,7 +514,7 @@ impl Project {
                 };
                 if let Err(err) = result {
                     eprintln!(
-                        "shoal: could not clean up {}: {err}",
+                        "ocean-graft: could not clean up {}: {err}",
                         entry.path().display()
                     );
                 }
@@ -554,14 +556,14 @@ impl Project {
             }
             let session = self.session_path(name);
             let result = if session.symlink_metadata().is_err() {
-                eprintln!("shoal: restoring session {name} after an interrupted rewind");
+                eprintln!("ocean-graft: restoring session {name} after an interrupted rewind");
                 std::fs::rename(entry.path(), &session)
             } else {
                 sys::remove_tree(entry.path())
             };
             if let Err(err) = result {
                 eprintln!(
-                    "shoal: could not clean up {}: {err}",
+                    "ocean-graft: could not clean up {}: {err}",
                     entry.path().display()
                 );
             }
@@ -596,7 +598,7 @@ impl Project {
         self.state
             .sessions
             .get(name)
-            .with_context(|| format!("no session named {name:?} (see `shoal ls`)"))
+            .with_context(|| format!("no session named {name:?} (see `ocean-graft ls`)"))
     }
 
     pub fn session_path(&self, name: &str) -> PathBuf {
@@ -652,7 +654,7 @@ impl Project {
     /// anything. The reservation lasts until the returned guard is dropped,
     /// by which time the new session is recorded in state.json.
     pub fn reserve_port(&self) -> Result<PortReservation> {
-        let home = shoal_home()?;
+        let home = ocean_graft_home()?;
         let reservations = home.join("ports");
         std::fs::create_dir_all(&reservations)?;
         let lock = File::options()

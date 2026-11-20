@@ -204,6 +204,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "ocean-graft"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "indexmap",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -302,20 +316,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "shoal"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "clap",
- "indexmap",
- "libc",
- "serde",
- "serde_json",
- "tempfile",
- "toml",
 ]
 
 [[package]]

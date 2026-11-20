@@ -1,6 +1,6 @@
-# shoal release binaries; the plugin launcher verifies downloads against this file.
+# ocean-graft release binaries; the plugin launcher verifies downloads against this file.
 version 0.1.0
-sha256 shoal-darwin-arm64 2c43b7db3cd5b7944f72401a069db1d5060f595f2c5dafad8495eea49c5d3a2a
-sha256 shoal-darwin-x86_64 a92454eb9836e0504d8d4dafa214ccd63d586f64af18cf4ad3a5ced157fc4078
-sha256 shoal-linux-aarch64 af15faf210ec6393c0cbdda8a961e6d7f0ae4ac15ce602adbff364ca61f614bb
-sha256 shoal-linux-x86_64 28839650e467b3eb073b1d909e6a2000f5f049723bfd348f759cc4e940c3be89
+sha256 ocean-graft-darwin-arm64 2c43b7db3cd5b7944f72401a069db1d5060f595f2c5dafad8495eea49c5d3a2a
+sha256 ocean-graft-darwin-x86_64 a92454eb9836e0504d8d4dafa214ccd63d586f64af18cf4ad3a5ced157fc4078
+sha256 ocean-graft-linux-aarch64 af15faf210ec6393c0cbdda8a961e6d7f0ae4ac15ce602adbff364ca61f614bb
+sha256 ocean-graft-linux-x86_64 28839650e467b3eb073b1d909e6a2000f5f049723bfd348f759cc4e940c3be89

@@ -165,7 +165,7 @@ fn stat_into(dir: &Path, rel: &str, hash: u64) -> u64 {
 fn snapshot(dir: &Path, base: &str) -> Result<SessionEntry> {
     let snapshot = git::snapshot_commit(dir)?;
     // Keep the snapshot reachable so nothing prunes it.
-    git::git(dir, &["update-ref", "refs/shoal/snapshot", &snapshot])?;
+    git::git(dir, &["update-ref", "refs/ocean-graft/snapshot", &snapshot])?;
     let files = git::git(dir, &["diff", "--name-only", base, &snapshot])?
         .lines()
         .map(str::to_string)
@@ -373,7 +373,7 @@ pub fn check(p: &Project) -> Result<Report> {
     })
 }
 
-/// Used by `shoal rm`: forget a removed session.
+/// Used by `ocean-graft rm`: forget a removed session.
 pub fn forget(project_dir: &Path, name: &str) {
     let path = project_dir.join("conflicts-cache.json");
     let Ok(raw) = std::fs::read(&path) else {

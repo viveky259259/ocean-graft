@@ -1,4 +1,4 @@
-//! Edge cases for `shoal mcp`, driven as a real process: JSON-RPC framing,
+//! Edge cases for `ocean-graft mcp`, driven as a real process: JSON-RPC framing,
 //! the initialize handshake, notifications, ids, batches, malformed input,
 //! tools/list and tools/call error paths, stdout purity while engine code
 //! runs child processes, concurrency of calls, and shutdown with calls in
@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 // Local helpers
 // ---------------------------------------------------------------------------
 
-/// Output of a scripted `shoal mcp` run: everything was written to stdin,
+/// Output of a scripted `ocean-graft mcp` run: everything was written to stdin,
 /// stdin was closed, and the server ran to exit.
 struct Run {
     status: ExitStatus,
@@ -76,7 +76,7 @@ fn parse_stdout(raw: &str) -> Vec<Value> {
     out
 }
 
-/// Run `shoal mcp` in `dir`, feed it `input` (raw bytes), close stdin and
+/// Run `ocean-graft mcp` in `dir`, feed it `input` (raw bytes), close stdin and
 /// wait (at most `limit`) for it to exit.
 fn run_bytes_in(env: &Env, dir: &Path, input: Vec<u8>, limit: Duration) -> Run {
     let start = Instant::now();
@@ -117,7 +117,9 @@ fn run_bytes_in(env: &Env, dir: &Path, input: Vec<u8>, limit: Duration) -> Run {
             let _ = child.kill();
             let _ = child.wait();
             let err = String::from_utf8_lossy(&err_reader.join().unwrap()).into_owned();
-            panic!("shoal mcp did not exit within {limit:?} after stdin closed; stderr:\n{err}");
+            panic!(
+                "ocean-graft mcp did not exit within {limit:?} after stdin closed; stderr:\n{err}"
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
     };
@@ -217,7 +219,7 @@ fn expect_rpc_error(resp: &Value, code: i64) {
     assert!(resp.get("result").is_none(), "{resp}");
 }
 
-/// No project directory may exist under SHOAL_HOME (nothing auto-initialised).
+/// No project directory may exist under OCEAN_GRAFT_HOME (nothing auto-initialised).
 fn assert_no_project(env: &Env) {
     let projects = env.home().join("projects");
     let found: Vec<PathBuf> = fs::read_dir(&projects)
@@ -231,11 +233,11 @@ fn assert_no_project(env: &Env) {
     assert!(found.is_empty(), "a project was created: {found:?}");
 }
 
-/// Commit a shoal.toml to the env's repository.
+/// Commit a ocean-graft.toml to the env's repository.
 fn write_config(env: &Env, toml: &str) {
-    fs::write(env.repo().join("shoal.toml"), toml).unwrap();
-    env.git(&env.repo(), &["add", "shoal.toml"]);
-    env.git(&env.repo(), &["commit", "-q", "-m", "add shoal.toml"]);
+    fs::write(env.repo().join("ocean-graft.toml"), toml).unwrap();
+    env.git(&env.repo(), &["add", "ocean-graft.toml"]);
+    env.git(&env.repo(), &["commit", "-q", "-m", "add ocean-graft.toml"]);
 }
 
 /// Run the initialize handshake on a live harness Mcp.
@@ -277,7 +279,7 @@ fn initialize_echoes_every_known_revision_and_reports_capabilities() {
         let res = &r["result"];
         assert_eq!(res["protocolVersion"], *v, "{r}");
         assert!(res["capabilities"]["tools"].is_object(), "{r}");
-        assert_eq!(res["serverInfo"]["name"], "shoal");
+        assert_eq!(res["serverInfo"]["name"], "ocean-graft");
         assert!(res["serverInfo"]["version"]
             .as_str()
             .is_some_and(|s| !s.is_empty()));
@@ -497,7 +499,7 @@ fn batches_answer_each_request_once_and_skip_notifications() {
     ]);
     let run = run_lines(&env, &[batch.to_string(), req_np(json!(99), "ping")]);
     assert!(run.status.success());
-    // Responses may come back one per line or as one array line; shoal writes
+    // Responses may come back one per line or as one array line; ocean-graft writes
     // one per line. Either way every request is answered exactly once.
     assert_eq!(run.one(&json!(1))["result"], json!({}));
     assert_eq!(
@@ -651,7 +653,7 @@ fn last_line_without_a_trailing_newline_is_still_answered() {
 // Fixed bug: a stdin line that is not valid UTF-8 makes `serve` treat the read
 // error as end-of-input (`Err(err) => break` in mcp::serve), so the server
 // stops reading and exits: every later request goes unanswered and Claude
-// Code loses all shoal tools for the rest of the session. A malformed line
+// Code loses all ocean-graft tools for the rest of the session. A malformed line
 // should be a -32700 parse error like any other garbage, and the server
 // should keep serving.
 #[test]
@@ -754,7 +756,7 @@ fn requests_without_method_and_client_responses() {
 // example `{"jsonrpc":"2.0","method":1,"params":"bar"}`) gets no reply at all;
 // mcp::handle returns None for any id-less object without a string method.
 // JSON-RPC 2.0 requires an Invalid Request error (-32600) with id null, as
-// shoal already does for non-object messages and empty batches.
+// ocean-graft already does for non-object messages and empty batches.
 #[test]
 fn invalid_request_without_id_gets_an_error_with_null_id() {
     let env = Env::new(5116);
@@ -969,7 +971,7 @@ fn an_idle_server_does_not_hold_the_project_lock() {
         json!({"session": "from-cli", "label": "c1"}),
     );
     assert!(!is_err, "{cp}");
-    let out = env.shoal(&["ls"]);
+    let out = env.ocean_graft(&["ls"]);
     assert!(out.contains("from-cli"), "{out}");
     assert!(mcp.close().success());
 }
@@ -1143,7 +1145,7 @@ fn fork_with_a_malformed_name_has_no_side_effects() {
 // Fixed bug: status turns every error from locating the project into
 // {"initialized": false, "next": "call fork to create the first session"},
 // including malformed arguments (`path: 1`, `project: false`) and a path that
-// does not exist. In a repository that already has a shoal project and
+// does not exist. In a repository that already has a ocean-graft project and
 // sessions, Claude is told there is no project and to fork a new one, instead
 // of being told its argument was wrong. Argument errors should be isError
 // results, and an initialized project must never be reported as missing.
@@ -1253,7 +1255,7 @@ fn tool_errors_with_a_project_name_the_fix() {
     let t = expect_tool_error(run.one(&json!(1)), "missing");
     assert!(t.contains("alpha"), "should list known sessions: {t}");
     expect_tool_error(run.one(&json!(2)), "session");
-    expect_tool_error(run.one(&json!(3)), "not inside a shoal session");
+    expect_tool_error(run.one(&json!(3)), "not inside a ocean-graft session");
     expect_tool_error(run.one(&json!(4)), "never-made");
     expect_tool_error(run.one(&json!(5)), "missing");
     expect_tool_error(run.one(&json!(6)), "never-made");
@@ -1400,13 +1402,13 @@ fn setup_that_reads_stdin_cannot_steal_protocol_bytes() {
     }
 }
 
-// Fixed bug: services started by a long-lived `shoal mcp` process are its
+// Fixed bug: services started by a long-lived `ocean-graft mcp` process are its
 // children, and nothing ever waits on them. When preview stop (or rewind,
 // discard) sends SIGTERM, the dev server dies but stays a zombie of the MCP
 // server, `kill(-pgid, 0)` keeps succeeding, and stop_all reports "process
 // group N did not stop" (isError) after waiting ~5 s. Through the CLI the
-// short-lived shoal process exits, so init reaps the child and this never
-// shows. Seen with `ps`: `[sleep] <defunct>` whose parent is `shoal mcp`.
+// short-lived ocean-graft process exits, so init reaps the child and this never
+// shows. Seen with `ps`: `[sleep] <defunct>` whose parent is `ocean-graft mcp`.
 #[test]
 fn services_started_through_mcp_can_be_stopped_through_mcp() {
     let env = Env::new(5144);
@@ -1626,8 +1628,8 @@ fn closing_stdin_with_a_call_in_flight_answers_it_then_exits_zero() {
     assert_eq!(read(env.repo().join("bye.txt")), "bye\n");
     // The landed branch is recorded and no lock is left behind: a new call works.
     assert!(env
-        .git(&env.repo(), &["branch", "--list", "shoal/bye"])
-        .contains("shoal/bye"));
+        .git(&env.repo(), &["branch", "--list", "ocean-graft/bye"])
+        .contains("ocean-graft/bye"));
     let st = env.api("status", json!({})).unwrap();
     assert_eq!(st["initialized"], true);
 }

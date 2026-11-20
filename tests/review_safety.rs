@@ -364,7 +364,7 @@ fn rewind_restart_errors(backend: &'static str) {
     .expect("checkpoint");
     write(&s.join("marker.txt"), "present\n");
     // "picky" refuses to start without marker.txt; "plain" always starts.
-    env.shoal(&[
+    env.ocean_graft(&[
         "serve",
         "svc",
         "--as",
@@ -374,7 +374,7 @@ fn rewind_restart_errors(backend: &'static str) {
         "-c",
         "test -f marker.txt || exit 3; exec sleep 60",
     ]);
-    env.shoal(&[
+    env.ocean_graft(&[
         "serve",
         "svc",
         "--as",
@@ -385,7 +385,7 @@ fn rewind_restart_errors(backend: &'static str) {
         "exec sleep 60",
     ]);
     let r = rewind(&env, "svc", "no-marker");
-    let _ = env.shoal_in(&env.repo(), &["stop", "svc"]);
+    let _ = env.ocean_graft_in(&env.repo(), &["stop", "svc"]);
     assert_eq!(r["label"], "no-marker");
     assert_eq!(r["saved_as"], "pre-rewind-1", "{r}");
     assert!(!s.join("marker.txt").exists(), "rewind did not happen");
@@ -429,13 +429,13 @@ fn clone_trash_restored_when_session_missing() {
     let trash = dir.join("trash-crash-me-99999");
     fs::rename(&s, &trash).unwrap();
     // Any command repairs it.
-    env.shoal(&["ls"]);
+    env.ocean_graft(&["ls"]);
     assert!(s.is_dir(), "session directory not restored");
     assert!(trash.symlink_metadata().is_err(), "trash left behind");
     assert_eq!(tree(&s), before);
     assert_eq!(
         env.git(&s, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
-        "shoal/crash-me"
+        "ocean-graft/crash-me"
     );
 }
 
@@ -468,7 +468,7 @@ fn clone_restore_dir_always_deleted() {
     let trash = dir.join("trash-crash-me-99999");
     write(&restore.join("partial.txt"), "half a checkpoint copy\n");
     fs::rename(&s, &trash).unwrap();
-    env.shoal(&["ls"]);
+    env.ocean_graft(&["ls"]);
     assert!(restore.symlink_metadata().is_err(), "restore copy left");
     assert!(trash.symlink_metadata().is_err(), "trash left");
     assert_eq!(tree(&s), before, "the session must come back from trash");
@@ -479,12 +479,12 @@ fn clone_unknown_session_never_touched() {
     let _s = fork(&env, "crash-me");
     let dir = env.project_dir();
     let ghost = dir.join("trash-ghost-99999");
-    write(&ghost.join("keep.txt"), "not shoal's to touch\n");
+    write(&ghost.join("keep.txt"), "not ocean-graft's to touch\n");
     let not_pid = dir.join("trash-crash-me-notapid");
     write(&not_pid.join("keep.txt"), "no pid suffix\n");
-    env.shoal(&["ls"]);
+    env.ocean_graft(&["ls"]);
     env.api("status", json!({})).expect("status");
-    assert_eq!(read(ghost.join("keep.txt")), "not shoal's to touch\n");
+    assert_eq!(read(ghost.join("keep.txt")), "not ocean-graft's to touch\n");
     assert!(
         dir.join("sessions/ghost").symlink_metadata().is_err(),
         "a session that is not in state must not be created"
@@ -525,7 +525,7 @@ fn overlay_interrupted_rewind_repaired() {
     fs::rename(volume.join("upper"), &aside).unwrap();
     fs::create_dir_all(staging.join("complete")).unwrap();
     env.api("status", json!({})).expect("status");
-    env.shoal(&["up"]);
+    env.ocean_graft(&["up"]);
     assert_eq!(
         tree(&s),
         before,
@@ -574,8 +574,8 @@ fn interrupted_rewind_is_repaired_on_next_open() {
 // Removal
 // ---------------------------------------------------------------------------
 
-// Fixed bug: extra branches are saved as shoal/<name>-<branch>, not
-// shoal/<name>--<branch> as rule 4 says: save_work passes "<name>--<branch>"
+// Fixed bug: extra branches are saved as ocean-graft/<name>-<branch>, not
+// ocean-graft/<name>--<branch> as rule 4 says: save_work passes "<name>--<branch>"
 // through sanitize_name, which collapses "--" to "-" (stashes keep "--"
 // because their suffix is added after sanitising). The single dash makes a
 // saved branch indistinguishable from (and able to collide with) the import
@@ -594,7 +594,7 @@ fn discard_saves_branches_and_stashes(backend: &'static str) {
     env.git(&s, &["add", "side.txt"]);
     env.git(&s, &["commit", "-q", "-m", "side work"]);
     let side_head = head(&env, &s);
-    env.git(&s, &["switch", "-q", "shoal/keeper"]);
+    env.git(&s, &["switch", "-q", "ocean-graft/keeper"]);
     // A branch whose commit is already in the source: nothing to save.
     env.git(&s, &["branch", "already-there", &main_before]);
     // Two stashes (stash@{0} is the newer one).
@@ -610,7 +610,7 @@ fn discard_saves_branches_and_stashes(backend: &'static str) {
         .expect("discard");
     assert!(!session_names(&env).contains(&"keeper".to_string()));
     assert_eq!(r["saved"]["committed_wip"], true, "{r}");
-    assert_eq!(r["saved"]["import"]["branch"], "shoal/keeper", "{r}");
+    assert_eq!(r["saved"]["import"]["branch"], "ocean-graft/keeper", "{r}");
     let mut extra: Vec<String> = r["saved"]["extra_branches"]
         .as_array()
         .unwrap_or_else(|| panic!("no extra_branches: {r}"))
@@ -618,7 +618,7 @@ fn discard_saves_branches_and_stashes(backend: &'static str) {
         .map(|b| b.as_str().unwrap().to_string())
         .collect();
     extra.sort();
-    // Contents first, by the names shoal reports, so a naming defect does not
+    // Contents first, by the names ocean-graft reports, so a naming defect does not
     // hide a content defect.
     assert_eq!(extra.len(), 3, "side, stash 0 and stash 1 expected: {r}");
     let side = extra
@@ -628,20 +628,26 @@ fn discard_saves_branches_and_stashes(backend: &'static str) {
     assert_eq!(tip(&env, side), side_head);
     assert_eq!(show(&env, side, "side.txt"), "side branch work\n");
     assert_eq!(
-        show(&env, "shoal/keeper--stash-0", "README.md"),
+        show(&env, "ocean-graft/keeper--stash-0", "README.md"),
         "stash two\n"
     );
     assert_eq!(
-        show(&env, "shoal/keeper--stash-1", "README.md"),
+        show(&env, "ocean-graft/keeper--stash-1", "README.md"),
         "stash one\n"
     );
-    assert_eq!(show(&env, "shoal/keeper", "own.txt"), "own branch work\n");
-    assert_eq!(show(&env, "shoal/keeper", "src/app.txt"), "uncommitted\n");
+    assert_eq!(
+        show(&env, "ocean-graft/keeper", "own.txt"),
+        "own branch work\n"
+    );
+    assert_eq!(
+        show(&env, "ocean-graft/keeper", "src/app.txt"),
+        "uncommitted\n"
+    );
     // The branch already in the source is skipped: nothing else was saved.
-    let mut in_source = source_branches(&env, "shoal/keeper");
+    let mut in_source = source_branches(&env, "ocean-graft/keeper");
     in_source.sort();
     let mut expected_in_source = extra.clone();
-    expected_in_source.push("shoal/keeper".to_string());
+    expected_in_source.push("ocean-graft/keeper".to_string());
     expected_in_source.sort();
     assert_eq!(
         in_source, expected_in_source,
@@ -652,9 +658,9 @@ fn discard_saves_branches_and_stashes(backend: &'static str) {
     assert_eq!(
         extra,
         vec![
-            "shoal/keeper--side",
-            "shoal/keeper--stash-0",
-            "shoal/keeper--stash-1"
+            "ocean-graft/keeper--side",
+            "ocean-graft/keeper--stash-0",
+            "ocean-graft/keeper--stash-1"
         ],
         "{r}"
     );
@@ -667,7 +673,7 @@ fn conflicting_branches(env: &Env, s: &Path) {
     env.git(s, &["switch", "-q", "-c", "other", "HEAD~1"]);
     write(&s.join("src/app.txt"), "theirs\n");
     env.git(s, &["commit", "-q", "-am", "theirs"]);
-    env.git(s, &["switch", "-q", "shoal/busy"]);
+    env.git(s, &["switch", "-q", "ocean-graft/busy"]);
 }
 
 fn discard_refuses_mid_rebase_and_merge(backend: &'static str) {
@@ -685,7 +691,7 @@ fn discard_refuses_mid_rebase_and_merge(backend: &'static str) {
     assert!(status_names(&env).contains(&"busy".to_string()));
     assert!(s.join(".git").exists(), "session files touched");
     assert!(
-        source_branches(&env, "shoal/busy").is_empty(),
+        source_branches(&env, "ocean-graft/busy").is_empty(),
         "nothing should be saved by a refused removal"
     );
     env.git(&s, &["rebase", "--abort"]);
@@ -702,8 +708,8 @@ fn discard_refuses_mid_rebase_and_merge(backend: &'static str) {
     let r = env
         .api("discard", json!({"session": "busy"}))
         .expect("discard after abort");
-    assert_eq!(r["saved"]["import"]["branch"], "shoal/busy", "{r}");
-    assert_eq!(show(&env, "shoal/busy", "src/app.txt"), "ours\n");
+    assert_eq!(r["saved"]["import"]["branch"], "ocean-graft/busy", "{r}");
+    assert_eq!(show(&env, "ocean-graft/busy", "src/app.txt"), "ours\n");
     // The other branch is saved too (its exact name is checked in
     // discard_saves_branches_and_stashes).
     let extra = r["saved"]["extra_branches"]
@@ -761,8 +767,8 @@ fn overlay_worktree_remove_keeps_work_in_upper() {
     assert!(upper.join("precious.txt").is_file());
     let r = env.hook("worktree-remove", &remove_input(&s), &env.repo(), None);
     assert_eq!(r.code, 0, "stderr:\n{}", r.stderr);
-    let saved = ref_exists(&env, &env.repo(), "refs/heads/shoal/wt-upper")
-        && show(&env, "shoal/wt-upper", "precious.txt") == "uncommitted work\n";
+    let saved = ref_exists(&env, &env.repo(), "refs/heads/ocean-graft/wt-upper")
+        && show(&env, "ocean-graft/wt-upper", "precious.txt") == "uncommitted work\n";
     let kept = upper.join("precious.txt").is_file();
     assert!(
         saved || kept,
@@ -776,7 +782,7 @@ fn stray_directory_blocks_exact_name_only(backend: &'static str) {
     // A crash between forgetting a session and deleting its files.
     let stray = env.project_dir().join("sessions/stray");
     write(&stray.join("leftover.txt"), "left by a crash\n");
-    let out = env.shoal_in(&env.repo(), &["new", "stray"]);
+    let out = env.ocean_graft_in(&env.repo(), &["new", "stray"]);
     assert!(!out.status.success(), "new stray must fail");
     let msg = format!("{}{}", stdout(&out), stderr(&out));
     assert!(
@@ -977,8 +983,8 @@ fn reused_names_keep_both(backend: &'static str) {
     let r = env
         .api("discard", json!({"session": "dup"}))
         .expect("discard 1");
-    assert_eq!(r["saved"]["import"]["branch"], "shoal/dup", "{r}");
-    let first_tip = tip(&env, "shoal/dup");
+    assert_eq!(r["saved"]["import"]["branch"], "ocean-graft/dup", "{r}");
+    let first_tip = tip(&env, "ocean-graft/dup");
 
     let s = fork(&env, "dup");
     write(&s.join("second.txt"), "second session\n");
@@ -986,15 +992,25 @@ fn reused_names_keep_both(backend: &'static str) {
         .api("discard", json!({"session": "dup"}))
         .expect("discard 2");
     assert_eq!(r["saved"]["committed_wip"], true, "{r}");
-    assert_eq!(r["saved"]["import"]["branch"], "shoal/dup-2", "{r}");
+    assert_eq!(r["saved"]["import"]["branch"], "ocean-graft/dup-2", "{r}");
 
-    assert_eq!(tip(&env, "shoal/dup"), first_tip, "shoal/dup moved");
-    assert_eq!(show(&env, "shoal/dup", "first.txt"), "first session\n");
-    assert_eq!(show(&env, "shoal/dup-2", "second.txt"), "second session\n");
+    assert_eq!(
+        tip(&env, "ocean-graft/dup"),
+        first_tip,
+        "ocean-graft/dup moved"
+    );
+    assert_eq!(
+        show(&env, "ocean-graft/dup", "first.txt"),
+        "first session\n"
+    );
+    assert_eq!(
+        show(&env, "ocean-graft/dup-2", "second.txt"),
+        "second session\n"
+    );
     let (has_first, _) = git_try(
         &env,
         &env.repo(),
-        &["cat-file", "-e", "shoal/dup-2:first.txt"],
+        &["cat-file", "-e", "ocean-graft/dup-2:first.txt"],
     );
     assert!(
         !has_first,
@@ -1005,7 +1021,7 @@ fn reused_names_keep_both(backend: &'static str) {
         env.git(&env.repo(), &["log", "--format=%H", "main"]),
         log_before
     );
-    for b in ["shoal/dup", "shoal/dup-2"] {
+    for b in ["ocean-graft/dup", "ocean-graft/dup-2"] {
         env.git(
             &env.repo(),
             &["merge-base", "--is-ancestor", &main_before, b],

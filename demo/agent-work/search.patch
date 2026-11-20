@@ -81,7 +81,7 @@ index 3b53202..3bc9fef 100644
  
 -export function renderPage(notes: Note[], total: number): string {
 +export function renderPage(notes: Note[], total: number, q = ""): string {
-   const session = process.env.SHOAL_SESSION ?? "local";
+   const session = process.env.OCEAN_GRAFT_SESSION ?? "local";
    const items = notes
      .map(
 @@ -33,6 +33,10 @@ export function renderPage(notes: Note[], total: number): string {

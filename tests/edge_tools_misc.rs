@@ -78,7 +78,7 @@ fn show(env: &Env, rev_path: &str) -> String {
     env.git(&env.repo(), &["show", rev_path])
 }
 
-/// Run `shoal api` with raw (possibly malformed) argument text.
+/// Run `ocean-graft api` with raw (possibly malformed) argument text.
 fn api_raw(env: &Env, dir: &Path, tool: &str, raw: &str) -> std::process::Output {
     env.command(BIN, dir)
         .args(["api", tool, raw])
@@ -86,7 +86,7 @@ fn api_raw(env: &Env, dir: &Path, tool: &str, raw: &str) -> std::process::Output
         .unwrap()
 }
 
-/// `shoal api` with git's upward search stopped at the test root, so a
+/// `ocean-graft api` with git's upward search stopped at the test root, so a
 /// directory outside the test repository really is outside any repository
 /// (the test tree itself lives inside a git checkout).
 fn api_c(env: &Env, dir: &Path, tool: &str, args: Value) -> Result<Value, String> {
@@ -143,7 +143,7 @@ fn session_names(env: &Env) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// A directory outside any repository and outside SHOAL_HOME.
+/// A directory outside any repository and outside OCEAN_GRAFT_HOME.
 fn outside_dir(env: &Env) -> PathBuf {
     let d = env.root.path().join("outside");
     fs::create_dir_all(&d).unwrap();
@@ -230,7 +230,7 @@ fn status_without_project_reports_uninitialized_and_creates_nothing() {
     let v = ok(env.api("status", json!({})), "status");
     assert_eq!(v["initialized"], false, "{v}");
     let msg = v["message"].as_str().unwrap();
-    assert!(msg.contains("no shoal project yet"), "{msg}");
+    assert!(msg.contains("no ocean-graft project yet"), "{msg}");
     assert!(v["next"].as_str().unwrap().contains("fork"), "{v}");
     assert_eq!(projects_count(&env), 0, "status must not create a project");
 
@@ -620,7 +620,7 @@ fn status_resolves_project_from_project_arg_env_and_session_path() {
         "status env+project",
     );
     assert_eq!(v["initialized"], true);
-    // `shoal --project` on the CLI.
+    // `ocean-graft --project` on the CLI.
     let out = env
         .command(BIN, &outside)
         .env("GIT_CEILING_DIRECTORIES", env.root.path())
@@ -789,7 +789,7 @@ fn conflicts_both_adding_the_same_new_file_differently_conflicts() {
 fn conflicts_errors_without_a_project_and_creates_nothing() {
     let env = Env::new(5533);
     let e = err(env.api("conflicts", json!({})), "conflicts no project");
-    assert!(e.contains("no shoal project yet"), "{e}");
+    assert!(e.contains("no ocean-graft project yet"), "{e}");
     assert_eq!(projects_count(&env), 0);
     let outside = outside_dir(&env);
     let e = err(
@@ -837,14 +837,20 @@ fn discard_default_saves_wip_and_imports_branch_then_removes() {
         let v = ok(env.api("discard", json!({"session": "a"})), "discard");
         assert_eq!(v["session"], "a");
         assert_eq!(v["saved"]["committed_wip"], true, "{v}");
-        assert_eq!(v["saved"]["import"]["branch"], "shoal/a", "{v}");
+        assert_eq!(v["saved"]["import"]["branch"], "ocean-graft/a", "{v}");
         assert_eq!(v["saved"]["import"]["commits"], 2, "{v}");
 
-        assert!(branch_exists(&env, "shoal/a"));
-        assert_eq!(show(&env, "shoal/a:committed.txt"), "c\n");
-        assert_eq!(show(&env, "shoal/a:src/app.txt"), "uncommitted edit\n");
-        assert_eq!(show(&env, "shoal/a:untracked.txt"), "u\n");
-        assert!(show(&env, "shoal/a").contains("WIP"), "WIP commit message");
+        assert!(branch_exists(&env, "ocean-graft/a"));
+        assert_eq!(show(&env, "ocean-graft/a:committed.txt"), "c\n");
+        assert_eq!(
+            show(&env, "ocean-graft/a:src/app.txt"),
+            "uncommitted edit\n"
+        );
+        assert_eq!(show(&env, "ocean-graft/a:untracked.txt"), "u\n");
+        assert!(
+            show(&env, "ocean-graft/a").contains("WIP"),
+            "WIP commit message"
+        );
 
         // Source repository untouched otherwise.
         assert_eq!(env.git(&env.repo(), &["rev-parse", "main"]), main_before);
@@ -891,7 +897,7 @@ fn discard_keep_work_false_removes_without_saving() {
         );
         assert_eq!(v["session"], "a");
         assert!(v["saved"].is_null(), "{v}");
-        assert!(!branch_exists(&env, "shoal/a"));
+        assert!(!branch_exists(&env, "ocean-graft/a"));
         assert!(!a.exists());
         assert!(session_names(&env).is_empty());
         assert!(env.state()["checkpoints"].as_array().unwrap().is_empty());
@@ -917,14 +923,14 @@ fn discard_clean_session_saves_nothing_and_creates_no_branch() {
     assert_eq!(v["saved"]["committed_wip"], false, "{v}");
     assert!(v["saved"]["import"]["branch"].is_null(), "{v}");
     assert_eq!(v["saved"]["import"]["commits"], 0);
-    assert!(!branch_exists(&env, "shoal/a"));
+    assert!(!branch_exists(&env, "ocean-graft/a"));
     assert!(session_names(&env).is_empty());
 }
 
-// Fixed bug: discard's import force-updates refs/heads/shoal/<name> ("+HEAD:...").
+// Fixed bug: discard's import force-updates refs/heads/ocean-graft/<name> ("+HEAD:...").
 // Session names are only unique among live sessions, so after one session
-// named "a" is discarded (its work saved as shoal/a), a later session that
-// reuses the name "a" overwrites shoal/a on its own discard, and the first
+// named "a" is discarded (its work saved as ocean-graft/a), a later session that
+// reuses the name "a" overwrites ocean-graft/a on its own discard, and the first
 // session's saved work is no longer on any branch. "Nothing lost" is broken.
 #[test]
 fn discard_twice_with_the_same_name_keeps_the_first_saved_work() {
@@ -933,7 +939,7 @@ fn discard_twice_with_the_same_name_keeps_the_first_saved_work() {
     let first = commit_file(&env, &a, "first.txt", "1\n", "first work");
     ok(env.api("discard", json!({"session": "a"})), "discard 1");
     assert_eq!(
-        env.git(&env.repo(), &["rev-parse", "shoal/a"]).trim(),
+        env.git(&env.repo(), &["rev-parse", "ocean-graft/a"]).trim(),
         first
     );
 
@@ -989,7 +995,7 @@ fn discard_resolves_the_session_from_a_path() {
         "discard path",
     );
     assert_eq!(v["session"], "a");
-    assert_eq!(show(&env, "shoal/a:work.txt"), "w\n");
+    assert_eq!(show(&env, "ocean-graft/a:work.txt"), "w\n");
     assert_eq!(session_names(&env), vec!["b".to_string()]);
 
     // Path outside any session.
@@ -997,7 +1003,7 @@ fn discard_resolves_the_session_from_a_path() {
         env.api("discard", json!({"path": env.repo().to_string_lossy()})),
         "discard repo path",
     );
-    assert!(e.contains("not inside a shoal session"), "{e}");
+    assert!(e.contains("not inside a ocean-graft session"), "{e}");
     // Path inside the template is not a session either.
     let template = fs::read_dir(env.project_dir())
         .unwrap()
@@ -1015,7 +1021,7 @@ fn discard_resolves_the_session_from_a_path() {
             env.api("discard", json!({"path": t.to_string_lossy()})),
             "discard template path",
         );
-        assert!(e.contains("not inside a shoal session"), "{e}");
+        assert!(e.contains("not inside a ocean-graft session"), "{e}");
     }
     // No session and no path.
     let e = err(env.api("discard", json!({})), "discard nothing");
@@ -1087,7 +1093,7 @@ fn concurrent_discards_of_different_and_same_sessions_keep_state_consistent() {
     assert!(session_names(&env).is_empty(), "{}", env.state());
     for (n, p) in names.iter().zip(&paths) {
         assert!(!p.exists());
-        assert_eq!(show(&env, &format!("shoal/{n}:{n}.txt")), *n);
+        assert_eq!(show(&env, &format!("ocean-graft/{n}:{n}.txt")), *n);
     }
 
     // The same session discarded twice at once: exactly one succeeds.
@@ -1110,7 +1116,7 @@ fn concurrent_discards_of_different_and_same_sessions_keep_state_consistent() {
     for e in results.iter().filter_map(|r| r.as_ref().err()) {
         assert!(e.contains("no session named"), "{e}");
     }
-    assert_eq!(show(&env, "shoal/dup:dup.txt"), "d");
+    assert_eq!(show(&env, "ocean-graft/dup:dup.txt"), "d");
     assert!(session_names(&env).is_empty());
 }
 
@@ -1265,16 +1271,16 @@ fn discard_stops_a_running_preview() {
 }
 
 #[test]
-fn preview_uses_the_preview_command_from_shoal_toml() {
+fn preview_uses_the_preview_command_from_ocean_graft_toml() {
     let env = Env::new(5540);
     fs::write(
-        env.repo().join("shoal.toml"),
+        env.repo().join("ocean-graft.toml"),
         // A TOML basic string: JSON string escapes are valid TOML.
         format!("preview = {}\n", serde_json::to_string(SERVER).unwrap()),
     )
     .unwrap();
-    env.git(&env.repo(), &["add", "shoal.toml"]);
-    env.git(&env.repo(), &["commit", "-q", "-m", "shoal.toml"]);
+    env.git(&env.repo(), &["add", "ocean-graft.toml"]);
+    env.git(&env.repo(), &["commit", "-q", "-m", "ocean-graft.toml"]);
     env.init("clone");
     let (_a, port, _) = fork(&env, "a");
     let s = ok(env.api("status", json!({})), "status");
@@ -1291,7 +1297,7 @@ fn preview_uses_the_preview_command_from_shoal_toml() {
         "{v}"
     );
     assert!(poll(Duration::from_secs(20), || http_status(port) == Some(200)));
-    // An explicit command of only whitespace falls back to shoal.toml too.
+    // An explicit command of only whitespace falls back to ocean-graft.toml too.
     ok(
         env.api("preview", json!({"session": "a", "stop": true})),
         "stop",
@@ -1320,7 +1326,7 @@ fn preview_uses_the_preview_command_from_shoal_toml() {
 // gateway then fails to bind and exits after preview has returned. The URL
 // handed to the user is served by the unrelated process, the dev server is
 // left running on its private port with no gateway, and a later preview
-// answers already_running for a URL shoal does not serve.
+// answers already_running for a URL ocean-graft does not serve.
 #[test]
 fn preview_refuses_when_the_session_port_is_already_taken() {
     let env = setup(5580, "clone");
@@ -1637,7 +1643,7 @@ fn session_tools_with_a_bad_project_fail_with_the_reason() {
             ),
             tool,
         );
-        assert!(e.contains("no shoal project yet"), "{tool}: {e}");
+        assert!(e.contains("no ocean-graft project yet"), "{tool}: {e}");
     }
     // Run from outside with no project at all.
     let e = err(
@@ -1856,8 +1862,8 @@ fn discard_a_parent_leaves_its_forked_child_intact() {
             "discard child",
         );
         assert_eq!(d["saved"]["committed_wip"], true, "{d}");
-        assert_eq!(show(&env, "shoal/child:parent-commit.txt"), "pc\n");
-        assert_eq!(show(&env, "shoal/child:child-edit.txt"), "ce\n");
+        assert_eq!(show(&env, "ocean-graft/child:parent-commit.txt"), "pc\n");
+        assert_eq!(show(&env, "ocean-graft/child:child-edit.txt"), "ce\n");
     }
 }
 
@@ -1868,7 +1874,7 @@ fn discard_fails_safely_when_its_branch_is_checked_out_in_the_source() {
     commit_file(&env, &a, "one.txt", "1\n", "one");
     ok(env.api("discard", json!({"session": "a"})), "first discard");
     // The user checks out the saved branch to look at it, and edits a file.
-    env.git(&env.repo(), &["checkout", "-q", "shoal/a"]);
+    env.git(&env.repo(), &["checkout", "-q", "ocean-graft/a"]);
     fs::write(env.repo().join("one.txt"), "user edit\n").unwrap();
 
     let (a2, _, _) = fork(&env, "a");
@@ -1879,7 +1885,7 @@ fn discard_fails_safely_when_its_branch_is_checked_out_in_the_source() {
     assert_eq!(
         env.git(&env.repo(), &["rev-parse", "--abbrev-ref", "HEAD"])
             .trim(),
-        "shoal/a"
+        "ocean-graft/a"
     );
     match r {
         // ...and if the save failed, the session (and its commit) is still there.
@@ -1928,7 +1934,7 @@ fn unsafe_kill_group(pgid: i32) {
 // ---------------------------------------------------------------------------
 
 /// `status` (per session) and the SessionStart context give Claude a
-/// command line for `shoal run`. Claude's Bash tool has no `shoal` on PATH
+/// command line for `ocean-graft run`. Claude's Bash tool has no `ocean-graft` on PATH
 /// when the plugin downloaded the binary, so the line names the binary by
 /// its full path, quoted: here a copy in a directory whose name has a space
 /// and a quote. Pasted into a shell, both lines run the command in the
@@ -1938,7 +1944,7 @@ fn the_run_command_in_status_and_session_start_works_from_a_shell() {
     let env = setup(5587, "clone");
     let odd = env.root.path().join("it's a dir");
     fs::create_dir_all(&odd).unwrap();
-    let bin = odd.join("shoal");
+    let bin = odd.join("ocean-graft");
     fs::copy(BIN, &bin).unwrap();
     let api = |tool: &str, args: Value| -> Value {
         let out = env

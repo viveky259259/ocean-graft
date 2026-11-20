@@ -1,9 +1,9 @@
 //! Wake-on-request for session services.
 //!
-//! `shoal serve --on-demand` runs the service on a private port and this
+//! `ocean-graft serve --on-demand` runs the service on a private port and this
 //! gateway on the session's public port. The gateway is a plain TCP relay
 //! (so HTTP, WebSockets and HMR all pass through) that:
-//!   - starts the service again with `shoal wake` when a connection arrives
+//!   - starts the service again with `ocean-graft wake` when a connection arrives
 //!     and nothing answers on the private port (because `reap` stopped it),
 //!     holding the connection until the service is up;
 //!   - records each connection as activity for the session, so a preview
@@ -60,7 +60,7 @@ struct Gateway {
     project_dir: PathBuf,
     session: String,
     internal_port: u16,
-    shoal: PathBuf,
+    ocean_graft: PathBuf,
     /// Only one connection at a time wakes the service; the rest wait for it.
     waking: Mutex<()>,
     last_touch: Mutex<Instant>,
@@ -100,15 +100,15 @@ impl Gateway {
             self.internal_port, self.session
         );
         let started = Instant::now();
-        let status = std::process::Command::new(&self.shoal)
+        let status = std::process::Command::new(&self.ocean_graft)
             .arg("--project")
             .arg(&self.project_dir)
             .args(["wake", &self.session])
             .stdin(std::process::Stdio::null())
             .status()
-            .context("could not run shoal wake")?;
+            .context("could not run ocean-graft wake")?;
         if !status.success() {
-            bail!("shoal wake {} failed ({status})", self.session);
+            bail!("ocean-graft wake {} failed ({status})", self.session);
         }
         while started.elapsed() < Duration::from_secs(60) {
             if answers(self.internal_port) {
@@ -185,7 +185,7 @@ pub fn run(project_dir: &Path, session: &str, public_port: u16, internal_port: u
         project_dir: project_dir.to_path_buf(),
         session: session.to_string(),
         internal_port,
-        shoal: std::env::current_exe().context("could not locate the shoal binary")?,
+        ocean_graft: std::env::current_exe().context("could not locate the ocean-graft binary")?,
         waking: Mutex::new(()),
         last_touch: Mutex::new(Instant::now() - Duration::from_secs(60)),
     });

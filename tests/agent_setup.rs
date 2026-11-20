@@ -1,4 +1,4 @@
-//! `shoal setup` and `shoal instructions`: shoal for Codex, Cursor, Gemini CLI
+//! `ocean-graft setup` and `ocean-graft instructions`: ocean-graft for Codex, Cursor, Gemini CLI
 //! and OpenCode. Every test runs the binary with HOME (and the agents' own
 //! directory variables) pointed at a throwaway directory.
 //!
@@ -59,7 +59,7 @@ impl Setup {
     }
 }
 
-fn shoal_path() -> String {
+fn ocean_graft_path() -> String {
     Path::new(BIN)
         .canonicalize()
         .unwrap()
@@ -77,9 +77,12 @@ fn instructions_are_the_skill_without_claude_only_parts() {
     let out = Command::new(BIN).arg("instructions").output().unwrap();
     assert!(out.status.success());
     let text = stdout(&out);
-    assert!(text.starts_with("# Working with shoal sessions"), "{text}");
+    assert!(
+        text.starts_with("# Working with ocean-graft sessions"),
+        "{text}"
+    );
     assert!(text.contains("pass `project`"));
-    assert!(text.contains("shoal api <tool>"));
+    assert!(text.contains("ocean-graft api <tool>"));
     assert!(!text.contains("mcp__plugin"));
     assert!(!text.contains("worktree isolation"));
 }
@@ -99,17 +102,17 @@ fn all_sets_up_every_installed_agent_and_nothing_else() {
 
     let toml: toml::Table = read(s.home.join(".codex/config.toml")).parse().unwrap();
     assert_eq!(
-        toml["mcp_servers"]["shoal"]["command"].as_str(),
-        Some(shoal_path().as_str())
+        toml["mcp_servers"]["ocean-graft"]["command"].as_str(),
+        Some(ocean_graft_path().as_str())
     );
     let gemini = json_file(&s.home.join(".gemini/settings.json"));
     assert_eq!(
-        gemini["mcpServers"]["shoal"],
-        json!({"command": shoal_path(), "args": ["mcp"]})
+        gemini["mcpServers"]["ocean-graft"],
+        json!({"command": ocean_graft_path(), "args": ["mcp"]})
     );
     // Codex reads AGENTS.md; Gemini CLI reads GEMINI.md.
-    assert!(read(s.repo.join("AGENTS.md")).contains("<!-- shoal:start"));
-    assert!(read(s.repo.join("GEMINI.md")).contains("<!-- shoal:start"));
+    assert!(read(s.repo.join("AGENTS.md")).contains("<!-- ocean-graft:start"));
+    assert!(read(s.repo.join("GEMINI.md")).contains("<!-- ocean-graft:start"));
 }
 
 #[test]
@@ -130,8 +133,8 @@ fn a_named_agent_is_set_up_even_before_it_is_installed() {
     let config = json_file(&s.home.join(".config/opencode/opencode.json"));
     assert_eq!(config["$schema"], "https://opencode.ai/config.json");
     assert_eq!(
-        config["mcp"]["shoal"],
-        json!({"type": "local", "command": [shoal_path(), "mcp"], "enabled": true})
+        config["mcp"]["ocean-graft"],
+        json!({"type": "local", "command": [ocean_graft_path(), "mcp"], "enabled": true})
     );
 }
 
@@ -148,7 +151,7 @@ fn a_second_run_changes_nothing() {
     assert!(s.run(&["cursor"]).status.success());
     let config = read(s.home.join(".cursor/mcp.json"));
     let agents = read(s.repo.join("AGENTS.md"));
-    assert!(agents.starts_with("# Ours\n\n<!-- shoal:start"));
+    assert!(agents.starts_with("# Ours\n\n<!-- ocean-graft:start"));
     let again = s.run(&["cursor"]);
     assert!(again.status.success());
     assert!(
@@ -188,7 +191,7 @@ fn an_edited_section_is_replaced_and_the_rest_of_the_file_kept() {
 }
 
 #[test]
-fn a_config_shoal_cannot_safely_edit_is_left_alone_and_the_rest_goes_on() {
+fn a_config_ocean_graft_cannot_safely_edit_is_left_alone_and_the_rest_goes_on() {
     let s = Setup::new();
     s.install(".cursor");
     s.install(".gemini");
@@ -204,7 +207,9 @@ fn a_config_shoal_cannot_safely_edit_is_left_alone_and_the_rest_goes_on() {
     assert!(text.contains("add this by hand: \"mcpServers\""), "{text}");
     assert_eq!(read(s.home.join(".cursor/mcp.json")), commented);
     // Gemini CLI was still set up.
-    assert!(json_file(&s.home.join(".gemini/settings.json"))["mcpServers"]["shoal"].is_object());
+    assert!(
+        json_file(&s.home.join(".gemini/settings.json"))["mcpServers"]["ocean-graft"].is_object()
+    );
 }
 
 #[test]
@@ -237,8 +242,8 @@ fn global_writes_each_agents_own_instructions_file() {
     fs::create_dir_all(&elsewhere).unwrap();
     let out = s.run_in(&elsewhere, &["codex", "gemini", "cursor", "--global"]);
     assert!(out.status.success(), "{}", stdout(&out));
-    assert!(read(s.home.join(".codex/AGENTS.md")).contains("<!-- shoal:start"));
-    assert!(read(s.home.join(".gemini/GEMINI.md")).contains("<!-- shoal:start"));
+    assert!(read(s.home.join(".codex/AGENTS.md")).contains("<!-- ocean-graft:start"));
+    assert!(read(s.home.join(".gemini/GEMINI.md")).contains("<!-- ocean-graft:start"));
     assert!(stdout(&out).contains("Cursor has no global instructions file"));
     assert!(!s.repo.join("AGENTS.md").exists());
 }
@@ -276,7 +281,7 @@ fn a_linked_dotfile_is_written_through_and_stays_a_link() {
     assert!(link.file_type().is_symlink());
     let text = read(dotfiles.join("config.toml"));
     assert!(text.starts_with("model = \"o4\"\n"));
-    assert!(text.contains("[mcp_servers.shoal]"));
+    assert!(text.contains("[mcp_servers.ocean-graft]"));
     assert!(!s.repo.join("AGENTS.md").exists());
 }
 

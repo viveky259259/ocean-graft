@@ -1,46 +1,46 @@
-# shoal
+# ocean-graft
 
 Copy-on-write session volumes for running coding agents in parallel, as a
 standalone CLI and a Claude Code plugin ([`plugin/`](plugin/)).
 
-`shoal init` builds a **template** from a git repository and runs a setup
-command in it once, for example `npm ci`. `shoal new` then gives each agent a
+`ocean-graft init` builds a **template** from a git repository and runs a setup
+command in it once, for example `npm ci`. `ocean-graft new` then gives each agent a
 **session**: a copy-on-write child of the template. A session is a complete
 checkout with its own `.git`, its own branch, installed dependencies and its
 own port. It is ready in milliseconds and stores only what it changes.
 
 ```bash
-cargo build --release    # binary: target/release/shoal
+cargo build --release    # binary: target/release/ocean-graft
 
 cd ~/code/my-app
-shoal init --setup "npm ci"                # once: clone + install into the template
-shoal new search                           # ~1.5 ms, warm, on branch shoal/search
-shoal new tags
-cd "$(shoal path search)"                  # point an agent here
-shoal ls                                   # what every session has changed
-shoal conflicts                            # overlaps and real conflicts, before anyone commits
-shoal import --all                         # commits come back as shoal/<name> branches
+ocean-graft init --setup "npm ci"                # once: clone + install into the template
+ocean-graft new search                           # ~1.5 ms, warm, on branch ocean-graft/search
+ocean-graft new tags
+cd "$(ocean-graft path search)"                  # point an agent here
+ocean-graft ls                                   # what every session has changed
+ocean-graft conflicts                            # overlaps and real conflicts, before anyone commits
+ocean-graft import --all                         # commits come back as ocean-graft/<name> branches
 ```
 
 ## Claude Code plugin
 
-[`plugin/`](plugin/) makes shoal something Claude uses on its own. Claude is
+[`plugin/`](plugin/) makes ocean-graft something Claude uses on its own. Claude is
 the operator: it forks, checkpoints, rewinds, previews and lands through MCP
 tools, and hooks give every `claude --worktree` session and every subagent
-with `isolation: worktree` its own shoal session automatically.
+with `isolation: worktree` its own ocean-graft session automatically.
 
 In a terminal:
 
 ```bash
-claude plugin install shoal --marketplace viveky259259/ocean_fs
+claude plugin install ocean-graft --marketplace viveky259259/ocean-graft
 ```
 
-On first use the plugin downloads the shoal binary for your machine (macOS
+On first use the plugin downloads the ocean-graft binary for your machine (macOS
 on Apple Silicon or Intel, Linux on x86_64 or arm64) from this repository's
 releases, checks it against the SHA-256 in
 [`plugin/libexec/release.txt`](plugin/libexec/), which ships with the
-plugin, and caches it. To work on shoal itself, build it and load the plugin
-from the checkout; the launcher then uses `target/release/shoal`:
+plugin, and caches it. To work on ocean-graft itself, build it and load the plugin
+from the checkout; the launcher then uses `target/release/ocean-graft`:
 
 ```bash
 cargo build --release
@@ -67,21 +67,21 @@ recovery, the macOS rules) is in [`plugin/ARCHITECTURE.md`](plugin/ARCHITECTURE.
 
 ## Codex, Cursor, Gemini CLI, OpenCode and other agents
 
-Everything Claude does with shoal goes through its MCP server, `shoal mcp`,
+Everything Claude does with ocean-graft goes through its MCP server, `ocean-graft mcp`,
 which any MCP client can start. Install the binary, then register it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/viveky259259/ocean_fs/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/viveky259259/ocean-graft/main/install.sh | sh
 cd your-repository
-shoal setup all
+ocean-graft setup all
 ```
 
 The installer downloads the binary for your machine from the latest release,
 checks it against that release's `release.txt`, and puts it in
-`~/.local/bin` (`SHOAL_INSTALL_DIR` to change it, `SHOAL_VERSION` for a
+`~/.local/bin` (`OCEAN_GRAFT_INSTALL_DIR` to change it, `OCEAN_GRAFT_VERSION` for a
 particular release). A binary that does not match is never installed.
 
-`shoal setup` then does two things for each agent:
+`ocean-graft setup` then does two things for each agent:
 
 | Agent | MCP server registered in | Instructions written to |
 |---|---|---|
@@ -91,20 +91,20 @@ particular release). A binary that does not match is never installed.
 | OpenCode | `~/.config/opencode/opencode.json` | `AGENTS.md` |
 
 `all` means every one of these installed here; name agents to choose
-(`shoal setup codex cursor`). The instructions go into the repository you
-run it in, between `<!-- shoal:start -->` and `<!-- shoal:end -->` markers
+(`ocean-graft setup codex cursor`). The instructions go into the repository you
+run it in, between `<!-- ocean-graft:start -->` and `<!-- ocean-graft:end -->` markers
 that a later run replaces; `--global` writes them to each agent's own global
 file instead (`~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md`,
 `~/.config/opencode/AGENTS.md`; Cursor has none), and `--no-instructions`
 skips them. `--dry-run` shows what would change.
 
-Setup only adds. An agent that already has a `shoal` server keeps it; the
+Setup only adds. An agent that already has a `ocean-graft` server keeps it; the
 rest of each config file keeps its text and order; a linked dotfile is
-written through and stays a link; and a config shoal cannot edit safely (JSON
+written through and stays a link; and a config ocean-graft cannot edit safely (JSON
 with comments, `opencode.jsonc`, TOML that does not parse) is left alone,
-with the entry to add by hand. `shoal instructions` prints the instructions
+with the entry to add by hand. `ocean-graft instructions` prints the instructions
 on their own: they are the plugin's skill, without the parts only Claude
-Code has, derived when shoal runs so the two cannot drift.
+Code has, derived when ocean-graft runs so the two cannot drift.
 
 What other agents do not get is the plugin's hooks: Claude Code's
 checkpoint at the end of every turn, and its worktree and subagent
@@ -120,12 +120,12 @@ MIT; see [`LICENSE`](LICENSE).
 | Command | What it does |
 |---|---|
 | `init [repo] --setup CMD [--copy .env] [--backend overlay\|clone]` | Clone the repo into a template and run the setup command in it once |
-| `new NAME` | Create a session from the latest template, on branch `shoal/NAME` |
+| `new NAME` | Create a session from the latest template, on branch `ocean-graft/NAME` |
 | `fork SOURCE NAME` | Copy a session as it is now, including uncommitted and ignored files |
 | `ls` / `status NAME` | Commits, uncommitted files, and the bytes each session stores |
 | `path NAME` | Print the session directory, mounting it again if needed |
 | `diff NAME [--stat]` | Everything changed against the template, including untracked files |
-| `exec [--sandbox] NAME -- CMD` | Run a command in the session with `SHOAL_SESSION`, `SHOAL_PORT` and `PORT` set |
+| `exec [--sandbox] NAME -- CMD` | Run a command in the session with `OCEAN_GRAFT_SESSION`, `OCEAN_GRAFT_PORT` and `PORT` set |
 | `shell [--sandbox] NAME` | Open a shell in the session |
 | `run [NAME] [--slots K] -- CMD` | Run a heavy command (tests, a build) once a machine-wide queue slot is free. Inside a session, NAME can be left out |
 | `queue [--slots N]` | Show running and waiting jobs, or set how many may run at once (default: one per CPU) |
@@ -135,12 +135,12 @@ MIT; see [`LICENSE`](LICENSE).
 | `wake NAME` / `touch NAME` | Restart services that `reap` stopped; mark a session active (for agent hooks) |
 | `checkpoint NAME [LABEL]` / `rewind NAME LABEL` | Save the whole session state and restore it later |
 | `conflicts` | Files that two or more sessions changed, and which pairs really conflict (`git merge-tree`). Incremental: only sessions that changed since the last check are looked at again |
-| `import [NAME...] [--all]` | Fetch session commits into the source repo as `shoal/NAME` branches |
+| `import [NAME...] [--all]` | Fetch session commits into the source repo as `ocean-graft/NAME` branches |
 | `refresh` | Build the next template generation from the source repo; setup re-runs only when a lockfile changed |
 | `rm NAME [--force]` | Remove a session; refuses if it would lose uncommitted or unimported work |
 | `up` / `down` | Mount or unmount every session, for example after a reboot |
 | `gc` / `info` | Delete unused layers; show generations and disk use |
-| `setup AGENT... [--global] [--no-instructions] [--dry-run]` | Register shoal's MCP server with Codex, Cursor, Gemini CLI or OpenCode (`all`: those installed) and add its instructions to AGENTS.md or GEMINI.md |
+| `setup AGENT... [--global] [--no-instructions] [--dry-run]` | Register ocean-graft's MCP server with Codex, Cursor, Gemini CLI or OpenCode (`all`: those installed) and add its instructions to AGENTS.md or GEMINI.md |
 | `instructions` | Print those instructions |
 | `mcp` | Serve the tools over MCP on stdin and stdout, for any MCP client |
 
@@ -160,14 +160,14 @@ Seatbelt (`sandbox-exec`): writes outside the session, its `$TMPDIR` and
 `/dev` are refused, and the rest of the project cannot be read. A tool that
 writes to `/tmp` directly instead of `$TMPDIR` is refused there.
 
-On macOS shoal follows a few extra rules (lower-case session names for the
+On macOS ocean-graft follows a few extra rules (lower-case session names for the
 case-insensitive APFS, kernel process data instead of `ps`/`lsof`, IPv6
 loopback for previews); see [`plugin/ARCHITECTURE.md`](plugin/ARCHITECTURE.md#macos).
 
 ## How it works
 
 ```text
-~/.shoal/projects/<repo>-<hash>/
+~/.ocean-graft/projects/<repo>-<hash>/
   state.json        what exists; every command takes a lock while it reads or writes it
   layers/g1/        overlay: generation 1 template (clone + installed dependencies)
   layers/g2/        overlay: what changed in generation 2, on top of g1
@@ -193,7 +193,7 @@ loopback for previews); see [`plugin/ARCHITECTURE.md`](plugin/ARCHITECTURE.md#ma
   repack shared objects. `refresh` builds a new generation on top of the old
   one; running sessions keep theirs.
 - **Ports.** Each session gets a block of ten from `port_base` (4100 by
-  default), unique on the machine; its first port is `SHOAL_PORT`, and `PORT`
+  default), unique on the machine; its first port is `OCEAN_GRAFT_PORT`, and `PORT`
   unless `PORT` is already set.
 
 ## Live test: four agents on one repo
@@ -203,8 +203,8 @@ Run on Linux 6.18 (4 vCPU VM) with the overlay backend, using
 Vitest tests and 1,506 files in `node_modules`.
 [`demo/run.sh`](demo/run.sh) reproduces the setup.
 
-1. **Template.** `shoal init --setup "npm ci"` took 1.7 s and used 128 MB.
-2. **Sessions.** `shoal new` created `search`, `tags`, `fix-limit` and
+1. **Template.** `ocean-graft init --setup "npm ci"` took 1.7 s and used 128 MB.
+2. **Sessions.** `ocean-graft new` created `search`, `tags`, `fix-limit` and
    `validation` in 1.2 to 1.5 ms each, plus 7 to 55 ms for the branch. The
    test suite passed in every session straight away, with no install step.
 3. **Agents.** Four agents worked at the same time, one per session:
@@ -239,13 +239,13 @@ Vitest tests and 1,506 files in `node_modules`.
 6. **Running side by side.** All four servers ran at once on ports
    4100–4130, each serving only its own change. See
    [`demo/four-sessions.png`](demo/four-sessions.png).
-7. **Import.** `shoal import --all` added four `shoal/*` branches to the
+7. **Import.** `ocean-graft import --all` added four `ocean-graft/*` branches to the
    source repo and left its working tree untouched.
 8. **Fork and rewind.**
    - A fork of `search` was ready in 11 ms.
    - After `rm -rf src node_modules` in the fork, its tests failed while
      `search` still passed.
-   - `shoal rewind` restored the fork in 90 ms, and its tests passed again.
+   - `ocean-graft rewind` restored the fork in 90 ms, and its tests passed again.
 
 ## Scale test: 100 sessions on one machine
 
@@ -259,11 +259,11 @@ overlay backend.
 | Create a session | 0.2 ms median for the first 10, 0.5 ms for the last 10, 1.2 ms worst; plus 4 ms to create the branch |
 | Disk for 104 sessions | 167 MB, of which the template is 128 MB |
 | Memory for files | `node_modules` read in 10 sessions occupied 109 MB of page cache, the same as in 1. Overlay sessions share the template's cache. Reflink copies on XFS do not: each extra copy added about 110 MB. |
-| `shoal ls` | 678 ms (about 6.5 ms per session) |
-| `shoal conflicts` | 5,356 pairs, of which 1,216 share a file and 955 conflict. The first version took 7.5 s. The incremental check takes 3.8 s the first time, 0.19 s when nothing changed, and 0.23 s after one session changes. |
+| `ocean-graft ls` | 678 ms (about 6.5 ms per session) |
+| `ocean-graft conflicts` | 5,356 pairs, of which 1,216 share a file and 955 conflict. The first version took 7.5 s. The incremental check takes 3.8 s the first time, 0.19 s when nothing changed, and 0.23 s after one session changes. |
 | Test suite in parallel | 53 runs/min with 1 session, 218 with 4, 231 with 8, 234 with 16. It saturates at the core count. |
 | One running dev server | 209 MB resident |
-| Remove 100 sessions | 1.65 s in one run and 12.4 s in another. The time is the kernel unmounting each overlay (16 to 220 ms), which shoal waits for so it never removes a session someone is still using. |
+| Remove 100 sessions | 1.65 s in one run and 12.4 s in another. The time is the kernel unmounting each overlay (16 to 220 ms), which ocean-graft waits for so it never removes a session someone is still using. |
 
 On one machine, storage stops being the limit. CPU and memory for running
 processes limit how many sessions can be active.
@@ -273,34 +273,34 @@ processes limit how many sessions can be active.
 On one machine, the limits are CPU and memory for running processes, not
 sessions. Two features keep many sessions practical.
 
-**Job queue.** `shoal run -- npm test` waits for one of N slots before it
+**Job queue.** `ocean-graft run -- npm test` waits for one of N slots before it
 starts. There is one slot per CPU by default, shared by every project on the
 machine.
 - Each slot is an exclusive lock on a file, so a job that crashes frees its
   slot at once. No daemon is needed.
 - Waiters line up in arrival order.
 - A job can ask for several slots (`--slots`).
-- `shoal queue` shows what is running and what is waiting.
+- `ocean-graft queue` shows what is running and what is waiting.
 
-**Idle shutdown.** `shoal serve` starts a session's dev server in its own
+**Idle shutdown.** `ocean-graft serve` starts a session's dev server in its own
 process group, on the session's port, with a log under `logs/` in the
-project. `shoal reap --idle 15m` stops the servers of sessions that have
+project. `ocean-graft reap --idle 15m` stops the servers of sessions that have
 been idle that long, and frees their memory. Run it with `--watch 1m` to
-keep checking. `shoal wake` starts them again.
+keep checking. `ocean-graft wake` starts them again.
 
 A session counts as active when any of these happen:
-- shoal runs something in it (`exec`, `run`, `serve`, `touch`)
+- ocean-graft runs something in it (`exec`, `run`, `serve`, `touch`)
 - a file in it changes, apart from dependency, build and cache directories
 - its git history moves
 
 `rm`, `down` and `rewind` stop a session's services first; `rewind` starts
 them again afterwards.
 
-**Wake on request.** `shoal serve NAME --on-demand -- CMD` runs the server
+**Wake on request.** `ocean-graft serve NAME --on-demand -- CMD` runs the server
 on a private port (given to it as `PORT`) and puts a small gateway on the
 session's public port. The gateway is a plain TCP relay, so HTTP,
 WebSockets and hot reload pass through. When a request arrives and nothing
-answers, the gateway runs `shoal wake` and holds the connection until the
+answers, the gateway runs `ocean-graft wake` and holds the connection until the
 server is up. Each request also counts as activity, so a preview someone is
 using is not reaped. `reap` leaves the gateway running; `stop`, `rm` and
 `down` remove it. With the notes app's dev server, the first request after
@@ -371,7 +371,7 @@ skipped otherwise.
   That copy is made without the project lock, so other sessions' commands
   go on meanwhile; commands on the session being copied wait for it (a land
   until its timeout).
-- A session's own services (`shoal serve`) are paused while it is
+- A session's own services (`ocean-graft serve`) are paused while it is
   checkpointed or forked, where that copy is cheap. Other writers are not:
   a checkpoint or fork taken while something else keeps changing the
   session is retried, and after three tries kept with a `warning`.
@@ -384,7 +384,7 @@ skipped otherwise.
 - Ports are allocated in blocks of ten that do not overlap any other
   session's block on the machine, and a block something already listens on
   is skipped; a port taken later by another program is not noticed.
-- The queue only governs commands started with `shoal run`. An agent that
+- The queue only governs commands started with `ocean-graft run`. An agent that
   runs `npm test` directly bypasses it, so agents have to be told to use it.
 - Wake on request is opt-in (`--on-demand`), because the server then sees a
   different port than the one users open. Most dev servers handle this, but

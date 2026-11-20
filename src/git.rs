@@ -7,7 +7,7 @@ use std::process::Command;
 
 pub fn command(dir: &Path) -> Command {
     let mut cmd = Command::new("git");
-    // GIT_OPTIONAL_LOCKS=0: shoal's own `git status` calls must not take
+    // GIT_OPTIONAL_LOCKS=0: ocean-graft's own `git status` calls must not take
     // index.lock and make an agent's concurrent `git commit` fail.
     cmd.arg("-C")
         .arg(dir)
@@ -110,7 +110,10 @@ pub fn short(rev: &str) -> &str {
 /// A commit holding the working tree as it is right now, including untracked
 /// (but not ignored) files. HEAD, the branch and the real index are untouched.
 pub fn snapshot_commit(dir: &Path) -> Result<String> {
-    let index = git_trim(dir, &["rev-parse", "--git-path", "shoal-snapshot-index"])?;
+    let index = git_trim(
+        dir,
+        &["rev-parse", "--git-path", "ocean-graft-snapshot-index"],
+    )?;
     let index = if Path::new(&index).is_absolute() {
         PathBuf::from(index)
     } else {
@@ -122,18 +125,25 @@ pub fn snapshot_commit(dir: &Path) -> Result<String> {
             command(dir)
                 .args(args)
                 .env("GIT_INDEX_FILE", &index)
-                .env("GIT_AUTHOR_NAME", "shoal")
-                .env("GIT_AUTHOR_EMAIL", "shoal@localhost")
-                .env("GIT_COMMITTER_NAME", "shoal")
-                .env("GIT_COMMITTER_EMAIL", "shoal@localhost"),
+                .env("GIT_AUTHOR_NAME", "ocean-graft")
+                .env("GIT_AUTHOR_EMAIL", "ocean-graft@localhost")
+                .env("GIT_COMMITTER_NAME", "ocean-graft")
+                .env("GIT_COMMITTER_EMAIL", "ocean-graft@localhost"),
         )
     };
     with_index(&["read-tree", "HEAD"])?;
     with_index(&["add", "-A"])?;
     let tree = with_index(&["write-tree"])?.trim().to_string();
-    let commit = with_index(&["commit-tree", &tree, "-p", "HEAD", "-m", "shoal snapshot"])?
-        .trim()
-        .to_string();
+    let commit = with_index(&[
+        "commit-tree",
+        &tree,
+        "-p",
+        "HEAD",
+        "-m",
+        "ocean-graft snapshot",
+    ])?
+    .trim()
+    .to_string();
     let _ = std::fs::remove_file(&index);
     Ok(commit)
 }

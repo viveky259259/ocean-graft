@@ -17,7 +17,7 @@
 //! Port range 5900-5999. Nothing here starts a service; the only listener is
 //! the one `bound_port_is_skipped_by_fork` binds itself, at 5990, which no
 //! other test here uses as a port_base. Ports are otherwise only recorded,
-//! so a brief bind by shoal's port probe in one test can at most make
+//! so a brief bind by ocean-graft's port probe in one test can at most make
 //! another test's fork skip a port; no test asserts an exact port except
 //! relative to its own listener.
 
@@ -44,9 +44,9 @@ extern "C" {
 const LOCK_EX: i32 = 2;
 const LOCK_NB: i32 = 4;
 
-/// `shoal init` with a fast setup whose input is deps.lock.
+/// `ocean-graft init` with a fast setup whose input is deps.lock.
 fn init_fast(env: &Env, backend: &str) {
-    env.shoal(&[
+    env.ocean_graft(&[
         "init",
         "--backend",
         backend,
@@ -72,7 +72,7 @@ fn sh_quote(p: &Path) -> String {
     format!("'{}'", p.display().to_string().replace('\'', "'\\''"))
 }
 
-/// Commit to main a shoal.toml whose setup appends a line to a marker file
+/// Commit to main a ocean-graft.toml whose setup appends a line to a marker file
 /// (outside the repository), sleeps `secs` and then installs deps/fresh,
 /// together with src/new.txt. Returns the marker path.
 fn commit_slow_setup(env: &Env, secs: u32) -> PathBuf {
@@ -82,7 +82,7 @@ fn commit_slow_setup(env: &Env, secs: u32) -> PathBuf {
         sh_quote(&marker)
     );
     fs::write(
-        env.repo().join("shoal.toml"),
+        env.repo().join("ocean-graft.toml"),
         format!("setup = {}\n", toml_str(&setup)),
     )
     .unwrap();
@@ -201,7 +201,7 @@ fn run_hook(
     }
 }
 
-/// `shoal api` in `dir` with extra environment variables.
+/// `ocean-graft api` in `dir` with extra environment variables.
 fn api_env(
     env: &Env,
     dir: &Path,
@@ -229,7 +229,7 @@ fn api_env(
     }
 }
 
-/// Hold queue slot `i` of this SHOAL_HOME (an exclusive flock, as a running
+/// Hold queue slot `i` of this OCEAN_GRAFT_HOME (an exclusive flock, as a running
 /// job does) until the returned file is dropped.
 fn hold_slot(env: &Env, i: usize) -> fs::File {
     use std::os::unix::io::AsRawFd;
@@ -380,7 +380,7 @@ fn gc_during_a_refresh_keeps_the_generation_being_built() {
             );
             assert!(generation_dir(&env, backend, 2).is_dir(), "[{backend}]");
             let t = Instant::now();
-            let gc = env.shoal(&["gc"]);
+            let gc = env.ocean_graft(&["gc"]);
             assert!(
                 t.elapsed() < Duration::from_secs(2),
                 "[{backend}] gc waited for the refresh"
@@ -418,7 +418,7 @@ fn gc_during_a_refresh_keeps_the_generation_being_built() {
         let (_, path) = first_session(&again);
         assert!(path.join("src/new.txt").is_file() && path.join("deps/fresh").is_file());
         // And a gc now (nothing building) keeps what sessions use.
-        env.shoal(&["gc"]);
+        env.ocean_graft(&["gc"]);
         let st = env.api("status", json!({})).unwrap();
         for s in st["sessions"].as_array().unwrap() {
             assert!(s["error"].is_null(), "[{backend}] {s}");
@@ -437,7 +437,7 @@ fn failed_refresh_falls_back_and_the_next_fork_refreshes_once_fixed() {
         init_fast(&env, backend);
         let repo = env.repo();
         fs::write(
-            repo.join("shoal.toml"),
+            repo.join("ocean-graft.toml"),
             "setup = \"echo setup-is-broken >&2; exit 3\"\n",
         )
         .unwrap();
@@ -504,7 +504,7 @@ fn failed_refresh_falls_back_and_the_next_fork_refreshes_once_fixed() {
 
         // Fix the setup: the next fork refreshes.
         fs::write(
-            repo.join("shoal.toml"),
+            repo.join("ocean-graft.toml"),
             "setup = \"mkdir -p deps && touch deps/fixed\"\n",
         )
         .unwrap();
@@ -732,7 +732,7 @@ fn land_deadline_bounds_the_wait_for_a_queue_slot() {
         let s = fork(&env, "s");
         commit_in(&env, &s, "src/feature.txt", "feature\n", "feature");
         let before = tip(&env, "main");
-        env.shoal(&["queue", "--slots", "2"]);
+        env.ocean_graft(&["queue", "--slots", "2"]);
         let slots = [hold_slot(&env, 0), hold_slot(&env, 1)];
 
         // Every slot is held: the land gives up at its deadline.
@@ -810,7 +810,7 @@ fn land_deadline_bounds_the_wait_for_a_queue_slot() {
 // Ports
 // ---------------------------------------------------------------------------
 
-/// A second repository at `<root>/repo2` sharing the Env's SHOAL_HOME.
+/// A second repository at `<root>/repo2` sharing the Env's OCEAN_GRAFT_HOME.
 fn second_repo(env: &Env, backend: &str) -> PathBuf {
     let repo2 = env.root.path().join("repo2");
     fs::create_dir_all(repo2.join("src")).unwrap();
@@ -818,7 +818,7 @@ fn second_repo(env: &Env, backend: &str) -> PathBuf {
     env.git(&repo2, &["init", "-q", "-b", "main"]);
     env.git(&repo2, &["add", "-A"]);
     env.git(&repo2, &["commit", "-q", "-m", "initial"]);
-    let out = env.shoal_in(
+    let out = env.ocean_graft_in(
         &repo2,
         &[
             "init",
@@ -941,7 +941,7 @@ fn status_and_stop_hook_leave_an_agents_index_lock_alone() {
         let lock = s.join(".git/index.lock");
         fs::write(&lock, b"agent-held").unwrap();
 
-        // A git that logs GIT_OPTIONAL_LOCKS for every call shoal makes.
+        // A git that logs GIT_OPTIONAL_LOCKS for every call ocean-graft makes.
         let fakebin = env.root.path().join("fakebin");
         fs::create_dir_all(&fakebin).unwrap();
         let log = env.root.path().join("git-calls.log");
@@ -993,7 +993,7 @@ fn status_and_stop_hook_leave_an_agents_index_lock_alone() {
         let hook = run_hook(&env, "stop", &json!({"cwd": s}), &s, &extra);
         assert_eq!(hook.code, 0, "[{backend}] {}", hook.stderr);
         assert!(
-            !hook.stderr.contains("shoal hook stop:"),
+            !hook.stderr.contains("ocean-graft hook stop:"),
             "[{backend}] stop failed: {}",
             hook.stderr
         );

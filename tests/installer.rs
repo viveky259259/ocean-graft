@@ -1,6 +1,6 @@
 //! install.sh: the standalone installer for agents other than Claude Code.
 //! A fake release is served from a local directory through file:// URLs
-//! (SHOAL_RELEASE_BASE), laid out as GitHub serves releases, so nothing
+//! (OCEAN_GRAFT_RELEASE_BASE), laid out as GitHub serves releases, so nothing
 //! touches the network.
 
 use std::fs;
@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-const FAKE_BINARY: &str = "#!/bin/sh\necho \"fake shoal $*\"\n";
+const FAKE_BINARY: &str = "#!/bin/sh\necho \"fake ocean-graft $*\"\n";
 
 fn platform_asset() -> String {
     let out = Command::new("sh")
@@ -18,9 +18,9 @@ fn platform_asset() -> String {
             r#"os=$(uname -s); arch=$(uname -m)
             if [ "$os" = Darwin ] && [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = 1 ]; then arch=arm64; fi
             case "$os-$arch" in
-              Darwin-*) echo "shoal-darwin-$arch" ;;
-              Linux-x86_64|Linux-amd64) echo shoal-linux-x86_64 ;;
-              Linux-aarch64|Linux-arm64) echo shoal-linux-aarch64 ;;
+              Darwin-*) echo "ocean-graft-darwin-$arch" ;;
+              Linux-x86_64|Linux-amd64) echo ocean-graft-linux-x86_64 ;;
+              Linux-aarch64|Linux-arm64) echo ocean-graft-linux-aarch64 ;;
             esac"#,
         )
         .output()
@@ -64,7 +64,7 @@ impl Release {
             .map(str::to_string)
             .unwrap_or_else(|| sha256(FAKE_BINARY.as_bytes()));
         let release_txt = format!(
-            "# test release\nversion {version}\nsha256 {asset} {sha}\nsha256 shoal-other-thing 00\n"
+            "# test release\nversion {version}\nsha256 {asset} {sha}\nsha256 ocean-graft-other-thing 00\n"
         );
         for served in [
             root.join("server/latest/download"),
@@ -84,12 +84,12 @@ impl Release {
         cmd.arg(script)
             .env("HOME", self.root.join("home"))
             .env(
-                "SHOAL_RELEASE_BASE",
+                "OCEAN_GRAFT_RELEASE_BASE",
                 format!("file://{}/server", self.root.display()),
             )
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-            .env_remove("SHOAL_VERSION")
-            .env_remove("SHOAL_INSTALL_DIR");
+            .env_remove("OCEAN_GRAFT_VERSION")
+            .env_remove("OCEAN_GRAFT_INSTALL_DIR");
         for (k, v) in envs {
             cmd.env(k, v);
         }
@@ -97,7 +97,7 @@ impl Release {
     }
 
     fn installed(&self) -> PathBuf {
-        self.root.join("home/.local/bin/shoal")
+        self.root.join("home/.local/bin/ocean-graft")
     }
 }
 
@@ -112,16 +112,16 @@ fn text(out: &Output) -> String {
 #[test]
 fn installs_the_latest_release_after_checking_it() {
     if platform_asset().is_empty() {
-        eprintln!("skipping: no shoal build for this platform");
+        eprintln!("skipping: no ocean-graft build for this platform");
         return;
     }
     let r = Release::new("9.9.9", None);
     let out = r.install(&[]);
     assert!(out.status.success(), "{}", text(&out));
     let log = text(&out);
-    assert!(log.contains("Installed shoal 9.9.9"), "{log}");
+    assert!(log.contains("Installed ocean-graft 9.9.9"), "{log}");
     assert!(log.contains("is not on your PATH"), "{log}");
-    assert!(log.contains("shoal setup all"), "{log}");
+    assert!(log.contains("ocean-graft setup all"), "{log}");
     assert_eq!(fs::read_to_string(r.installed()).unwrap(), FAKE_BINARY);
     let mode = fs::metadata(r.installed()).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o755);
@@ -130,7 +130,7 @@ fn installs_the_latest_release_after_checking_it() {
         .unwrap()
         .map(|e| e.unwrap().file_name())
         .collect();
-    assert_eq!(names, ["shoal"]);
+    assert_eq!(names, ["ocean-graft"]);
 }
 
 #[test]
@@ -159,12 +159,12 @@ fn installs_a_named_version_into_a_chosen_directory() {
     let dir = r.root.join("tools");
     let path = format!("{}:/usr/bin:/bin", dir.display());
     let out = r.install(&[
-        ("SHOAL_VERSION", "v1.2.3"),
-        ("SHOAL_INSTALL_DIR", dir.to_str().unwrap()),
+        ("OCEAN_GRAFT_VERSION", "v1.2.3"),
+        ("OCEAN_GRAFT_INSTALL_DIR", dir.to_str().unwrap()),
         ("PATH", &path),
     ]);
     assert!(out.status.success(), "{}", text(&out));
-    assert!(dir.join("shoal").exists());
+    assert!(dir.join("ocean-graft").exists());
     assert!(
         !text(&out).contains("is not on your PATH"),
         "{}",
@@ -178,14 +178,14 @@ fn a_version_that_is_not_released_fails_cleanly() {
         return;
     }
     let r = Release::new("1.2.3", None);
-    let out = r.install(&[("SHOAL_VERSION", "4.5.6")]);
+    let out = r.install(&[("OCEAN_GRAFT_VERSION", "4.5.6")]);
     assert!(!out.status.success());
     assert!(text(&out).contains("could not download"), "{}", text(&out));
     assert!(!r.installed().exists());
 }
 
 #[test]
-fn an_existing_shoal_is_replaced_whole() {
+fn an_existing_ocean_graft_is_replaced_whole() {
     if platform_asset().is_empty() {
         return;
     }

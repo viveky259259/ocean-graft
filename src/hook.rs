@@ -1,4 +1,4 @@
-//! `shoal hook <event>`: Claude Code hook handlers. Input is the hook's JSON
+//! `ocean-graft hook <event>`: Claude Code hook handlers. Input is the hook's JSON
 //! on stdin.
 //!
 //! - worktree-create / worktree-remove replace Claude Code's git worktree
@@ -67,7 +67,7 @@ fn agent_cwd(input: &Value) -> Option<PathBuf> {
 }
 
 /// The project and session `path` is inside, if it is inside a session.
-/// A path outside any shoal project is `Ok(None)`; a project that exists but
+/// A path outside any ocean-graft project is `Ok(None)`; a project that exists but
 /// cannot be opened (busy, corrupt state) is an error, so the caller can say
 /// why it skipped.
 fn session_at(path: &Path, wait: Option<Duration>) -> Result<Option<(Project, String)>> {
@@ -166,7 +166,7 @@ pub fn worktree_create(input: &Value) -> Result<PathBuf> {
     Ok(info.path.canonicalize().unwrap_or(info.path))
 }
 
-/// Run `shoal <args>` detached (own session, no stdio, cwd /), for work a
+/// Run `ocean-graft <args>` detached (own session, no stdio, cwd /), for work a
 /// hook must not wait for. Best effort.
 fn spawn_detached(args: &[&std::ffi::OsStr]) {
     use std::os::unix::process::CommandExt;
@@ -211,7 +211,7 @@ pub fn worktree_remove(input: &Value) -> Result<()> {
     let path = field(input, "worktree_path").context("no worktree_path in the hook input")?;
     let path = Path::new(path);
     if path.symlink_metadata().is_err() {
-        // Already gone. If it was a shoal session, clear its record too, so
+        // Already gone. If it was a ocean-graft session, clear its record too, so
         // status does not keep reporting a broken session.
         forget_missing_session(path);
         return Ok(());
@@ -221,7 +221,7 @@ pub fn worktree_remove(input: &Value) -> Result<()> {
             return Ok(()); // removed by another hook while we waited for the lock
         }
         bail!(
-            "{} is not a shoal session, so shoal will not delete it",
+            "{} is not a ocean-graft session, so ocean-graft will not delete it",
             path.display()
         );
     };
@@ -256,7 +256,7 @@ fn forget_missing_session(path: &Path) {
         return;
     };
     let Ok(projects) =
-        crate::project::shoal_home().and_then(|h| Ok(h.join("projects").canonicalize()?))
+        crate::project::ocean_graft_home().and_then(|h| Ok(h.join("projects").canonicalize()?))
     else {
         return;
     };
@@ -370,16 +370,16 @@ pub fn session_start(input: &Value) -> Result<Option<String>> {
     let s = p.session(&name)?;
     // Only promise automatic checkpoints where the Stop hook takes them.
     let checkpoints = if ops::checkpoints_are_cheap(&p) {
-        "A checkpoint is taken automatically at the end of each turn that changed something; use the shoal rewind tool to undo"
+        "A checkpoint is taken automatically at the end of each turn that changed something; use the ocean-graft rewind tool to undo"
     } else {
-        "Checkpoints are NOT taken automatically here (this filesystem cannot copy cheaply); call the shoal checkpoint tool yourself before risky steps, and rewind to undo"
+        "Checkpoints are NOT taken automatically here (this filesystem cannot copy cheaply); call the ocean-graft checkpoint tool yourself before risky steps, and rewind to undo"
     };
     Ok(Some(format!(
-        "You are working in shoal session \"{name}\" (branch {}, port {}), an isolated copy-on-write copy of {} with dependencies installed. Your changes stay here until you land them with the shoal land tool. {checkpoints}; fork to try alternatives, and preview to show the user the running app. Run tests and builds from this directory as `{} run -- <command>`: it waits for a free slot in the job queue this machine's sessions share, so parallel sessions do not overload it.",
+        "You are working in ocean-graft session \"{name}\" (branch {}, port {}), an isolated copy-on-write copy of {} with dependencies installed. Your changes stay here until you land them with the ocean-graft land tool. {checkpoints}; fork to try alternatives, and preview to show the user the running app. Run tests and builds from this directory as `{} run -- <command>`: it waits for a free slot in the job queue this machine's sessions share, so parallel sessions do not overload it.",
         s.branch,
         s.port,
         p.state.source.display(),
-        sys::shoal_command()
+        sys::ocean_graft_command()
     )))
 }
 
@@ -399,7 +399,7 @@ pub fn run(event: &str) -> i32 {
     let input = match read_input() {
         Ok(v) => v,
         Err(err) => {
-            eprintln!("shoal hook {event}: {err:#}");
+            eprintln!("ocean-graft hook {event}: {err:#}");
             return if matches!(event, "worktree-create" | "worktree-remove") {
                 1
             } else {
@@ -414,20 +414,20 @@ pub fn run(event: &str) -> i32 {
                 0
             }
             Err(err) => {
-                eprintln!("shoal hook worktree-create: {err:#}");
+                eprintln!("ocean-graft hook worktree-create: {err:#}");
                 1
             }
         },
         "worktree-remove" => match worktree_remove(&input) {
             Ok(()) => 0,
             Err(err) => {
-                eprintln!("shoal hook worktree-remove: {err:#}");
+                eprintln!("ocean-graft hook worktree-remove: {err:#}");
                 1
             }
         },
         "stop" => {
             if let Err(err) = stop(&input) {
-                eprintln!("shoal hook stop: {err:#}");
+                eprintln!("ocean-graft hook stop: {err:#}");
             }
             0
         }
@@ -435,19 +435,19 @@ pub fn run(event: &str) -> i32 {
             match session_start(&input) {
                 Ok(Some(text)) => println!("{text}"),
                 Ok(None) => {}
-                Err(err) => eprintln!("shoal hook session-start: {err:#}"),
+                Err(err) => eprintln!("ocean-graft hook session-start: {err:#}"),
             }
             0
         }
         "prompt" => {
             if let Err(err) = prompt(&input) {
-                eprintln!("shoal hook prompt: {err:#}");
+                eprintln!("ocean-graft hook prompt: {err:#}");
             }
             0
         }
         other => {
             eprintln!(
-                "shoal hook: unknown event {other:?}; events: {}",
+                "ocean-graft hook: unknown event {other:?}; events: {}",
                 EVENTS.join(", ")
             );
             // 1, not 2: exit 2 would block a prompt or a stop in Claude Code.

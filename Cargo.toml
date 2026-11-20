@@ -1,14 +1,14 @@
 [package]
-name = "shoal"
+name = "ocean-graft"
 version = "0.2.0"
 license = "MIT"
-repository = "https://github.com/viveky259259/ocean_fs"
+repository = "https://github.com/viveky259259/ocean-graft"
 edition = "2021"
 description = "Copy-on-write session volumes for running coding agents in parallel"
 publish = false
 
 [[bin]]
-name = "shoal"
+name = "ocean-graft"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,4 +1,4 @@
-//! Project configuration: `shoal.toml` at the repository root, with every
+//! Project configuration: `ocean-graft.toml` at the repository root, with every
 //! key optional. Missing keys are detected from the repository's lockfiles
 //! and manifests, so most projects need no file at all.
 
@@ -33,13 +33,13 @@ pub struct Config {
     pub backend: Option<Backend>,
 }
 
-pub const FILE_NAME: &str = "shoal.toml";
+pub const FILE_NAME: &str = "ocean-graft.toml";
 const MAX_FILE: u64 = 256 * 1024;
 /// Each session takes a block of ten ports, so the last base must leave room.
 pub const PORT_BASE_MAX: u16 = u16::MAX - 9;
 
-/// Read shoal.toml without following a symlink out of the repository and
-/// without blocking on a FIFO or device someone named shoal.toml.
+/// Read ocean-graft.toml without following a symlink out of the repository and
+/// without blocking on a FIFO or device someone named ocean-graft.toml.
 fn read_config_text(path: &Path) -> Result<Option<String>> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
@@ -269,7 +269,7 @@ mod tests {
             ("package-lock.json", "{}"),
             ("package.json", r#"{"scripts":{"test":"x"}}"#),
             (
-                "shoal.toml",
+                "ocean-graft.toml",
                 "setup = \"make deps\"\ntest = \"make check\"\ncopy = [\".env\"]\nport_base = 5000\nbackend = \"clone\"\n",
             ),
         ]);
@@ -283,16 +283,16 @@ mod tests {
 
     #[test]
     fn bad_files_are_rejected_with_the_reason() {
-        let r = repo(&[("shoal.toml", "setp = \"typo\"\n")]);
+        let r = repo(&[("ocean-graft.toml", "setp = \"typo\"\n")]);
         let err = format!("{:#}", load(r.path()).unwrap_err());
-        assert!(err.contains("shoal.toml is not valid"), "{err}");
-        let r = repo(&[("shoal.toml", "copy = [\"../secrets\"]\n")]);
+        assert!(err.contains("ocean-graft.toml is not valid"), "{err}");
+        let r = repo(&[("ocean-graft.toml", "copy = [\"../secrets\"]\n")]);
         assert!(load(r.path()).is_err());
-        let r = repo(&[("shoal.toml", "copy = [\"/etc/passwd\"]\n")]);
+        let r = repo(&[("ocean-graft.toml", "copy = [\"/etc/passwd\"]\n")]);
         assert!(load(r.path()).is_err());
-        let r = repo(&[("shoal.toml", "port_base = 99999\n")]);
+        let r = repo(&[("ocean-graft.toml", "port_base = 99999\n")]);
         assert!(load(r.path()).is_err());
-        let r = repo(&[("shoal.toml", "backend = \"zfs\"\n")]);
+        let r = repo(&[("ocean-graft.toml", "backend = \"zfs\"\n")]);
         assert!(load(r.path()).is_err());
     }
 

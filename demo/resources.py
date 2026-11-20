@@ -6,12 +6,12 @@ Run from the base repository of an initialised notes-app project (run.sh):
     python3 resources.py [--jobs 16] [--servers 8]
 
 A. Job queue: start the test suite in N sessions at the same moment, first
-   with `shoal exec` (no queue), then with `shoal run` (queued, one slot per
+   with `ocean-graft exec` (no queue), then with `ocean-graft run` (queued, one slot per
    CPU). Samples every 100 ms how many test runners are alive and how much
    memory they hold.
-B. Idle shutdown: start a dev server in M sessions with `shoal serve`, keep
-   two sessions busy, let the rest go idle, run `shoal reap`, and measure
-   the memory freed. Then `shoal wake` one session and time how long its
+B. Idle shutdown: start a dev server in M sessions with `ocean-graft serve`, keep
+   two sessions busy, let the rest go idle, run `ocean-graft reap`, and measure
+   the memory freed. Then `ocean-graft wake` one session and time how long its
    server takes to answer again.
 Everything it creates is removed at the end.
 """
@@ -65,7 +65,7 @@ def burst(names, verb):
     thread = threading.Thread(target=sampler.run)
     thread.start()
     start = time.perf_counter()
-    procs = [subprocess.Popen(["shoal", verb, n, "--", "npx", "vitest", "run"],
+    procs = [subprocess.Popen(["ocean-graft", verb, n, "--", "npx", "vitest", "run"],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
              for n in names]
     codes = [p.wait() for p in procs]
@@ -100,26 +100,26 @@ def main():
     names = [f"r{i:02d}" for i in range(1, count + 1)]
     results = {"cpus": os.cpu_count(), "queue_slots": None}
     for n in names:
-        sh("shoal", "new", n)
+        sh("ocean-graft", "new", n)
     try:
         # A. Job queue.
-        results["queue_slots"] = int(sh("shoal", "queue").split(" of ")[1].split()[0])
+        results["queue_slots"] = int(sh("ocean-graft", "queue").split(" of ")[1].split()[0])
         results["no_queue"] = burst(names[: args.jobs], "exec")
         results["queued"] = burst(names[: args.jobs], "run")
 
         # B. Idle shutdown.
         servers = names[: args.servers]
         for n in servers:
-            sh("shoal", "serve", n, "--", "npx", "tsx", "src/server.ts")
+            sh("ocean-graft", "serve", n, "--", "npx", "tsx", "src/server.ts")
         ports = {}
-        for line in sh("shoal", "services").splitlines()[1:]:
+        for line in sh("ocean-graft", "services").splitlines()[1:]:
             parts = line.split()
             if parts and parts[0] in servers:
                 ports[parts[0]] = int(parts[2])
         for n in servers:
             wait_http(ports[n])
         time.sleep(1)
-        listing = sh("shoal", "services")
+        listing = sh("ocean-graft", "services")
         server_kb = 0
         for line in listing.splitlines()[1:]:
             parts = line.split()
@@ -132,11 +132,11 @@ def main():
         time.sleep(4)
         busy = servers[:2]
         for n in busy:  # someone is still working in these two
-            path = sh("shoal", "path", n).strip()
+            path = sh("ocean-graft", "path", n).strip()
             with open(os.path.join(path, "src", "notes-draft.ts"), "w") as f:
                 f.write("// work in progress\n")
         start = time.perf_counter()
-        reaped = sh("shoal", "reap", "--idle", "3s")
+        reaped = sh("ocean-graft", "reap", "--idle", "3s")
         results["reap_s"] = round(time.perf_counter() - start, 2)
         freed_mb = 0.0
         for line in reaped.splitlines():
@@ -145,17 +145,17 @@ def main():
         results["reap_output"] = reaped.strip().splitlines()
         results["servers_stopped"] = len(reaped.strip().splitlines())
         results["memory_freed_mb"] = round(freed_mb)
-        still = [l.split()[0] for l in sh("shoal", "services").splitlines()[1:] if " running " in l]
+        still = [l.split()[0] for l in sh("ocean-graft", "services").splitlines()[1:] if " running " in l]
         results["still_running"] = still
 
         woken = servers[-1]
         start = time.perf_counter()
-        sh("shoal", "wake", woken)
+        sh("ocean-graft", "wake", woken)
         wait_http(ports[woken])
         results["wake_to_first_response_s"] = round(time.perf_counter() - start, 2)
     finally:
         for n in names:
-            sh("shoal", "rm", "--force", n, check=False)
+            sh("ocean-graft", "rm", "--force", n, check=False)
     print(json.dumps(results, indent=2))
 
 

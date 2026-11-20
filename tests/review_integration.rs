@@ -3,7 +3,7 @@ use common::*;
 
 // Regression tests for the Claude Code integration fixes of commit dda3697
 // (rules 2 and 5 of plugin/ARCHITECTURE.md, and the service part of rule 6):
-// the libexec/shoal-plugin launcher's exit-code mapping, the plugin
+// the libexec/ocean-graft-plugin launcher's exit-code mapping, the plugin
 // manifests, MCP protocol negotiation and SIGPIPE survival, honest
 // auto_checkpoints, the idle worktree sweep, and the PID-reuse guard on
 // service process groups.
@@ -35,7 +35,7 @@ fn plugin_dir() -> PathBuf {
 }
 
 fn launcher() -> PathBuf {
-    plugin_dir().join("libexec/shoal-plugin")
+    plugin_dir().join("libexec/ocean-graft-plugin")
 }
 
 fn scratch() -> tempfile::TempDir {
@@ -114,7 +114,7 @@ fn run_with(program: &Path, args: &[&str], input: &[u8], setup: impl FnOnce(&mut
 const TURN_HOOKS: &[&str] = &["stop", "session-start", "prompt"];
 const WORKTREE_HOOKS: &[&str] = &["worktree-create", "worktree-remove"];
 
-/// Run `shoal hook <event>` (the real binary) from `dir`.
+/// Run `ocean-graft hook <event>` (the real binary) from `dir`.
 fn hook_env(
     env: &Env,
     event: &str,
@@ -129,8 +129,8 @@ fn hook_env(
         input.to_string().as_bytes(),
         |cmd| {
             cmd.current_dir(dir)
-                .env("SHOAL_HOME", env.home())
-                .env_remove("SHOAL_PROJECT")
+                .env("OCEAN_GRAFT_HOME", env.home())
+                .env_remove("OCEAN_GRAFT_PROJECT")
                 .env_remove("CLAUDE_PROJECT_DIR")
                 .env("GIT_AUTHOR_NAME", "Test")
                 .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
@@ -172,7 +172,7 @@ fn turn_input(event: &str, cwd: &Path) -> Value {
 }
 
 /// WorktreeCreate from `cwd` with the given idle limit (None: the default,
-/// with SHOAL_WORKTREE_IDLE_HOURS removed). Returns (path, stderr).
+/// with OCEAN_GRAFT_WORKTREE_IDLE_HOURS removed). Returns (path, stderr).
 fn worktree_create(
     env: &Env,
     name: &str,
@@ -185,7 +185,7 @@ fn worktree_create(
             "worktree-create",
             &create_input(name, cwd),
             cwd,
-            &[("SHOAL_WORKTREE_IDLE_HOURS", h)],
+            &[("OCEAN_GRAFT_WORKTREE_IDLE_HOURS", h)],
             &[],
         ),
         None => hook_env(
@@ -194,7 +194,7 @@ fn worktree_create(
             &create_input(name, cwd),
             cwd,
             &[],
-            &["SHOAL_WORKTREE_IDLE_HOURS"],
+            &["OCEAN_GRAFT_WORKTREE_IDLE_HOURS"],
         ),
     };
     assert_eq!(
@@ -245,7 +245,7 @@ fn launcher_maps_failing_and_killed_binaries() {
         for (events, want) in [(TURN_HOOKS, 0), (WORKTREE_HOOKS, 1)] {
             for event in events {
                 let r = run_with(&launcher(), &["hook", event], b"{}", |cmd| {
-                    cmd.env("SHOAL_BIN", &fake).current_dir(dir.path());
+                    cmd.env("OCEAN_GRAFT_BIN", &fake).current_dir(dir.path());
                 });
                 if r.code() != want || r.status.signal().is_some() {
                     failures.push(format!(
@@ -267,38 +267,38 @@ fn launcher_passes_success_through() {
     write_exe(&fake, "#!/bin/sh\ncat >/dev/null\nexit 0\n");
     for event in TURN_HOOKS.iter().chain(WORKTREE_HOOKS) {
         let r = run_with(&launcher(), &["hook", event], b"{}", |cmd| {
-            cmd.env("SHOAL_BIN", &fake).current_dir(dir.path());
+            cmd.env("OCEAN_GRAFT_BIN", &fake).current_dir(dir.path());
         });
         assert_eq!(r.code(), 0, "hook {event}: {:?} {}", r.status, r.stderr);
     }
 }
 
-/// No binary at all (SHOAL_BIN unset, nothing bundled, no dev build, none on
+/// No binary at all (OCEAN_GRAFT_BIN unset, nothing bundled, no dev build, none on
 /// PATH): turn hooks 0, worktree hooks 1, mcp 1, with a reason on stderr.
 #[test]
 fn launcher_without_any_binary() {
     let dir = scratch();
-    // Nested so that "$here/../../target/release/shoal" does not exist.
-    let copy = dir.path().join("a/b/libexec/shoal-plugin");
+    // Nested so that "$here/../../target/release/ocean-graft" does not exist.
+    let copy = dir.path().join("a/b/libexec/ocean-graft-plugin");
     write_exe(&copy, &read(launcher()));
     assert!(!copy
         .parent()
         .unwrap()
-        .join("../../target/release/shoal")
+        .join("../../target/release/ocean-graft")
         .exists());
     let path = "/usr/bin:/bin";
     for d in path.split(':') {
         assert!(
-            !Path::new(d).join("shoal").exists(),
-            "{d}/shoal exists; this test needs a PATH without shoal"
+            !Path::new(d).join("ocean-graft").exists(),
+            "{d}/ocean-graft exists; this test needs a PATH without ocean-graft"
         );
     }
-    for shoal_bin in [None, Some("")] {
+    for ocean_graft_bin in [None, Some("")] {
         let setup = |cmd: &mut Command| {
             cmd.env("PATH", path).current_dir(dir.path());
-            match shoal_bin {
-                Some(v) => cmd.env("SHOAL_BIN", v),
-                None => cmd.env_remove("SHOAL_BIN"),
+            match ocean_graft_bin {
+                Some(v) => cmd.env("OCEAN_GRAFT_BIN", v),
+                None => cmd.env_remove("OCEAN_GRAFT_BIN"),
             };
         };
         for event in TURN_HOOKS {
@@ -306,7 +306,7 @@ fn launcher_without_any_binary() {
             assert_eq!(
                 r.code(),
                 0,
-                "hook {event} (SHOAL_BIN {shoal_bin:?}): {:?}",
+                "hook {event} (OCEAN_GRAFT_BIN {ocean_graft_bin:?}): {:?}",
                 r.status
             );
             assert!(
@@ -320,13 +320,18 @@ fn launcher_without_any_binary() {
             assert_eq!(
                 r.code(),
                 1,
-                "hook {event} (SHOAL_BIN {shoal_bin:?}): {:?}",
+                "hook {event} (OCEAN_GRAFT_BIN {ocean_graft_bin:?}): {:?}",
                 r.status
             );
             assert!(r.stdout.is_empty(), "hook {event} printed {:?}", r.stdout);
         }
         let r = run_with(&copy, &["mcp"], b"", setup);
-        assert_eq!(r.code(), 1, "mcp (SHOAL_BIN {shoal_bin:?}): {:?}", r.status);
+        assert_eq!(
+            r.code(),
+            1,
+            "mcp (OCEAN_GRAFT_BIN {ocean_graft_bin:?}): {:?}",
+            r.status
+        );
         assert!(r.stdout.is_empty(), "mcp printed {:?}", r.stdout);
     }
 }
@@ -351,7 +356,7 @@ fn launcher_passes_stdin_stdout_and_arguments_through() {
     );
     for event in WORKTREE_HOOKS.iter().chain(TURN_HOOKS) {
         let r = run_with(&launcher(), &["hook", event], input.as_bytes(), |cmd| {
-            cmd.env("SHOAL_BIN", &fake).current_dir(dir.path());
+            cmd.env("OCEAN_GRAFT_BIN", &fake).current_dir(dir.path());
         });
         assert_eq!(r.code(), 0, "hook {event}: {:?} {}", r.status, r.stderr);
         assert_eq!(
@@ -366,7 +371,7 @@ fn launcher_passes_stdin_stdout_and_arguments_through() {
     // mcp: exec'd, so the binary's exit code and both streams are its own.
     let rpc = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n";
     let r = run_with(&launcher(), &["mcp"], rpc.as_bytes(), |cmd| {
-        cmd.env("SHOAL_BIN", &fake).current_dir(dir.path());
+        cmd.env("OCEAN_GRAFT_BIN", &fake).current_dir(dir.path());
     });
     assert_eq!(r.code(), 0, "mcp: {:?} {}", r.status, r.stderr);
     assert_eq!(r.stdout, format!("{rpc}/made/up/session/path\n"));
@@ -381,25 +386,25 @@ fn unknown_hook_event_exits_1_never_2() {
     for event in ["bogus", "PreToolUse", "worktree_create", ""] {
         let r = run_with(Path::new(BIN), &["hook", event], b"{}", |cmd| {
             cmd.current_dir(dir.path())
-                .env("SHOAL_HOME", dir.path().join("home"))
+                .env("OCEAN_GRAFT_HOME", dir.path().join("home"))
                 .env("GIT_CEILING_DIRECTORIES", dir.path());
         });
         assert_eq!(
             r.code(),
             1,
-            "shoal hook {event:?}: {:?} stderr {}",
+            "ocean-graft hook {event:?}: {:?} stderr {}",
             r.status,
             r.stderr
         );
         assert!(
             r.stdout.is_empty(),
-            "shoal hook {event:?} printed {:?}",
+            "ocean-graft hook {event:?} printed {:?}",
             r.stdout
         );
         let r = run_with(&launcher(), &["hook", event], b"{}", |cmd| {
             cmd.current_dir(dir.path())
-                .env("SHOAL_BIN", BIN)
-                .env("SHOAL_HOME", dir.path().join("home"))
+                .env("OCEAN_GRAFT_BIN", BIN)
+                .env("OCEAN_GRAFT_HOME", dir.path().join("home"))
                 .env("GIT_CEILING_DIRECTORIES", dir.path());
         });
         assert_ne!(r.code(), 2, "launcher hook {event:?} exited 2");
@@ -445,16 +450,16 @@ fn manifests_point_at_the_libexec_launcher() {
         assert_eq!(commands.len(), 1, "{event}: {commands:?}");
         assert_eq!(
             commands[0],
-            format!("\"${{CLAUDE_PLUGIN_ROOT}}/libexec/shoal-plugin\" {args}"),
+            format!("\"${{CLAUDE_PLUGIN_ROOT}}/libexec/ocean-graft-plugin\" {args}"),
             "{event}"
         );
     }
     let mcp: Value = serde_json::from_str(&read(plugin_dir().join(".mcp.json"))).unwrap();
     assert_eq!(
-        mcp["mcpServers"]["shoal"]["command"],
-        "${CLAUDE_PLUGIN_ROOT}/libexec/shoal-plugin"
+        mcp["mcpServers"]["ocean-graft"]["command"],
+        "${CLAUDE_PLUGIN_ROOT}/libexec/ocean-graft-plugin"
     );
-    assert_eq!(mcp["mcpServers"]["shoal"]["args"], json!(["mcp"]));
+    assert_eq!(mcp["mcpServers"]["ocean-graft"]["args"], json!(["mcp"]));
     assert!(
         !plugin_dir().join("bin").exists(),
         "plugin/bin must be gone (it is put on PATH)"
@@ -574,7 +579,7 @@ fn mcp_children_get_the_default_sigpipe_disposition() {
     }
 }
 
-// Fixed bug: shoal mcp ignores every stdout write error (mcp.rs serve(): `let _ =
+// Fixed bug: ocean-graft mcp ignores every stdout write error (mcp.rs serve(): `let _ =
 // out.write_all(..)`), so contrary to the comment in main.rs it never ends on
 // a broken output pipe; with stdin left open it keeps running indefinitely.
 /// main.rs: "a write error then ends the server cleanly after in-flight
@@ -607,8 +612,8 @@ fn mcp_exits_when_its_output_pipe_is_gone() {
     let _ = child.kill();
     let _ = child.wait();
     drop(stdin);
-    let status =
-        status.expect("shoal mcp kept running after its stdout pipe broke (stdin still open)");
+    let status = status
+        .expect("ocean-graft mcp kept running after its stdout pipe broke (stdin still open)");
     assert_ne!(status.signal(), Some(libc::SIGPIPE), "died of SIGPIPE");
 }
 
@@ -663,11 +668,11 @@ fn mcp_survives_sigpipe_and_finishes_a_slow_land() {
         assert_ne!(
             status.signal(),
             Some(libc::SIGPIPE),
-            "[{backend}] shoal mcp died of SIGPIPE; stderr:\n{errtext}"
+            "[{backend}] ocean-graft mcp died of SIGPIPE; stderr:\n{errtext}"
         );
         assert!(
             status.success(),
-            "[{backend}] shoal mcp exited {status:?}; stderr:\n{errtext}"
+            "[{backend}] ocean-graft mcp exited {status:?}; stderr:\n{errtext}"
         );
         let log = env.git(&env.repo(), &["log", "-1", "--format=%s", "main"]);
         assert_eq!(
@@ -781,7 +786,7 @@ fn subagent_worktree(env: &Env, name: &str, cwd: &Path, idle_hours: &str) -> Pat
         "worktree-create",
         &input,
         cwd,
-        &[("SHOAL_WORKTREE_IDLE_HOURS", idle_hours)],
+        &[("OCEAN_GRAFT_WORKTREE_IDLE_HOURS", idle_hours)],
         &[],
     );
     assert_eq!(r.code, 0, "worktree-create {name}: {}", r.stderr);
@@ -793,7 +798,7 @@ fn sweep(env: &Env, idle_hours: &str) -> String {
     let out = env
         .command(BIN, &env.repo())
         .args(["--project", env.project_dir().to_str().unwrap(), "sweep"])
-        .env("SHOAL_WORKTREE_IDLE_HOURS", idle_hours)
+        .env("OCEAN_GRAFT_WORKTREE_IDLE_HOURS", idle_hours)
         .output()
         .unwrap();
     assert!(
@@ -821,7 +826,7 @@ fn worktree_sweep_removes_only_idle_subagent_sessions() {
         fs::write(sub1.join("src/app.txt"), "edited in sub1\n").unwrap();
         subagent_worktree(&env, "sub2", &repo, "0");
         subagent_worktree(&env, "svc", &repo, "0");
-        env.shoal(&["serve", "svc", "--", "sleep", "300"]);
+        env.ocean_graft(&["serve", "svc", "--", "sleep", "300"]);
         let busy = subagent_worktree(&env, "busy", &repo, "0");
         let mut worker = std::process::Command::new("sleep")
             .arg("60")
@@ -906,11 +911,11 @@ fn worktree_sweep_removes_only_idle_subagent_sessions() {
             "[{backend}] the kept session's service was stopped"
         );
         assert_eq!(
-            env.git(&repo, &["show", "shoal/sub1:sub1-work.txt"]),
+            env.git(&repo, &["show", "ocean-graft/sub1:sub1-work.txt"]),
             "unsaved work\n"
         );
         assert_eq!(
-            env.git(&repo, &["show", "shoal/sub1:src/app.txt"]),
+            env.git(&repo, &["show", "ocean-graft/sub1:src/app.txt"]),
             "edited in sub1\n"
         );
         assert!(
@@ -956,7 +961,7 @@ fn worktree_sweep_removes_only_idle_subagent_sessions() {
             "[{backend}] the parent was swept"
         );
         assert!(names.contains(&"child".to_string()), "[{backend}]");
-        env.shoal(&["down"]);
+        env.ocean_graft(&["down"]);
     }
 }
 
@@ -1081,10 +1086,10 @@ fn reused_pid_is_never_reported_running_or_signalled() {
         // And with the CLI stop, discard keep_work: false, and down.
         env.api("fork", json!({"name": "reuse2"})).unwrap();
         plant_reused_pid(&env, "reuse2", pid);
-        env.shoal(&["stop", "reuse2"]);
+        env.ocean_graft(&["stop", "reuse2"]);
         assert!(
             other.running(),
-            "[{backend}] shoal stop killed an unrelated process"
+            "[{backend}] ocean-graft stop killed an unrelated process"
         );
         plant_reused_pid(&env, "reuse2", pid);
         let r = env.api("discard", json!({"session": "reuse2", "keep_work": false}));
@@ -1095,10 +1100,10 @@ fn reused_pid_is_never_reported_running_or_signalled() {
         );
         env.api("fork", json!({"name": "reuse3"})).unwrap();
         plant_reused_pid(&env, "reuse3", pid);
-        env.shoal(&["down"]);
+        env.ocean_graft(&["down"]);
         assert!(
             other.running(),
-            "[{backend}] shoal down killed an unrelated process"
+            "[{backend}] ocean-graft down killed an unrelated process"
         );
         drop(env);
         assert!(

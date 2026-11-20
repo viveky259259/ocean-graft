@@ -1,7 +1,7 @@
 //! A machine-wide job queue for heavy commands (tests, builds, installs).
 //!
 //! There are N slots, one per CPU by default, shared by every project on the
-//! machine. A slot is an exclusive `flock` on `$SHOAL_HOME/queue/slot-<i>.lock`,
+//! machine. A slot is an exclusive `flock` on `$OCEAN_GRAFT_HOME/queue/slot-<i>.lock`,
 //! so a slot is freed by the kernel the moment its job exits, even if the job
 //! crashed. No daemon is needed.
 //!
@@ -9,9 +9,9 @@
 //! competes for slots. That keeps jobs that ask for several slots from being
 //! starved, and serves waiters in roughly the order they arrived.
 //! Each running or waiting job also writes a small JSON file describing
-//! itself, which `shoal queue` reads.
+//! itself, which `ocean-graft queue` reads.
 
-use crate::project::shoal_home;
+use crate::project::ocean_graft_home;
 use crate::sys;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -47,7 +47,7 @@ impl Drop for Held {
 }
 
 fn dir() -> Result<PathBuf> {
-    let dir = shoal_home()?.join("queue");
+    let dir = ocean_graft_home()?.join("queue");
     std::fs::create_dir_all(dir.join("waiting"))
         .with_context(|| format!("could not create {}", dir.display()))?;
     Ok(dir)

@@ -23,12 +23,12 @@ pub fn shell_quote(word: &str) -> String {
 }
 
 /// How to invoke this binary from a shell: Claude's Bash tool has no
-/// `shoal` on PATH when the plugin's launcher found or downloaded it.
-pub fn shoal_command() -> String {
+/// `ocean-graft` on PATH when the plugin's launcher found or downloaded it.
+pub fn ocean_graft_command() -> String {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.to_str().map(shell_quote))
-        .unwrap_or_else(|| "shoal".into())
+        .unwrap_or_else(|| "ocean-graft".into())
 }
 
 pub fn now() -> u64 {
@@ -79,10 +79,10 @@ extern "C" fn forward_signal(signal: libc::c_int) {
     }
 }
 
-/// Like `interactive`, but shoal stays in charge of the child until it exits:
-/// SIGTERM and SIGHUP sent to shoal are passed on to the child, and Ctrl-C
+/// Like `interactive`, but ocean-graft stays in charge of the child until it exits:
+/// SIGTERM and SIGHUP sent to ocean-graft are passed on to the child, and Ctrl-C
 /// reaches the child directly from the terminal. This keeps resources that
-/// shoal holds for the job (such as a queue slot) tied to the job's lifetime.
+/// ocean-graft holds for the job (such as a queue slot) tied to the job's lifetime.
 pub fn supervised(cmd: &mut Command) -> Result<i32> {
     let mut child = cmd
         .spawn()
@@ -197,7 +197,9 @@ pub fn mount_overlay(lowers: &[&Path], upper: &Path, work: &Path, target: &Path)
         let err = std::io::Error::last_os_error();
         let hint = match err.raw_os_error() {
             Some(libc::EPERM) => " (the overlay backend needs root; use --backend clone)",
-            Some(libc::EINVAL) => " (SHOAL_HOME may be on a filesystem overlayfs cannot write to)",
+            Some(libc::EINVAL) => {
+                " (OCEAN_GRAFT_HOME may be on a filesystem overlayfs cannot write to)"
+            }
             _ => "",
         };
         bail!("mounting {} failed: {err}{hint}", target.display());
@@ -409,7 +411,7 @@ pub fn process_start(pid: i32) -> Option<String> {
     {
         // From the kernel, in microseconds since the epoch: unlike `ps -o
         // lstart`, independent of the time zone and locale, so a trip or a
-        // different LANG never makes shoal disown its own services.
+        // different LANG never makes ocean-graft disown its own services.
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
         let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
         let n = unsafe {
@@ -459,11 +461,11 @@ pub fn port_in_use(port: u16) -> bool {
 /// Whether file names in `dir` are matched without regard to case (the
 /// default on macOS APFS and HFS+).
 pub fn case_insensitive(dir: &Path) -> bool {
-    let probe = dir.join(format!(".shoal-case-probe-{}", std::process::id()));
+    let probe = dir.join(format!(".ocean-graft-case-probe-{}", std::process::id()));
     if std::fs::write(&probe, b"").is_err() {
         return cfg!(target_os = "macos");
     }
-    let upper = dir.join(format!(".SHOAL-CASE-PROBE-{}", std::process::id()));
+    let upper = dir.join(format!(".OCEAN-GRAFT-CASE-PROBE-{}", std::process::id()));
     let insensitive = upper.symlink_metadata().is_ok();
     let _ = std::fs::remove_file(&probe);
     insensitive
@@ -472,8 +474,8 @@ pub fn case_insensitive(dir: &Path) -> bool {
 /// Whether the filesystem holding `dir` can clone files (APFS clonefile).
 #[cfg(target_os = "macos")]
 pub fn clones_supported(dir: &Path) -> bool {
-    let a = dir.join(format!(".shoal-clone-probe-a-{}", std::process::id()));
-    let b = dir.join(format!(".shoal-clone-probe-b-{}", std::process::id()));
+    let a = dir.join(format!(".ocean-graft-clone-probe-a-{}", std::process::id()));
+    let b = dir.join(format!(".ocean-graft-clone-probe-b-{}", std::process::id()));
     let _ = std::fs::remove_file(&b);
     if std::fs::write(&a, b"probe").is_err() {
         return false;
@@ -595,7 +597,7 @@ pub fn is_cwd_of_a_process(dir: &Path) -> bool {
     }
 }
 
-/// Process groups shoal started for setup and tests. If shoal is killed
+/// Process groups ocean-graft started for setup and tests. If ocean-graft is killed
 /// (Ctrl-C, a hook timeout, the MCP server shutting down), they are killed
 /// with it instead of running on, orphaned and unbounded.
 static GROUPS: [std::sync::atomic::AtomicI32; 64] =
@@ -615,7 +617,7 @@ extern "C" fn kill_groups_and_die(signal: libc::c_int) {
     }
 }
 
-/// Kill `pgid` if shoal dies, until the returned guard is dropped.
+/// Kill `pgid` if ocean-graft dies, until the returned guard is dropped.
 pub fn own_group(pgid: i32) -> OwnedGroup {
     GROUP_HANDLER.call_once(|| {
         let handler = kill_groups_and_die as extern "C" fn(libc::c_int) as libc::sighandler_t;

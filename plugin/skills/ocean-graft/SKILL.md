@@ -1,15 +1,15 @@
 ---
-name: shoal
+name: ocean-graft
 description: Isolated, instant copy-on-write sessions of the repository. Use when you want to try more than one approach, make a risky change (migration, large refactor, dependency upgrade) you may need to undo, keep work away from the user's checkout until it passes tests, run parallel subagents that must not collide, or show the user a running preview of a change.
 ---
 
-# Working with shoal sessions
+# Working with ocean-graft sessions
 
-shoal gives you sessions: complete copies of the repository with dependencies
+ocean-graft gives you sessions: complete copies of the repository with dependencies
 installed, each on its own branch and port, created in milliseconds. Changes
 in a session never touch the user's checkout until you land them.
 
-The tools are `mcp__plugin_shoal_shoal__<tool>`. Every tool that works on one
+The tools are `mcp__plugin_ocean-graft_ocean-graft__<tool>`. Every tool that works on one
 session takes `session` (a name from `status`) or `path` (your working
 directory, if it is inside a session).
 

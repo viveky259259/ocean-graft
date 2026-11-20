@@ -1,7 +1,7 @@
 //! Regression tests for the issues the last review round found in the
 //! fixes before it: rewind safety-checkpoint pruning and in-place restore,
 //! branch names when saving, checkpoints of a session whose files vanished,
-//! land running out of time on a lock, and setup dying with shoal.
+//! land running out of time on a lock, and setup dying with ocean-graft.
 //! Ports 6100-6199.
 
 mod common;
@@ -81,7 +81,7 @@ fn rewind_to_the_oldest_safety_checkpoint_restores_it() {
             l.contains(&"pre-rewind-11".to_string()),
             "[{backend}] {l:?}"
         );
-        env.shoal(&["down"]);
+        env.ocean_graft(&["down"]);
     }
 }
 
@@ -174,7 +174,7 @@ fn rewind_of_a_busy_session_restores_in_place() {
         assert_eq!(fs::read_to_string(s.join("new.txt")).unwrap(), "after\n");
         let _ = shell.kill();
         let _ = shell.wait();
-        env.shoal(&["down"]);
+        env.ocean_graft(&["down"]);
     }
 }
 
@@ -206,7 +206,7 @@ fn saving_branches_with_awkward_names_works() {
                 b,
             ],
         );
-        env.git(&s, &["switch", "-q", "shoal/s2"]);
+        env.git(&s, &["switch", "-q", "ocean-graft/s2"]);
     }
     let r = env.api("discard", json!({"session": "s2"})).unwrap();
     let extra = r["saved"]["extra_branches"].as_array().unwrap();
@@ -291,14 +291,14 @@ fn land_out_of_time_on_the_land_lock_is_timed_out() {
     assert_eq!(r["status"], "landed", "{r}");
 }
 
-/// Killing shoal while setup runs kills setup too (it used to run on,
+/// Killing ocean-graft while setup runs kills setup too (it used to run on,
 /// orphaned, in its own process group).
 #[test]
-fn setup_dies_with_shoal() {
+fn setup_dies_with_ocean_graft() {
     let env = Env::new(6195);
     let marker = env.root.path().join("setup.pid");
     fs::write(
-        env.repo().join("shoal.toml"),
+        env.repo().join("ocean-graft.toml"),
         format!(
             "setup = \"echo $$ > '{}'; sleep 60\"\nbackend = \"clone\"\nport_base = 6195\n",
             marker.display()
@@ -325,7 +325,7 @@ fn setup_dies_with_shoal() {
     while alive(pid) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(!alive(pid), "setup {pid} outlived shoal");
+    assert!(!alive(pid), "setup {pid} outlived ocean-graft");
     let _: &Path = env.repo().as_path();
 }
 
@@ -380,7 +380,7 @@ fn in_place_rewind_compares_contents_not_just_metadata() {
             "{\"version\":\"1.0.0\"}\n",
             "[{backend}]"
         );
-        env.shoal(&["down"]);
+        env.ocean_graft(&["down"]);
     }
 }
 
@@ -433,7 +433,7 @@ fn in_place_overlay_rewind_leaves_untouched_directories_alone() {
         "in-place rewind copied up {before} -> {after} entries"
     );
     assert!(!upper.join("src").exists(), "untouched src/ was copied up");
-    env.shoal(&["down"]);
+    env.ocean_graft(&["down"]);
 }
 
 /// The session's own running service is stopped before the decision, so it
@@ -447,7 +447,7 @@ fn a_running_service_does_not_force_an_in_place_rewind() {
     let s = fork(&env, "svc");
     env.api("checkpoint", json!({"session": "svc", "label": "a"}))
         .unwrap();
-    env.shoal(&["serve", "svc", "--", "sleep", "300"]);
+    env.ocean_graft(&["serve", "svc", "--", "sleep", "300"]);
     let ino = fs::metadata(&s).unwrap().ino();
     let r = rewind(&env, "svc", "a");
     assert_eq!(r["restarted_services"], json!(["web"]), "{r}");
@@ -456,7 +456,7 @@ fn a_running_service_does_not_force_an_in_place_rewind() {
         ino,
         "rewound in place although only its own service ran in it"
     );
-    env.shoal(&["down"]);
+    env.ocean_graft(&["down"]);
 }
 
 /// A swap rewind that fails after the swap (cleanup of the old tree fails)
@@ -588,7 +588,7 @@ fn names_and_labels_are_case_insensitive() {
     let s = fork(&env, "api");
     env.api("checkpoint", json!({"session": "api", "label": "Before"}))
         .unwrap();
-    let out = env.shoal_in(&env.repo(), &["new", "Api"]);
+    let out = env.ocean_graft_in(&env.repo(), &["new", "Api"]);
     assert!(!out.status.success());
     assert!(stderr(&out).contains("lower case"), "{}", stderr(&out));
     assert!(env.project_dir().join("checkpoints/api/Before").exists());

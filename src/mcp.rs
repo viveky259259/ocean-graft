@@ -1,4 +1,4 @@
-//! `shoal mcp`: a Model Context Protocol server over stdio.
+//! `ocean-graft mcp`: a Model Context Protocol server over stdio.
 //!
 //! Newline-delimited JSON-RPC 2.0. stdout carries protocol messages only;
 //! everything else goes to stderr. Each tools/call runs on its own thread,
@@ -23,7 +23,7 @@ pub const KNOWN_PROTOCOLS: &[&str] = &[
 ];
 pub const FALLBACK_PROTOCOL: &str = "2025-06-18";
 
-const INSTRUCTIONS: &str = "shoal gives you instant, isolated copy-on-write sessions of this repository: full checkouts with dependencies installed, each on its own branch and port. Use fork to try approaches in parallel or to keep risky work away from the user's checkout, checkpoint before risky steps and rewind if they go wrong, land to deliver tested work to the user's branch, preview to give the user a URL, and status whenever you need to know where things stand.";
+const INSTRUCTIONS: &str = "ocean-graft gives you instant, isolated copy-on-write sessions of this repository: full checkouts with dependencies installed, each on its own branch and port. Use fork to try approaches in parallel or to keep risky work away from the user's checkout, checkpoint before risky steps and rewind if they go wrong, land to deliver tested work to the user's branch, preview to give the user a URL, and status whenever you need to know where things stand.";
 
 fn error(id: Value, code: i64, message: impl Into<String>) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message.into()}})
@@ -80,7 +80,7 @@ pub fn handle(msg: &Value, on_call: &mut dyn FnMut(Value, String, Value)) -> Opt
                 asked
             } else {
                 let newest = KNOWN_PROTOCOLS.last().copied().unwrap_or(FALLBACK_PROTOCOL);
-                eprintln!("shoal mcp: client asked for protocol {asked:?}, which shoal does not know; offering {newest}");
+                eprintln!("ocean-graft mcp: client asked for protocol {asked:?}, which ocean-graft does not know; offering {newest}");
                 newest
             };
             Some(result(
@@ -88,7 +88,7 @@ pub fn handle(msg: &Value, on_call: &mut dyn FnMut(Value, String, Value)) -> Opt
                 json!({
                     "protocolVersion": version,
                     "capabilities": {"tools": {"listChanged": false}},
-                    "serverInfo": {"name": "shoal", "version": env!("CARGO_PKG_VERSION")},
+                    "serverInfo": {"name": "ocean-graft", "version": env!("CARGO_PKG_VERSION")},
                     "instructions": INSTRUCTIONS,
                 }),
             ))
@@ -141,7 +141,7 @@ pub fn serve() -> anyhow::Result<()> {
     loop {
         if broken.load(std::sync::atomic::Ordering::SeqCst) {
             eprintln!(
-                "shoal mcp: the client closed its end; finishing calls in flight and exiting"
+                "ocean-graft mcp: the client closed its end; finishing calls in flight and exiting"
             );
             break;
         }
@@ -151,7 +151,7 @@ pub fn serve() -> anyhow::Result<()> {
             Ok(_) => {}
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(err) => {
-                eprintln!("shoal mcp: reading stdin failed: {err}");
+                eprintln!("ocean-graft mcp: reading stdin failed: {err}");
                 break;
             }
         }
@@ -189,7 +189,7 @@ pub fn serve() -> anyhow::Result<()> {
                     let outcome = std::panic::catch_unwind(|| tool_result(&name, &args))
                         .unwrap_or_else(|_| {
                             json!({
-                                "content": [{"type": "text", "text": format!("shoal: internal error while running {name}; see stderr")}],
+                                "content": [{"type": "text", "text": format!("ocean-graft: internal error while running {name}; see stderr")}],
                                 "isError": true,
                             })
                         });
@@ -234,7 +234,7 @@ mod tests {
             );
             let r = r.unwrap();
             assert_eq!(r["result"]["protocolVersion"], *v);
-            assert_eq!(r["result"]["serverInfo"]["name"], "shoal");
+            assert_eq!(r["result"]["serverInfo"]["name"], "ocean-graft");
             assert!(r["result"]["capabilities"]["tools"].is_object());
         }
         let (r, _) = run(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}));
@@ -294,7 +294,7 @@ mod tests {
             for req in t["inputSchema"]["required"].as_array().unwrap() {
                 assert!(props.contains_key(req.as_str().unwrap()));
             }
-            // Names Claude Code builds: mcp__plugin_shoal_shoal__<name>; keep them plain.
+            // Names Claude Code builds: mcp__plugin_ocean-graft_ocean-graft__<name>; keep them plain.
             assert!(t["name"]
                 .as_str()
                 .unwrap()

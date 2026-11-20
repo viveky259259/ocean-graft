@@ -35,7 +35,7 @@ impl State {
 }
 
 pub fn group_alive(pgid: i32) -> bool {
-    // A long-lived shoal (the MCP server) is the parent of the services it
+    // A long-lived ocean-graft (the MCP server) is the parent of the services it
     // starts. Reap the group leader if it has exited, or it stays a zombie
     // and kill(-pgid, 0) keeps reporting the group alive. For a group we did
     // not start this is ECHILD and changes nothing.
@@ -97,7 +97,7 @@ pub fn start_gateway(p: &Project, session: &Session, service: &mut Service) -> R
         .join(format!("{}-{}-gateway.log", session.name, service.name));
     std::fs::create_dir_all(log_path.parent().expect("log path has a parent"))?;
     let log = File::options().create(true).append(true).open(&log_path)?;
-    let mut cmd = Command::new(std::env::current_exe().context("could not locate shoal")?);
+    let mut cmd = Command::new(std::env::current_exe().context("could not locate ocean-graft")?);
     let internal = service
         .internal_port
         .context("an on-demand service needs an internal port")?;
@@ -212,7 +212,7 @@ pub fn start(p: &Project, session: &Session, service: &mut Service) -> Result<()
     use std::io::Write;
     writeln!(
         log,
-        "--- shoal: starting {} at {}: {}",
+        "--- ocean-graft: starting {} at {}: {}",
         service.name,
         sys::now(),
         service.command.join(" ")
@@ -224,14 +224,14 @@ pub fn start(p: &Project, session: &Session, service: &mut Service) -> Result<()
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log)
-        .env("SHOAL_SESSION", &session.name)
-        .env("SHOAL_SERVICE", &service.name)
-        .env("SHOAL_PORT", session.port.to_string())
+        .env("OCEAN_GRAFT_SESSION", &session.name)
+        .env("OCEAN_GRAFT_SERVICE", &service.name)
+        .env("OCEAN_GRAFT_PORT", session.port.to_string())
         .env(
             "PORT",
             service.internal_port.unwrap_or(service.port).to_string(),
         )
-        .env("SHOAL_PROJECT", &p.dir);
+        .env("OCEAN_GRAFT_PROJECT", &p.dir);
     unsafe {
         cmd.pre_exec(|| {
             if libc::setsid() == -1 {
@@ -350,7 +350,7 @@ fn newest_mtime(root: &Path) -> u64 {
     newest
 }
 
-/// When the session last showed signs of work: a shoal command run in it, or
+/// When the session last showed signs of work: a ocean-graft command run in it, or
 /// a change to its files or git history.
 pub fn last_activity(p: &Project, session: &Session) -> u64 {
     use std::os::unix::fs::MetadataExt;

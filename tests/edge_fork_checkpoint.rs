@@ -169,8 +169,8 @@ fn dirty_up(dir: &Path, tag: &str) {
     fs::remove_file(dir.join("README.md")).unwrap();
 }
 
-fn shoal_cli(env: &Env, args: &[&str]) -> std::process::Output {
-    env.shoal_in(&env.repo(), args)
+fn ocean_graft_cli(env: &Env, args: &[&str]) -> std::process::Output {
+    env.ocean_graft_in(&env.repo(), args)
 }
 
 fn poll<F: FnMut() -> bool>(within: Duration, mut f: F) -> bool {
@@ -200,7 +200,7 @@ fn fork_default_starts_from_main_with_warm_template() {
         let s = &v["sessions"][0];
         assert_eq!(v["sessions"].as_array().unwrap().len(), 1);
         assert_eq!(s["name"], "task", "{backend}: {v}");
-        assert_eq!(s["branch"], "shoal/task");
+        assert_eq!(s["branch"], "ocean-graft/task");
         assert_eq!(s["port"], 5403);
         assert_eq!(s["generation"], 1);
         assert!(s["parent"].is_null());
@@ -222,7 +222,7 @@ fn fork_default_starts_from_main_with_warm_template() {
             "{backend}: copied .env"
         );
         assert_eq!(head(&env, &path), repo_head);
-        assert_eq!(branch(&env, &path), "shoal/task");
+        assert_eq!(branch(&env, &path), "ocean-graft/task");
         assert_eq!(
             porcelain(&env, &path),
             "",
@@ -232,7 +232,7 @@ fn fork_default_starts_from_main_with_warm_template() {
         // A second default fork gets a fresh name and the next port block.
         let (n2, p2) = fork1(&env, json!({"from": "main"}));
         assert_eq!(n2, "task-2");
-        assert_eq!(branch(&env, &p2), "shoal/task-2");
+        assert_eq!(branch(&env, &p2), "ocean-graft/task-2");
         let st = env.state();
         assert_eq!(st["sessions"]["task-2"]["port"], 5413);
         // "template" is an alias of main.
@@ -266,9 +266,9 @@ fn fork_count_one_to_eight_numbers_sessions_with_distinct_ports_and_branches() {
         assert!(v.get("error").is_none_or(Value::is_null), "{v}");
         for (i, s) in sessions.iter().enumerate() {
             assert_eq!(s["name"], format!("task-{}", i + 1));
-            assert_eq!(s["branch"], format!("shoal/task-{}", i + 1));
+            assert_eq!(s["branch"], format!("ocean-graft/task-{}", i + 1));
             let p = PathBuf::from(s["path"].as_str().unwrap());
-            assert_eq!(branch(&env, &p), format!("shoal/task-{}", i + 1));
+            assert_eq!(branch(&env, &p), format!("ocean-graft/task-{}", i + 1));
             assert_eq!(read(p.join("deps/installed.txt")), "lib 1.0\n");
         }
         let st = env.state();
@@ -358,7 +358,7 @@ fn fork_name_is_sanitised_and_stays_inside_the_sessions_dir() {
             assert_eq!(name, want, "{backend}: {raw:?}");
             assert!(valid_session_name(&name));
             assert_eq!(path, sessions_dir.join(&name));
-            assert_eq!(branch(&env, &path), format!("shoal/{name}"));
+            assert_eq!(branch(&env, &path), format!("ocean-graft/{name}"));
         }
         let long = "x".repeat(60);
         let (name, _) = fork1(&env, json!({"name": long}));
@@ -481,10 +481,10 @@ fn fork_from_session_copies_uncommitted_untracked_ignored_and_commits() {
         assert_eq!(read(child.join("deps/extra.txt")), "ignored p\n");
         assert_eq!(read(child.join("deps/installed.txt")), "lib 1.0\n");
         assert_eq!(read(child.join(".env")), "SECRET=1\n");
-        assert_eq!(branch(&env, &child), "shoal/parent-fork");
+        assert_eq!(branch(&env, &child), "ocean-graft/parent-fork");
         assert_eq!(
             branch(&env, &parent),
-            "shoal/parent",
+            "ocean-graft/parent",
             "{backend}: parent keeps its branch"
         );
         // The parent's status is untouched by the fork.
@@ -538,7 +538,7 @@ fn fork_from_session_is_isolated_in_both_directions() {
             "{backend}: parent deps intact"
         );
         assert_ne!(head(&env, &parent), head(&env, &child));
-        assert_eq!(branch(&env, &parent), "shoal/p");
+        assert_eq!(branch(&env, &parent), "ocean-graft/p");
         // Neither commit leaked into the source repository.
         let src_log = env.git(&env.repo(), &["log", "--all", "--format=%s"]);
         assert!(!src_log.contains("moves on"), "{src_log}");
@@ -601,17 +601,17 @@ fn fork_from_a_session_that_is_not_mounted_still_copies_its_work() {
         let (_, parent) = fork1(&env, json!({"name": "p"}));
         dirty_up(&parent, "x");
         let want = tree(&parent);
-        let out = shoal_cli(&env, &["down"]);
+        let out = ocean_graft_cli(&env, &["down"]);
         assert!(out.status.success(), "{}", stderr(&out));
         let (_, child) = fork1(&env, json!({"from": "p", "name": "c"}));
         assert_eq!(tree(&child), want, "{backend}");
         assert_eq!(tree(&parent), want, "{backend}: parent is mounted again");
         // checkpoint and rewind also work on an unmounted session.
-        let out = shoal_cli(&env, &["down"]);
+        let out = ocean_graft_cli(&env, &["down"]);
         assert!(out.status.success(), "{}", stderr(&out));
         checkpoint(&env, "p", Some("after-down"));
         wr(parent.join("src/app.txt"), "changed\n");
-        let out = shoal_cli(&env, &["down"]);
+        let out = ocean_graft_cli(&env, &["down"]);
         assert!(out.status.success(), "{}", stderr(&out));
         rewind(&env, "p", "after-down");
         assert_eq!(tree(&parent), want, "{backend}");
@@ -787,7 +787,7 @@ fn fork_at_checkpoint_starts_from_that_exact_state_after_parent_moved_on() {
             "{backend}: HEAD as at the checkpoint"
         );
         assert_eq!(porcelain(&env, &child), cp_status);
-        assert_eq!(branch(&env, &child), "shoal/back");
+        assert_eq!(branch(&env, &child), "ocean-graft/back");
         // The parent is not rewound by forking from its past.
         assert_eq!(read(parent.join("src/app.txt")), "much later\n");
         assert!(parent.join("uncommitted-later.txt").exists());
@@ -836,11 +836,11 @@ fn fork_at_checkpoint_survives_parent_discard_gc_and_remount() {
             env.api("discard", json!({"session": "c", "keep_work": false})),
             "discard c",
         );
-        let out = shoal_cli(&env, &["gc"]);
+        let out = ocean_graft_cli(&env, &["gc"]);
         assert!(out.status.success(), "gc: {}", stderr(&out));
-        let out = shoal_cli(&env, &["down"]);
+        let out = ocean_graft_cli(&env, &["down"]);
         assert!(out.status.success(), "{}", stderr(&out));
-        let out = shoal_cli(&env, &["up"]);
+        let out = ocean_graft_cli(&env, &["up"]);
         assert!(out.status.success(), "up: {}{}", stdout(&out), stderr(&out));
         assert_eq!(
             tree(&grand),
@@ -894,7 +894,7 @@ fn fork_at_checkpoint_survives_automatic_pruning() {
         assert_eq!(labels.len(), 20, "{labels:?}");
         assert!(!env.project_dir().join("checkpoints/p/turn-1").exists());
         assert_eq!(tree(&child), want, "{backend}");
-        let out = shoal_cli(&env, &["down"]);
+        let out = ocean_graft_cli(&env, &["down"]);
         assert!(out.status.success());
         ok(env.api("status", json!({})), "status remounts");
         assert_eq!(tree(&child), want, "{backend}: after remount");
@@ -1271,7 +1271,10 @@ fn checkpoint_and_rewind_resolve_the_session_from_a_path() {
             env.api("checkpoint", json!({"path": env.repo()})),
             "repo path",
         );
-        assert!(e.contains("not inside a shoal session"), "{backend}: {e}");
+        assert!(
+            e.contains("not inside a ocean-graft session"),
+            "{backend}: {e}"
+        );
         // A session that does not exist lists the real ones.
         let e = err(env.api("checkpoint", json!({"session": "zzz"})), "zzz");
         assert!(
@@ -1365,11 +1368,11 @@ fn rewind_restores_files_head_index_untracked_and_deps() {
         assert_eq!(tree(&a), want, "{backend}: files");
         assert_eq!(porcelain(&env, &a), want_status, "{backend}: git status");
         assert_eq!(head(&env, &a), want_head, "{backend}: HEAD");
-        assert_eq!(branch(&env, &a), "shoal/a");
+        assert_eq!(branch(&env, &a), "ocean-graft/a");
         assert_eq!(read(a.join("deps/installed.txt")), "lib 1.0\n");
         assert!(!a.join("new-junk.txt").exists() && !a.join("deps2").exists());
         // The branch ref went back too: the bad commit is no longer on it.
-        let log = env.git(&a, &["log", "--format=%s", "shoal/a"]);
+        let log = env.git(&a, &["log", "--format=%s", "ocean-graft/a"]);
         assert!(!log.contains("bad commit") && log.contains("kept"), "{log}");
         // The checkpoint survives being used.
         assert!(state_checkpoints(&env, "a").contains(&"good".to_string()));
@@ -1574,9 +1577,9 @@ fn rewind_does_not_touch_children_or_siblings() {
         assert_eq!(read(sib.join("mine.txt")), "sib\n");
         assert!(!p.join("mine.txt").exists());
         // The children still mount after a full remount.
-        let out = shoal_cli(&env, &["down"]);
+        let out = ocean_graft_cli(&env, &["down"]);
         assert!(out.status.success());
-        let out = shoal_cli(&env, &["up"]);
+        let out = ocean_graft_cli(&env, &["up"]);
         assert!(out.status.success(), "{}", stderr(&out));
         assert_eq!(read(child.join("v.txt")), "evolved\n", "{backend}");
         assert_eq!(read(p.join("v.txt")), "base\n");
@@ -1594,7 +1597,7 @@ fn rewind_restarts_running_services_and_leaves_stopped_ones() {
         wr(a.join("v.txt"), "later\n");
 
         let script = format!("cat v.txt > '{}'; exec sleep 300", seen.display());
-        let out = shoal_cli(&env, &["serve", "a", "--", "sh", "-c", &script]);
+        let out = ocean_graft_cli(&env, &["serve", "a", "--", "sh", "-c", &script]);
         assert!(
             out.status.success(),
             "serve: {}{}",
@@ -1624,7 +1627,7 @@ fn rewind_restarts_running_services_and_leaves_stopped_ones() {
         assert_eq!(svc["state"], "running", "{st}");
 
         // A stopped service is not started by a rewind.
-        let out = shoal_cli(&env, &["stop", "a"]);
+        let out = ocean_graft_cli(&env, &["stop", "a"]);
         assert!(out.status.success(), "stop: {}", stderr(&out));
         assert!(poll(Duration::from_secs(3), || !alive(new)));
         let r = rewind(&env, "a", "cp");

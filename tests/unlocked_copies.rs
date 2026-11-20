@@ -2,7 +2,7 @@
 //! without the project lock, so other sessions' commands are not held up;
 //! a fork of a session that keeps changing is verified like a checkpoint.
 //!
-//! SHOAL_TEST_COPY_DELAY_MS makes an unlocked copy take that long, so what
+//! OCEAN_GRAFT_TEST_COPY_DELAY_MS makes an unlocked copy take that long, so what
 //! happens meanwhile can be observed. Where copies are cheap (APFS, a
 //! reflink filesystem) nothing is copied unlocked, and those tests skip.
 //!
@@ -32,11 +32,11 @@ fn slow_project(port: u16) -> Option<Env> {
     Some(env)
 }
 
-/// `shoal api <tool> <args>` in the background, its unlocked copy slowed.
+/// `ocean-graft api <tool> <args>` in the background, its unlocked copy slowed.
 fn spawn_slow(env: &Env, tool: &str, args: Value, delay_ms: u64) -> Child {
     env.command(BIN, &env.repo())
         .args(["api", tool, &args.to_string()])
-        .env("SHOAL_TEST_COPY_DELAY_MS", delay_ms.to_string())
+        .env("OCEAN_GRAFT_TEST_COPY_DELAY_MS", delay_ms.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -113,7 +113,7 @@ fn other_commands_run_while_a_slow_fork_copies() {
         .unwrap_or_default();
     // The fork tool makes names unique, so this one becomes slow-2.
     assert_eq!(err["sessions"][0]["name"], "slow-2", "{err}");
-    let out = env.shoal_in(&env.repo(), &["new", "slow"]);
+    let out = env.ocean_graft_in(&env.repo(), &["new", "slow"]);
     assert!(!out.status.success());
     assert!(
         stderr(&out).contains("is being created"),
@@ -135,7 +135,7 @@ fn operations_on_a_session_being_copied_wait_for_the_copy() {
     let Some(env) = slow_project(6310) else {
         return;
     };
-    let a = PathBuf::from(env.shoal(&["path", "a"]).trim());
+    let a = PathBuf::from(env.ocean_graft(&["path", "a"]).trim());
     fs::write(a.join("note.txt"), "before\n").unwrap();
     // A slow checkpoint of a holds a's session lock, not the project lock.
     let slow = spawn_slow(
@@ -192,7 +192,7 @@ fn a_land_waits_for_a_copy_of_its_session_instead_of_failing() {
     wait_until("the fork to hold a's lock", || {
         fs::read_to_string(&lock).unwrap_or_default().trim() == "fork"
     });
-    let a = PathBuf::from(env.shoal(&["path", "a"]).trim());
+    let a = PathBuf::from(env.ocean_graft(&["path", "a"]).trim());
     let r = env.api("land", json!({"session": "a", "test": ""}));
     let r = ok(r, "land after the copy");
     assert_eq!(r["status"], "nothing_to_land", "{r}");
@@ -230,8 +230,8 @@ fn gc_keeps_the_template_a_pending_copy_reads() {
     // must not remove the one being copied from.
     fs::write(env.repo().join("README.md"), "demo 2\n").unwrap();
     env.git(&env.repo(), &["commit", "-qam", "two"]);
-    env.shoal(&["refresh"]);
-    env.shoal(&["gc"]);
+    env.ocean_graft(&["refresh"]);
+    env.ocean_graft(&["gc"]);
     let r = ok(finish(slow), "the slow fork");
     let path = PathBuf::from(r["sessions"][0]["path"].as_str().unwrap());
     assert_eq!(read(path.join("README.md")), "demo\n");
@@ -243,7 +243,7 @@ fn a_fork_of_a_session_that_never_stops_changing_comes_with_a_warning() {
         let env = Env::new(6350 + if backend == "clone" { 0 } else { 10 });
         env.init(backend);
         ok(env.api("fork", json!({"name": "busy"})), "fork busy");
-        let path = PathBuf::from(env.shoal(&["path", "busy"]).trim());
+        let path = PathBuf::from(env.ocean_graft(&["path", "busy"]).trim());
         let mut writer = Command::new("sh")
             .args(["-c", "i=0; while :; do i=$((i+1)); echo $i > churn; done"])
             .current_dir(&path)

@@ -1,4 +1,4 @@
-//! Every shoal operation, implemented once.
+//! Every ocean-graft operation, implemented once.
 //!
 //! The CLI, the MCP server (`tools`) and the Claude Code hooks are adapters
 //! over these functions. Two rules hold throughout:
@@ -49,18 +49,18 @@ pub const DEFAULT_SETUP_INPUTS: &[&str] = &[
 pub const AUTO_CHECKPOINTS_KEPT: usize = 20;
 
 pub fn progress(message: impl AsRef<str>) {
-    eprintln!("shoal: {}", message.as_ref());
+    eprintln!("ocean-graft: {}", message.as_ref());
 }
 
 fn ms(d: Duration) -> u64 {
     d.as_millis() as u64
 }
 
-/// The longest a setup command may run (SHOAL_SETUP_TIMEOUT_SECS), so a
+/// The longest a setup command may run (OCEAN_GRAFT_SETUP_TIMEOUT_SECS), so a
 /// hung install cannot hold up every fork behind the refresh lock.
 fn setup_timeout() -> Duration {
     Duration::from_secs(
-        std::env::var("SHOAL_SETUP_TIMEOUT_SECS")
+        std::env::var("OCEAN_GRAFT_SETUP_TIMEOUT_SECS")
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .filter(|s| *s > 0)
@@ -81,7 +81,7 @@ fn run_setup(dir: &Path, setup: &str, budget: Option<Instant>) -> Result<()> {
         .arg("-c")
         .arg(setup)
         .current_dir(dir)
-        .env("SHOAL_TEMPLATE", "1")
+        .env("OCEAN_GRAFT_TEMPLATE", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::from(std::io::stderr()))
         .stderr(Stdio::inherit())
@@ -101,7 +101,7 @@ fn run_setup(dir: &Path, setup: &str, budget: Option<Instant>) -> Result<()> {
                 return Err(OverBudget::Setup.into());
             }
             bail!(
-                "setup command `{setup}` did not finish within {} (SHOAL_SETUP_TIMEOUT_SECS)",
+                "setup command `{setup}` did not finish within {} (OCEAN_GRAFT_SETUP_TIMEOUT_SECS)",
                 sys::human_duration(limit)
             );
         }
@@ -157,7 +157,7 @@ fn check_case_collisions(tree: &Path) -> Result<()> {
     for f in files.split('\0').filter(|f| !f.is_empty()) {
         if let Some(other) = seen.insert(f.to_lowercase(), f) {
             bail!(
-                "the repository has paths that differ only in case ({other} and {f}), and {} does not tell them apart; put SHOAL_HOME on a case-sensitive volume",
+                "the repository has paths that differ only in case ({other} and {f}), and {} does not tell them apart; put OCEAN_GRAFT_HOME on a case-sensitive volume",
                 tree.display()
             );
         }
@@ -225,7 +225,7 @@ pub fn init(o: InitOptions) -> Result<InitReport> {
     };
     if branch == "HEAD" {
         bail!(
-            "{} has a detached HEAD, and shoal sessions track a branch; check out a branch there (git switch <branch>), or run `shoal init --branch <branch>`",
+            "{} has a detached HEAD, and ocean-graft sessions track a branch; check out a branch there (git switch <branch>), or run `ocean-graft init --branch <branch>`",
             source.display()
         );
     }
@@ -247,7 +247,7 @@ pub fn init(o: InitOptions) -> Result<InitReport> {
     let _guard = init_lock_within(&dir, o.setup_deadline)?;
     if dir.join("state.json").exists() {
         bail!(
-            "{} already has a shoal project at {}",
+            "{} already has a ocean-graft project at {}",
             source.display(),
             dir.display()
         );
@@ -355,7 +355,7 @@ pub fn init(o: InitOptions) -> Result<InitReport> {
     })
 }
 
-/// The project for a repository, creating it on first use from `shoal.toml`
+/// The project for a repository, creating it on first use from `ocean-graft.toml`
 /// and detection. Safe to call from several agents at once.
 pub fn ensure_project(repo: &Path) -> Result<PathBuf> {
     ensure_project_within(repo, None)
@@ -412,7 +412,7 @@ pub fn project_for_path(path: &Path, create: bool) -> Result<PathBuf> {
     let path = path
         .canonicalize()
         .with_context(|| format!("{} does not exist", path.display()))?;
-    if let Ok(projects) = project::shoal_home()?.join("projects").canonicalize() {
+    if let Ok(projects) = project::ocean_graft_home()?.join("projects").canonicalize() {
         if let Ok(rest) = path.strip_prefix(&projects) {
             if let Some(first) = rest.components().next() {
                 let dir = projects.join(first);
@@ -434,7 +434,7 @@ pub fn project_for_path(path: &Path, create: bool) -> Result<PathBuf> {
     }
 }
 
-/// A git repository that has no shoal project yet (as opposed to a bad path
+/// A git repository that has no ocean-graft project yet (as opposed to a bad path
 /// or a broken project).
 #[derive(Debug)]
 pub struct NoProject {
@@ -445,7 +445,7 @@ impl std::fmt::Display for NoProject {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} has no shoal project yet; fork from it once to create one",
+            "{} has no ocean-graft project yet; fork from it once to create one",
             self.source.display()
         )
     }
@@ -540,7 +540,7 @@ impl std::fmt::Display for OverBudget {
 pub struct RefreshLimits {
     /// How long to wait for a refresh another process is running.
     pub lock_wait: Option<Duration>,
-    /// How long setup may run here (SHOAL_SETUP_TIMEOUT_SECS still applies).
+    /// How long setup may run here (OCEAN_GRAFT_SETUP_TIMEOUT_SECS still applies).
     pub setup: Option<Duration>,
 }
 
@@ -569,7 +569,7 @@ pub fn refresh(dir: &Path, force: bool, limits: RefreshLimits) -> Result<Refresh
             let age = sys::now().saturating_sub(failed.at);
             if !force && failed.commit == source_head && age < REFRESH_RETRY_AFTER {
                 bail!(
-                    "{} ({} s ago; retried automatically after {} s, or now with `shoal refresh`)",
+                    "{} ({} s ago; retried automatically after {} s, or now with `ocean-graft refresh`)",
                     failed.error,
                     age,
                     REFRESH_RETRY_AFTER
@@ -639,7 +639,7 @@ pub fn refresh(dir: &Path, force: bool, limits: RefreshLimits) -> Result<Refresh
         .lines()
         .map(str::to_string)
         .collect();
-        // shoal.toml may have changed in these commits: the committed
+        // ocean-graft.toml may have changed in these commits: the committed
         // version decides the setup command from now on.
         let (setup, inputs) = if changed.iter().any(|f| f == config::FILE_NAME) {
             let cfg = config::load(&build)?;
@@ -1056,7 +1056,7 @@ fn create(p: &mut Project, name: &str, unique: bool, origin: &Origin) -> Result<
         name: name.to_string(),
         generation,
         base_commit,
-        branch: format!("shoal/{name}"),
+        branch: format!("ocean-graft/{name}"),
         port,
         created_at: sys::now(),
         parent: parent.clone(),
@@ -1125,7 +1125,7 @@ impl Drop for SessionLock {
 }
 
 /// The lock, or what its holder is doing ("" while a holder is still
-/// writing it, or for an older shoal, which never writes it).
+/// writing it, or for an older ocean-graft, which never writes it).
 fn take_session_lock(
     project_dir: &Path,
     name: &str,
@@ -1164,7 +1164,7 @@ fn session_lock(p: &mut Project, name: &str, what: &str) -> Result<SessionLock> 
         match take_session_lock(&p.dir, name, what)? {
             Ok(lock) => return Ok(lock),
             Err(holder) if holder == "land" => bail!("{}", busy_message(name, &holder, what)),
-            // Just taken and not yet written, or an older shoal's land.
+            // Just taken and not yet written, or an older ocean-graft's land.
             Err(holder) if holder.is_empty() && unknown >= 20 => {
                 bail!("{}", busy_message(name, &holder, what))
             }
@@ -1334,7 +1334,7 @@ fn checkpoint_inner(
         Backend::Overlay => p.volume_dir(name).join("upper"),
         Backend::Clone => path.clone(),
     };
-    // Writers shoal did not start (a command Claude runs, a queued job) are
+    // Writers ocean-graft did not start (a command Claude runs, a queued job) are
     // caught by comparing the session around the copy.
     let copy = || copy_settled(&src, &dst, &path, fingerprint, "checkpoint");
     let settled = if unlocked {
@@ -1484,7 +1484,7 @@ fn copy_settled(
 /// For tests: make a copy that runs without the project lock take this
 /// long, so that what happens meanwhile can be observed.
 fn test_copy_delay() {
-    if let Some(ms) = std::env::var("SHOAL_TEST_COPY_DELAY_MS")
+    if let Some(ms) = std::env::var("OCEAN_GRAFT_TEST_COPY_DELAY_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
     {
@@ -1508,7 +1508,7 @@ fn copy_new_session<R>(
     p.state.pending.push(Pending::ours(name, source));
     p.save()?;
     // If the lock cannot be taken again, the entry stays until this process
-    // has exited and the next shoal command cleans it up.
+    // has exited and the next ocean-graft command cleans it up.
     let copied = p.without_lock(|| {
         test_copy_delay();
         copy()
@@ -1706,7 +1706,7 @@ fn restore_by_swap(p: &Project, session: &Session, saved: &Path) -> Result<Swap>
                 return Err(match rolled_back {
                     Ok(()) => unchanged(err),
                     Err(rb) => err.context(format!(
-                        "and putting the old layer back failed ({rb:#}); the next shoal command repairs the session"
+                        "and putting the old layer back failed ({rb:#}); the next ocean-graft command repairs the session"
                     )),
                 });
             }
@@ -1746,7 +1746,7 @@ fn restore_by_swap(p: &Project, session: &Session, saved: &Path) -> Result<Swap>
                         unchanged(err.into())
                     }
                     Err(rb) => anyhow::Error::from(err).context(format!(
-                        "and moving the session back failed ({rb}); the next shoal command repairs it"
+                        "and moving the session back failed ({rb}); the next ocean-graft command repairs it"
                     )),
                 });
             }
@@ -1958,7 +1958,7 @@ pub fn rewind(p: &mut Project, name: &str, label: &str) -> Result<RewindInfo> {
 // Getting work out
 // ---------------------------------------------------------------------------
 
-/// A git command in `dir` with the repository's identity, or shoal's when
+/// A git command in `dir` with the repository's identity, or ocean-graft's when
 /// none is configured (so commits and rebases never fail for want of one).
 fn git_with_identity(dir: &Path) -> Command {
     let has_identity = git::git_trim(dir, &["config", "user.email"])
@@ -1966,7 +1966,12 @@ fn git_with_identity(dir: &Path) -> Command {
         .unwrap_or(false);
     let mut cmd = git::command(dir);
     if !has_identity {
-        cmd.args(["-c", "user.name=shoal", "-c", "user.email=shoal@localhost"]);
+        cmd.args([
+            "-c",
+            "user.name=ocean-graft",
+            "-c",
+            "user.email=ocean-graft@localhost",
+        ]);
     }
     cmd
 }
@@ -1987,8 +1992,8 @@ pub struct ImportInfo {
     pub uncommitted: Vec<String>,
 }
 
-/// Copy the session's HEAD into the source repository as `shoal/<name>`, or
-/// `shoal/<name>-2`, `-3`... when `shoal/<name>` already holds commits this
+/// Copy the session's HEAD into the source repository as `ocean-graft/<name>`, or
+/// `ocean-graft/<name>-2`, `-3`... when `ocean-graft/<name>` already holds commits this
 /// HEAD does not contain (an earlier session of the same name, or the user's
 /// own commits). The fetch is never forced, so git itself refuses to move a
 /// branch anywhere but forward.
@@ -1996,22 +2001,26 @@ pub(crate) fn save_branch(source: &Path, session: &Path, name: &str) -> Result<S
     save_rev(source, session, "HEAD", name)
 }
 
-/// `rev` of the session saved as `shoal/<name>` (or `-2`, `-3`...).
+/// `rev` of the session saved as `ocean-graft/<name>` (or `-2`, `-3`...).
 fn save_rev(source: &Path, session: &Path, rev: &str, name: &str) -> Result<String> {
-    // Existing shoal/ branches, to skip names that differ only in case: on
-    // macOS a loose ref shoal/api would shadow a packed shoal/Api.
+    // Existing ocean-graft/ branches, to skip names that differ only in case: on
+    // macOS a loose ref ocean-graft/api would shadow a packed ocean-graft/Api.
     let existing: Vec<String> = git::git(
         source,
-        &["for-each-ref", "--format=%(refname)", "refs/heads/shoal/"],
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads/ocean-graft/",
+        ],
     )
     .map(|o| o.lines().map(str::to_string).collect())
     .unwrap_or_default();
     let mut last_err = None;
     for i in 1..=50 {
         let branch = if i == 1 {
-            format!("shoal/{name}")
+            format!("ocean-graft/{name}")
         } else {
-            format!("shoal/{name}-{i}")
+            format!("ocean-graft/{name}-{i}")
         };
         let full = format!("refs/heads/{branch}");
         if existing
@@ -2051,11 +2060,12 @@ fn save_rev(source: &Path, session: &Path, rev: &str, name: &str) -> Result<Stri
             }
         }
     }
-    Err(last_err.expect("at least one attempt"))
-        .with_context(|| format!("could not save the work of {name} to any shoal/{name}-N branch"))
+    Err(last_err.expect("at least one attempt")).with_context(|| {
+        format!("could not save the work of {name} to any ocean-graft/{name}-N branch")
+    })
 }
 
-/// Copy the session's commits into the source repository as `shoal/<name>`.
+/// Copy the session's commits into the source repository as `ocean-graft/<name>`.
 pub fn import(p: &Project, name: &str) -> Result<ImportInfo> {
     let s = p.session(name)?;
     let path = p.ensure_ready(name)?;
@@ -2125,12 +2135,15 @@ pub fn save_work(p: &Project, name: &str) -> Result<SaveInfo> {
     }
     let mut committed_wip = false;
     if !git::status_lines(&path)?.is_empty() {
-        commit_all(&path, &format!("WIP: work saved from shoal session {name}"))?;
+        commit_all(
+            &path,
+            &format!("WIP: work saved from ocean-graft session {name}"),
+        )?;
         committed_wip = true;
     }
     let import = import(p, name)?;
     let mut extra_branches = Vec::new();
-    let own = format!("shoal/{name}");
+    let own = format!("ocean-graft/{name}");
     let branches = git::git(
         &path,
         &[
@@ -2292,10 +2305,10 @@ pub fn interactive_marker(project_dir: &Path, name: &str) -> PathBuf {
 }
 
 /// How long a subagent session may sit idle before `sweep_subagents`
-/// removes it (its work saved first): SHOAL_WORKTREE_IDLE_HOURS, default
+/// removes it (its work saved first): OCEAN_GRAFT_WORKTREE_IDLE_HOURS, default
 /// 72. Zero turns the sweep off.
 pub fn subagent_idle_limit() -> Option<u64> {
-    let hours = std::env::var("SHOAL_WORKTREE_IDLE_HOURS")
+    let hours = std::env::var("OCEAN_GRAFT_WORKTREE_IDLE_HOURS")
         .ok()
         .and_then(|h| h.trim().parse::<f64>().ok())
         .filter(|h| h.is_finite() && *h >= 0.0)
@@ -2453,8 +2466,8 @@ fn run_tests(
     cmd.arg("-c")
         .arg(command)
         .current_dir(path)
-        .env("SHOAL_SESSION", name)
-        .env("SHOAL_PORT", port.to_string())
+        .env("OCEAN_GRAFT_SESSION", name)
+        .env("OCEAN_GRAFT_PORT", port.to_string())
         .env("CI", "1")
         .stdin(Stdio::null())
         .stdout(out.try_clone()?)

@@ -110,7 +110,7 @@ def build_template_image(ctx):
     size_gb = max(2, (kb * 2) // (1024 * 1024) + 1)
     base = ctx["work"] / "template"
     run("hdiutil", "create", "-size", f"{size_gb}g", "-type", "SPARSE", "-fs", "APFS",
-        "-volname", "ShoalTemplate", "-quiet", base)
+        "-volname", "OceanGraftTemplate", "-quiet", base)
     image = Path(str(base) + ".sparseimage")
     mnt = ctx["work"] / "template-mnt"
     attach(image, mnt)
@@ -138,8 +138,8 @@ def concurrent_images(ctx, count):
             if not os.path.ismount(dst) or not any(dst.iterdir()):
                 raise RuntimeError(f"clone {i} attached but {dst} is not a populated mount")
             mounts.append(dst)
-        (mounts[0] / "SHOAL_PROBE").write_text("only in the first\n")
-        isolated = all(not (m / "SHOAL_PROBE").exists() for m in mounts[1:])
+        (mounts[0] / "OCEAN_GRAFT_PROBE").write_text("only in the first\n")
+        isolated = all(not (m / "OCEAN_GRAFT_PROBE").exists() for m in mounts[1:])
     except Exception as exc:  # report, do not abort the whole benchmark
         error, isolated = str(exc)[:400], None
     finally:
@@ -167,7 +167,7 @@ def main():
     if os.stat(src).st_dev != os.stat(args.work_parent).st_dev:
         sys.exit("--work-parent must be on the same APFS volume as the source (clonefile cannot cross volumes)")
 
-    work = Path(tempfile.mkdtemp(prefix="shoal-bench.", dir=args.work_parent))
+    work = Path(tempfile.mkdtemp(prefix="ocean-graft-bench.", dir=args.work_parent))
     ctx = {"src": src, "work": work}
     results = {"macos": platform.mac_ver()[0], "machine": platform.machine(), "rows": []}
     try:

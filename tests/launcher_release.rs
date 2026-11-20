@@ -4,7 +4,7 @@
 //! Code's exit-code and stdout rules on every failure.
 //!
 //! A fake release is served from a local directory through file:// URLs
-//! (SHOAL_RELEASE_BASE), so nothing touches the network.
+//! (OCEAN_GRAFT_RELEASE_BASE), so nothing touches the network.
 
 use std::fs;
 use std::io::Write;
@@ -28,12 +28,12 @@ fn platform_asset() -> String {
         .unwrap()
         .trim()
         .to_string();
-    format!("shoal-{os}-{arch}")
+    format!("ocean-graft-{os}-{arch}")
 }
 
 /// A stand-in for the real binary: prints its arguments on stdout (as the
 /// MCP server or the worktree path would) and exits 0.
-const FAKE_BINARY: &str = "#!/bin/sh\necho \"fake shoal $*\"\nexit 0\n";
+const FAKE_BINARY: &str = "#!/bin/sh\necho \"fake ocean-graft $*\"\nexit 0\n";
 
 fn sha256(bytes: &[u8]) -> String {
     let mut child = Command::new("sh")
@@ -64,9 +64,9 @@ impl Fixture {
         let root = dir.path().to_path_buf();
         let libexec = root.join("plugin/libexec");
         fs::create_dir_all(&libexec).unwrap();
-        let launcher = libexec.join("shoal-plugin");
+        let launcher = libexec.join("ocean-graft-plugin");
         fs::copy(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin/libexec/shoal-plugin"),
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin/libexec/ocean-graft-plugin"),
             &launcher,
         )
         .unwrap();
@@ -80,14 +80,14 @@ impl Fixture {
             .unwrap_or_else(|| sha256(FAKE_BINARY.as_bytes()));
         fs::write(
             libexec.join("release.txt"),
-            format!("# test release\nversion {VERSION}\nsha256 {asset} {sha}\nsha256 shoal-other-thing 00\n"),
+            format!("# test release\nversion {VERSION}\nsha256 {asset} {sha}\nsha256 ocean-graft-other-thing 00\n"),
         )
         .unwrap();
         Fixture { _dir: dir, root }
     }
 
     fn launcher(&self) -> PathBuf {
-        self.root.join("plugin/libexec/shoal-plugin")
+        self.root.join("plugin/libexec/ocean-graft-plugin")
     }
 
     fn cached(&self) -> PathBuf {
@@ -103,7 +103,7 @@ impl Fixture {
             .env("HOME", self.root.join("home"))
             .env("CLAUDE_PLUGIN_DATA", self.root.join("data"))
             .env(
-                "SHOAL_RELEASE_BASE",
+                "OCEAN_GRAFT_RELEASE_BASE",
                 format!("file://{}", self.root.join("server").display()),
             )
             .stdin(Stdio::null())
@@ -139,9 +139,9 @@ fn first_use_downloads_verifies_and_caches_the_release_binary() {
     let out = f.run(&["api", "status", "{}"]);
     assert!(out.status.success(), "{}", stderr(&out));
     // stdout carries only the binary's own output.
-    assert_eq!(stdout(&out), "fake shoal api status {}\n");
+    assert_eq!(stdout(&out), "fake ocean-graft api status {}\n");
     assert!(
-        stderr(&out).contains("downloading shoal 9.9.9"),
+        stderr(&out).contains("downloading ocean-graft 9.9.9"),
         "{}",
         stderr(&out)
     );
@@ -160,7 +160,7 @@ fn first_use_downloads_verifies_and_caches_the_release_binary() {
     .unwrap();
     let out = f.run(&["mcp"]);
     assert!(out.status.success(), "{}", stderr(&out));
-    assert_eq!(stdout(&out), "fake shoal mcp\n");
+    assert_eq!(stdout(&out), "fake ocean-graft mcp\n");
     assert!(!stderr(&out).contains("downloading"), "{}", stderr(&out));
 }
 
@@ -234,7 +234,7 @@ fn without_a_release_entry_for_this_platform_nothing_is_downloaded() {
     let f = Fixture::new(None);
     fs::write(
         f.root.join("plugin/libexec/release.txt"),
-        format!("version {VERSION}\nsha256 shoal-plan9-mips 00\n"),
+        format!("version {VERSION}\nsha256 ocean-graft-plan9-mips 00\n"),
     )
     .unwrap();
     let out = f.run(&["hook", "stop"]);
@@ -264,7 +264,7 @@ fn many_first_runs_at_once_all_succeed_with_one_verified_binary() {
         assert!(out.status.success(), "run {i}: {}", stderr(out));
         assert_eq!(
             stdout(out),
-            format!("fake shoal api status {{\"n\":{i}}}\n")
+            format!("fake ocean-graft api status {{\"n\":{i}}}\n")
         );
     }
     assert_eq!(fs::read_to_string(f.cached()).unwrap(), FAKE_BINARY);
@@ -277,18 +277,18 @@ fn many_first_runs_at_once_all_succeed_with_one_verified_binary() {
 }
 
 #[test]
-fn shoal_bin_and_a_bundled_binary_take_precedence_over_the_download() {
+fn ocean_graft_bin_and_a_bundled_binary_take_precedence_over_the_download() {
     let f = Fixture::new(None);
-    let own = f.root.join("own-shoal");
+    let own = f.root.join("own-ocean-graft");
     fs::write(&own, "#!/bin/sh\necho own $*\n").unwrap();
     fs::set_permissions(&own, fs::Permissions::from_mode(0o755)).unwrap();
     let out = Command::new(f.launcher())
         .arg("mcp")
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
-        .env("SHOAL_BIN", &own)
+        .env("OCEAN_GRAFT_BIN", &own)
         .env("CLAUDE_PLUGIN_DATA", f.root.join("data"))
-        .env("SHOAL_RELEASE_BASE", "file:///nonexistent")
+        .env("OCEAN_GRAFT_RELEASE_BASE", "file:///nonexistent")
         .output()
         .unwrap();
     assert_eq!(stdout(&out), "own mcp\n");

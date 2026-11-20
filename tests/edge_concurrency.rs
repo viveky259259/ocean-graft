@@ -1,7 +1,7 @@
 //! Edge-case tests for concurrency, crash leftovers and unusual repository
 //! paths, against plugin/ARCHITECTURE.md and src/{ops,project,hook}.rs.
 //!
-//! Real parallel processes: every test starts several `shoal` processes at
+//! Real parallel processes: every test starts several `ocean-graft` processes at
 //! once (threads released together by a barrier) and then checks that the
 //! project is still consistent: state.json parses, every recorded session and
 //! checkpoint directory exists, nothing unrecorded is lying around, ports and
@@ -57,18 +57,18 @@ fn par<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     })
 }
 
-/// A shoal command with the git ceiling at the test root.
+/// A ocean-graft command with the git ceiling at the test root.
 fn cmd(env: &Env, dir: &Path) -> Command {
     let mut c = env.command(BIN, dir);
     c.env("GIT_CEILING_DIRECTORIES", env.root.path());
     c
 }
 
-fn run_shoal(env: &Env, dir: &Path, args: &[&str]) -> std::process::Output {
+fn run_ocean_graft(env: &Env, dir: &Path, args: &[&str]) -> std::process::Output {
     cmd(env, dir).args(args).output().unwrap()
 }
 
-/// `shoal api` in `dir` with the git ceiling set.
+/// `ocean-graft api` in `dir` with the git ceiling set.
 fn api_at(env: &Env, dir: &Path, tool: &str, args: Value) -> Result<Value, String> {
     let out = cmd(env, dir)
         .args(["api", tool, &args.to_string()])
@@ -115,19 +115,19 @@ fn hook_at(env: &Env, event: &str, input: &Value, dir: &Path) -> HookResult {
     finish(spawn_hook(env, event, input, dir))
 }
 
-/// Commit a shoal.toml choosing the backend and port base, so a hook's
+/// Commit a ocean-graft.toml choosing the backend and port base, so a hook's
 /// automatic init uses them.
 fn commit_config(env: &Env, backend: &str, port_base: u16) {
     fs::write(
-        env.repo().join("shoal.toml"),
+        env.repo().join("ocean-graft.toml"),
         format!("backend = \"{backend}\"\nport_base = {port_base}\n"),
     )
     .unwrap();
-    env.git(&env.repo(), &["add", "shoal.toml"]);
-    env.git(&env.repo(), &["commit", "-q", "-m", "shoal config"]);
+    env.git(&env.repo(), &["add", "ocean-graft.toml"]);
+    env.git(&env.repo(), &["commit", "-q", "-m", "ocean-graft config"]);
 }
 
-/// Directories (not lock files) under $SHOAL_HOME/projects.
+/// Directories (not lock files) under $OCEAN_GRAFT_HOME/projects.
 fn project_dirs(home: &Path) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(home.join("projects")) else {
         return Vec::new();
@@ -174,7 +174,7 @@ fn check_invariants_in(home: &Path, stale: &[&str]) -> Value {
     let mut ports = BTreeSet::new();
     for (name, s) in sessions {
         assert_eq!(s["name"], name.as_str());
-        assert_eq!(s["branch"], format!("shoal/{name}"));
+        assert_eq!(s["branch"], format!("ocean-graft/{name}"));
         let path = dir.join("sessions").join(name);
         assert!(path.is_dir(), "recorded session {name} has no directory");
         assert!(
@@ -351,7 +351,7 @@ fn six_parallel_worktree_creates_on_fresh_repo_build_one_project() {
                 "[{backend}] {name} path not printed"
             );
             let branch = env.git(&p, &["rev-parse", "--abbrev-ref", "HEAD"]);
-            assert_eq!(branch.trim(), format!("shoal/{name}"));
+            assert_eq!(branch.trim(), format!("ocean-graft/{name}"));
         }
     }
 }
@@ -529,7 +529,7 @@ fn eight_parallel_forks_from_the_same_session() {
             assert_eq!(read(path.join("committed.txt")), "c\n");
             assert_eq!(read(path.join("deps/ignored.bin")), "ignored\n");
             assert_eq!(v["sessions"][0]["parent"], "base");
-            assert_eq!(v["sessions"][0]["branch"], format!("shoal/f{k}"));
+            assert_eq!(v["sessions"][0]["branch"], format!("ocean-graft/f{k}"));
         }
         let state = check_invariants(&env);
         assert_eq!(state["sessions"].as_object().unwrap().len(), 9);
@@ -924,7 +924,7 @@ fn checkpoint_of_the_landing_session_during_its_tests() {
 // untracked files (`?? f2.txt`) and sometimes a staged deletion of a commit
 // that DID land (`D  f4.txt`): a following `git commit` by the user deletes
 // landed work from main. The losing land reports `target_blocked`, blaming
-// "untracked working tree files would be overwritten" (shoal's own leftovers
+// "untracked working tree files would be overwritten" (ocean-graft's own leftovers
 // for the user's edits), or `target_moving`, and every later land of that
 // session is blocked by the leftovers. Reproduces in most runs.
 #[test]
@@ -958,12 +958,12 @@ fn parallel_lands_into_the_checked_out_branch_all_land() {
             statuses.push(v["status"].as_str().unwrap().to_string());
         }
         // Whatever happened, nothing is lost: every session's work is in the
-        // source repository, on main or on shoal/<name>.
+        // source repository, on main or on ocean-graft/<name>.
         for k in 1..=4 {
             let on_main = repo.join(format!("f{k}.txt")).exists();
             let on_branch = env
                 .command("git", &repo)
-                .args(["cat-file", "-e", &format!("shoal/l-{k}:f{k}.txt")])
+                .args(["cat-file", "-e", &format!("ocean-graft/l-{k}:f{k}.txt")])
                 .status()
                 .unwrap()
                 .success();
@@ -1109,7 +1109,7 @@ fn parallel_worktree_removes_save_every_sessions_work() {
         for (k, p) in paths.iter().enumerate() {
             assert!(!p.exists(), "[{backend}] {} still exists", p.display());
             let k = k + 1;
-            let content = env.git(&repo, &["show", &format!("shoal/rm-{k}:work{k}.txt")]);
+            let content = env.git(&repo, &["show", &format!("ocean-graft/rm-{k}:work{k}.txt")]);
             assert_eq!(content, format!("work {k}\n"), "[{backend}] work lost");
         }
         let state = check_invariants(&env);
@@ -1133,7 +1133,7 @@ fn parallel_worktree_removes_save_every_sessions_work() {
 // Fixed bug: two WorktreeRemove hooks for the same path race. The loser checks
 // that the path exists before taking the project lock; once it gets the lock
 // the winner has removed the session, session_at() finds nothing, and the
-// loser reports "<path> is not a shoal session, so shoal will not delete it"
+// loser reports "<path> is not a ocean-graft session, so ocean-graft will not delete it"
 // and exits 1, so Claude Code sees a failed removal of a worktree that was
 // removed (and saved) correctly. Expected: "already gone" -> exit 0.
 #[test]
@@ -1149,7 +1149,10 @@ fn parallel_worktree_removes_of_the_same_path_are_idempotent() {
         hook_at(&env, "worktree-remove", &json!({"worktree_path": p}), &repo)
     });
     assert!(!p.exists());
-    assert_eq!(env.git(&repo, &["show", "shoal/twice:keep.txt"]), "keep\n");
+    assert_eq!(
+        env.git(&repo, &["show", "ocean-graft/twice:keep.txt"]),
+        "keep\n"
+    );
     check_invariants(&env);
     for r in &results {
         assert_eq!(
@@ -1190,7 +1193,7 @@ fn fork_racing_a_discard_of_its_parent() {
             }
         }
         assert_eq!(
-            env.git(&repo, &["show", "shoal/a:precious.txt"]),
+            env.git(&repo, &["show", "ocean-graft/a:precious.txt"]),
             "precious\n",
             "[{backend}] discarded work lost"
         );
@@ -1265,7 +1268,7 @@ fn turn_hooks_and_status_during_parallel_forks_never_fail() {
         1 => {
             let r = hook_at(&env, "session-start", &json!({"cwd": a}), &a);
             (
-                r.code == 0 && r.stdout.contains("shoal session \"a\""),
+                r.code == 0 && r.stdout.contains("ocean-graft session \"a\""),
                 format!("{} {}", r.stdout, r.stderr),
             )
         }
@@ -1365,7 +1368,7 @@ fn stale_session_directory_is_refused_by_name_but_worktree_create_moves_on() {
         fs::create_dir_all(&stale).unwrap();
         fs::write(stale.join("orphan.txt"), "do not delete\n").unwrap();
 
-        let out = run_shoal(&env, &repo, &["new", "ghost"]);
+        let out = run_ocean_graft(&env, &repo, &["new", "ghost"]);
         assert!(
             !out.status.success(),
             "[{backend}] new over a stale directory succeeded"
@@ -1408,7 +1411,7 @@ fn stale_volume_directory_is_treated_as_taken() {
     let stale = env.project_dir().join("volumes/vol");
     fs::create_dir_all(stale.join("upper")).unwrap();
     fs::write(stale.join("upper/orphan.txt"), "keep\n").unwrap();
-    let out = run_shoal(&env, &repo, &["new", "vol"]);
+    let out = run_ocean_graft(&env, &repo, &["new", "vol"]);
     assert!(!out.status.success());
     assert!(stderr(&out).contains("left over"), "{}", stderr(&out));
     let r = hook_at(
@@ -1545,7 +1548,7 @@ fn repository_path_with_spaces_and_unicode_works_end_to_end() {
             .join("my projects – ü 日本")
             .join("app (v2) é");
         make_repo(&env, &repo);
-        let out = run_shoal(
+        let out = run_ocean_graft(
             &env,
             &repo,
             &[
@@ -1622,15 +1625,15 @@ fn repository_path_with_spaces_and_unicode_works_end_to_end() {
 }
 
 #[test]
-fn shoal_home_with_spaces_works() {
+fn ocean_graft_home_with_spaces_works() {
     for (i, backend) in backends().into_iter().enumerate() {
         let port = 5689 + i as u16;
         let env = Env::new(port);
-        let home = env.root.path().join("shoal home dir");
+        let home = env.root.path().join("ocean-graft home dir");
         let repo = env.repo();
         let run = |args: &[&str]| {
             cmd(&env, &repo)
-                .env("SHOAL_HOME", &home)
+                .env("OCEAN_GRAFT_HOME", &home)
                 .args(args)
                 .output()
                 .unwrap()
@@ -1663,7 +1666,7 @@ fn detached_head_is_refused_with_a_clear_message() {
     commit_in(&env, &repo, "second.txt", "2\n", "second");
     env.git(&repo, &["checkout", "-q", "--detach", "HEAD~1"]);
 
-    let out = run_shoal(&env, &repo, &["init", "--backend", "clone"]);
+    let out = run_ocean_graft(&env, &repo, &["init", "--backend", "clone"]);
     assert!(!out.status.success(), "init on a detached HEAD succeeded");
     let err = stderr(&out);
     assert!(
@@ -1691,7 +1694,7 @@ fn detached_head_is_refused_with_a_clear_message() {
     assert!(project_dirs(&env.home()).is_empty());
 
     // With --branch it works, and tracks that branch.
-    let out = run_shoal(
+    let out = run_ocean_graft(
         &env,
         &repo,
         &["init", "--backend", "clone", "--branch", "main"],
@@ -1705,7 +1708,7 @@ fn detached_head_is_refused_with_a_clear_message() {
     );
 }
 
-// Fixed bug: on a repository with no commits, `shoal init`, the WorktreeCreate
+// Fixed bug: on a repository with no commits, `ocean-graft init`, the WorktreeCreate
 // hook and `fork` all fail with git's raw "fatal: ambiguous argument 'HEAD':
 // unknown revision or path not in the working tree" from
 // `git rev-parse --abbrev-ref HEAD`; ops::init's own "branch main has no
@@ -1717,7 +1720,7 @@ fn empty_repository_without_commits_is_refused_clearly() {
     let repo = env.root.path().join("empty");
     fs::create_dir_all(&repo).unwrap();
     env.git(&repo, &["init", "-q", "-b", "main"]);
-    let out = run_shoal(&env, &repo, &["init", "--backend", "clone"]);
+    let out = run_ocean_graft(&env, &repo, &["init", "--backend", "clone"]);
     assert!(!out.status.success());
     let err = stderr(&out);
     assert!(
@@ -1748,7 +1751,7 @@ fn non_git_directory_is_refused_clearly() {
     let plain = env.root.path().join("plain dir");
     fs::create_dir_all(&plain).unwrap();
     fs::write(plain.join("file.txt"), "x").unwrap();
-    let out = run_shoal(&env, &plain, &["init", "--backend", "clone"]);
+    let out = run_ocean_graft(&env, &plain, &["init", "--backend", "clone"]);
     assert!(!out.status.success());
     assert!(
         stderr(&out).contains("not inside a git repository"),

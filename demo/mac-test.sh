@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# The whole shoal test on a Mac, in one command:
-#   1. build shoal and run its end-to-end tests (clone backend, clonefile on APFS)
+# The whole ocean-graft test on a Mac, in one command:
+#   1. build ocean-graft and run its end-to-end tests (clone backend, clonefile on APFS)
 #   2. the four-session demo, replaying the agents' recorded commits, with
 #      tests, conflicts, all four servers at once, and import
 #   3. a 100-session scale test
@@ -11,8 +11,8 @@
 #   demo/mac-test.sh [--keep]
 #
 # Everything is created in a new folder in your home directory and deleted at
-# the end unless you pass --keep. Your checkout and ~/.shoal are not modified.
-# The full output is saved to ~/shoal-mac-test-<time>.log.
+# the end unless you pass --keep. Your checkout and ~/.ocean-graft are not modified.
+# The full output is saved to ~/ocean-graft-mac-test-<time>.log.
 #
 # Needs Rust (cargo), Node 22.12 or newer, git and python3. Ports 4100-4130
 # must be free. For the page-cache measurement, run `sudo -v` first (the
@@ -28,10 +28,10 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 keep=0
 [ "${1:-}" = "--keep" ] && keep=1
 stamp="$(date +%Y%m%d-%H%M%S)"
-work="$HOME/shoal-mac-test-$stamp"
-log="$HOME/shoal-mac-test-$stamp.log"
+work="$HOME/ocean-graft-mac-test-$stamp"
+log="$HOME/ocean-graft-mac-test-$stamp.log"
 mkdir -p "$work"
-export SHOAL_HOME="$work/shoal-home"
+export OCEAN_GRAFT_HOME="$work/ocean-graft-home"
 exec > >(tee "$log") 2>&1
 
 finish() {

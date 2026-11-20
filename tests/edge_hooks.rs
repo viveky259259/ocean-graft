@@ -1,4 +1,4 @@
-//! Edge-case tests for `shoal hook <event>`: WorktreeCreate, WorktreeRemove,
+//! Edge-case tests for `ocean-graft hook <event>`: WorktreeCreate, WorktreeRemove,
 //! Stop/SubagentStop, SessionStart and UserPromptSubmit, against the contract
 //! in plugin/ARCHITECTURE.md.
 //!
@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 // Local helpers
 // ---------------------------------------------------------------------------
 
-/// Run `shoal hook <event>` with raw bytes on stdin. Write errors are ignored
+/// Run `ocean-graft hook <event>` with raw bytes on stdin. Write errors are ignored
 /// (the hook may stop reading early), and the elapsed time is returned.
 fn run_hook_raw(
     env: &Env,
@@ -126,7 +126,7 @@ fn expect_created(env: &Env, r: &HookResult, name: &str) -> PathBuf {
     assert_eq!(
         env.git(&path, &["rev-parse", "--abbrev-ref", "HEAD"])
             .trim(),
-        format!("shoal/{name}")
+        format!("ocean-graft/{name}")
     );
     assert!(
         env.state()["sessions"][name].is_object(),
@@ -192,11 +192,11 @@ fn fork(env: &Env, name: &str) -> PathBuf {
     PathBuf::from(r["sessions"][0]["path"].as_str().unwrap())
 }
 
-/// Write shoal.toml at the repository root and commit it.
+/// Write ocean-graft.toml at the repository root and commit it.
 fn write_config(env: &Env, toml: &str) {
-    fs::write(env.repo().join("shoal.toml"), toml).unwrap();
-    env.git(&env.repo(), &["add", "shoal.toml"]);
-    env.git(&env.repo(), &["commit", "-q", "-m", "shoal config"]);
+    fs::write(env.repo().join("ocean-graft.toml"), toml).unwrap();
+    env.git(&env.repo(), &["add", "ocean-graft.toml"]);
+    env.git(&env.repo(), &["commit", "-q", "-m", "ocean-graft config"]);
 }
 
 fn config_for(env: &Env, backend: &str, setup: &str) -> String {
@@ -227,7 +227,7 @@ fn source_branches(env: &Env) -> Vec<String> {
         &[
             "for-each-ref",
             "--format=%(refname:short)",
-            "refs/heads/shoal/",
+            "refs/heads/ocean-graft/",
         ],
     )
     .lines()
@@ -293,10 +293,10 @@ impl Drop for LockHolder {
 // ---------------------------------------------------------------------------
 
 /// First use in a repository with no project: the project is initialised from
-/// shoal.toml, the setup's stdout (including a line with no trailing newline)
+/// ocean-graft.toml, the setup's stdout (including a line with no trailing newline)
 /// goes to stderr, and stdout is exactly the session path.
 #[test]
-fn create_auto_inits_from_shoal_toml_and_keeps_stdout_clean() {
+fn create_auto_inits_from_ocean_graft_toml_and_keeps_stdout_clean() {
     for (i, backend) in backends().into_iter().enumerate() {
         let env = Env::new(5200 + i as u16 * 2);
         write_config(
@@ -390,10 +390,10 @@ fn create_sanitises_names() {
 }
 
 // Fixed bug: (medium) sanitize_name keeps "..", "..." and a ".lock" suffix, so the
-// branch shoal/<name> is not a valid git ref and the hook fails.
-/// Names that pass shoal's own validation but make an invalid git branch.
+// branch ocean-graft/<name> is not a valid git ref and the hook fails.
+/// Names that pass ocean-graft's own validation but make an invalid git branch.
 /// sanitize_name keeps "..", and names ending in ".lock", so the branch
-/// shoal/<name> is not a valid ref and `git switch -C` fails: the hook exits 1
+/// ocean-graft/<name> is not a valid ref and `git switch -C` fails: the hook exits 1
 /// and `claude --worktree a..b` / `--worktree release.lock` cannot start.
 #[test]
 fn create_sanitises_names_git_rejects_as_branches() {
@@ -421,7 +421,7 @@ fn create_sanitises_names_git_rejects_as_branches() {
         );
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let branch = env.git(&path, &["rev-parse", "--abbrev-ref", "HEAD"]);
-        assert_eq!(branch.trim(), format!("shoal/{name}"));
+        assert_eq!(branch.trim(), format!("ocean-graft/{name}"));
     }
     // Whatever failed must not leave a half-made session behind.
     for entry in fs::read_dir(sessions_dir(&env)).unwrap().flatten() {
@@ -617,7 +617,7 @@ fn create_inside_a_session_forks_it_with_uncommitted_and_ignored_files() {
         assert_eq!(
             env.git(&parent, &["rev-parse", "--abbrev-ref", "HEAD"])
                 .trim(),
-            "shoal/parent",
+            "ocean-graft/parent",
             "[{backend}] parent's branch must not change"
         );
 
@@ -859,7 +859,7 @@ fn create_handles_bad_and_empty_stdin() {
 }
 
 /// A failing setup fails the hook, leaves no half-built project, and the next
-/// attempt after fixing shoal.toml succeeds. An invalid shoal.toml is
+/// attempt after fixing ocean-graft.toml succeeds. An invalid ocean-graft.toml is
 /// reported.
 #[test]
 fn create_reports_setup_and_config_failures() {
@@ -923,7 +923,7 @@ fn create_reports_setup_and_config_failures() {
     let x = expect_created(&env, &r, "x");
     assert!(x.join("deps/installed.txt").exists());
 
-    // An invalid shoal.toml in a second repository.
+    // An invalid ocean-graft.toml in a second repository.
     let env2 = Env::new(5226);
     write_config(&env2, "bogus_key = 1\n");
     let r = hook(
@@ -935,7 +935,7 @@ fn create_reports_setup_and_config_failures() {
     );
     assert_eq!(r.code, 1, "{}", r.stderr);
     assert!(r.stdout.is_empty());
-    assert!(r.stderr.contains("shoal.toml"), "{}", r.stderr);
+    assert!(r.stderr.contains("ocean-graft.toml"), "{}", r.stderr);
     assert!(!has_project_state(&env2));
 }
 
@@ -1033,7 +1033,7 @@ fn create_with_corrupt_state_fails_without_reinitialising() {
 // WorktreeRemove
 // ---------------------------------------------------------------------------
 
-/// Uncommitted, untracked and committed work is saved as shoal/<name> in the
+/// Uncommitted, untracked and committed work is saved as ocean-graft/<name> in the
 /// source repository before the session is deleted; the user's checkout is
 /// untouched.
 #[test]
@@ -1073,26 +1073,29 @@ fn remove_saves_uncommitted_work_then_deletes() {
 
         assert_eq!(
             source_branches(&env),
-            vec!["shoal/work".to_string()],
+            vec!["ocean-graft/work".to_string()],
             "[{backend}]"
         );
         assert_eq!(
-            env.git(&repo, &["show", "shoal/work:src/app.txt"]),
+            env.git(&repo, &["show", "ocean-graft/work:src/app.txt"]),
             "changed in session\n"
         );
         assert_eq!(
-            env.git(&repo, &["show", "shoal/work:new.txt"]),
+            env.git(&repo, &["show", "ocean-graft/work:new.txt"]),
             "brand new\n"
         );
-        let tree = env.git(&repo, &["ls-tree", "--name-only", "shoal/work"]);
+        let tree = env.git(&repo, &["ls-tree", "--name-only", "ocean-graft/work"]);
         assert!(
             !tree.lines().any(|l| l == "README.md"),
             "[{backend}] deletion saved too"
         );
         assert!(env
-            .git(&repo, &["log", "-1", "--format=%s", "shoal/work"])
+            .git(&repo, &["log", "-1", "--format=%s", "ocean-graft/work"])
             .contains("WIP"));
-        assert_eq!(env.git(&repo, &["rev-parse", "shoal/work~1"]), main_before);
+        assert_eq!(
+            env.git(&repo, &["rev-parse", "ocean-graft/work~1"]),
+            main_before
+        );
 
         // The user's checkout did not move or change.
         assert_eq!(env.git(&repo, &["rev-parse", "main"]), main_before);
@@ -1133,9 +1136,9 @@ fn remove_imports_committed_work_without_wip() {
     let r = hook(&env, "worktree-remove", &remove_input(&path), &repo, None);
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert!(!path.exists());
-    assert_eq!(env.git(&repo, &["rev-parse", "shoal/c"]), head);
+    assert_eq!(env.git(&repo, &["rev-parse", "ocean-graft/c"]), head);
     assert_eq!(
-        env.git(&repo, &["log", "-1", "--format=%s", "shoal/c"])
+        env.git(&repo, &["log", "-1", "--format=%s", "ocean-graft/c"])
             .trim(),
         "a feature"
     );
@@ -1173,8 +1176,8 @@ fn remove_clean_session_creates_no_branch() {
     }
 }
 
-/// Paths that are not shoal sessions are refused (exit 1) and survive: a
-/// directory outside shoal, the source repository, the project directory, a
+/// Paths that are not ocean-graft sessions are refused (exit 1) and survive: a
+/// directory outside ocean-graft, the source repository, the project directory, a
 /// template, the sessions directory, a leftover directory that is not in
 /// state, and a dangling symlink.
 #[test]
@@ -1417,16 +1420,16 @@ fn remove_keeps_the_session_when_saving_fails() {
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert!(!path.exists());
     assert_eq!(
-        env.git(&repo, &["show", "shoal/w:src/app.txt"]),
+        env.git(&repo, &["show", "ocean-graft/w:src/app.txt"]),
         "unsaved work\n"
     );
 }
 
-// Fixed bug: (critical) worktree-remove force-fetches into shoal/<name>, so a reused
+// Fixed bug: (critical) worktree-remove force-fetches into ocean-graft/<name>, so a reused
 // worktree name overwrites the work saved from the earlier session.
 /// A second session with a name that was used before (Claude Code reuses
 /// worktree names) is saved with a forced fetch to the same branch
-/// shoal/<name>, overwriting the first session's saved work. The first WIP
+/// ocean-graft/<name>, overwriting the first session's saved work. The first WIP
 /// commit is left on no branch at all (only in the reflog).
 #[test]
 fn remove_does_not_overwrite_work_saved_by_an_earlier_session_of_the_same_name() {
@@ -1450,7 +1453,7 @@ fn remove_does_not_overwrite_work_saved_by_an_earlier_session_of_the_same_name()
         0
     );
     let saved_first = env
-        .git(&repo, &["rev-parse", "shoal/fix"])
+        .git(&repo, &["rev-parse", "ocean-graft/fix"])
         .trim()
         .to_string();
 
@@ -1936,7 +1939,7 @@ fn session_start_names_the_session_branch_and_port() {
         let port = env.state()["sessions"][name]["port"].as_u64().unwrap();
         assert!(r.stdout.contains(&format!("\"{name}\"")), "{:?}", r.stdout);
         assert!(
-            r.stdout.contains(&format!("shoal/{name}")),
+            r.stdout.contains(&format!("ocean-graft/{name}")),
             "{:?}",
             r.stdout
         );
@@ -2015,7 +2018,7 @@ fn prompt_marks_only_its_session_active() {
 // ---------------------------------------------------------------------------
 
 /// Unknown or misspelt events are rejected by the CLI (non-zero, nothing on
-/// stdout), and the plugin's hooks.json only uses events shoal accepts, wired
+/// stdout), and the plugin's hooks.json only uses events ocean-graft accepts, wired
 /// to the right Claude Code events.
 #[test]
 fn unknown_events_are_rejected_and_hooks_json_matches() {
@@ -2035,10 +2038,10 @@ fn unknown_events_are_rejected_and_hooks_json_matches() {
         assert!(r.stdout.is_empty(), "{bad:?}: {:?}", r.stdout);
         assert!(!r.stderr.trim().is_empty());
     }
-    let out = env.shoal_in(&repo, &["hook"]);
+    let out = env.ocean_graft_in(&repo, &["hook"]);
     assert!(
         !out.status.success(),
-        "`shoal hook` with no event must fail"
+        "`ocean-graft hook` with no event must fail"
     );
 
     let hooks: Value = serde_json::from_str(&read(
@@ -2060,30 +2063,32 @@ fn unknown_events_are_rejected_and_hooks_json_matches() {
         "{:?}",
         map.keys().collect::<Vec<_>>()
     );
-    for (claude_event, shoal_event) in expected {
+    for (claude_event, ocean_graft_event) in expected {
         let cmd = hooks["hooks"][claude_event][0]["hooks"][0]["command"]
             .as_str()
             .unwrap_or_else(|| panic!("no command for {claude_event}"));
         assert!(
-            cmd.trim_end().ends_with(&format!("hook {shoal_event}")),
+            cmd.trim_end()
+                .ends_with(&format!("hook {ocean_graft_event}")),
             "{claude_event} runs {cmd:?}"
         );
         // The wrapper, pointed at this build, runs the event.
-        let wrapper = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin/libexec/shoal-plugin");
+        let wrapper =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("plugin/libexec/ocean-graft-plugin");
         let mut c = env.command(wrapper.to_str().unwrap(), &repo);
-        c.args(["hook", shoal_event])
-            .env("SHOAL_BIN", BIN)
+        c.args(["hook", ocean_graft_event])
+            .env("OCEAN_GRAFT_BIN", BIN)
             .env("GIT_CEILING_DIRECTORIES", env.root.path())
             .stdin(Stdio::null());
         let out = c.output().unwrap();
         let code = out.status.code().unwrap_or(-1);
-        match shoal_event {
+        match ocean_graft_event {
             // Empty stdin from the repository: a default-named session.
             "worktree-create" => assert_eq!(code, 0, "{}", stderr(&out)),
             // Empty stdin: no worktree_path.
             "worktree-remove" => assert_eq!(code, 1, "{}", stderr(&out)),
             _ => {
-                assert_eq!(code, 0, "{shoal_event}: {}", stderr(&out));
+                assert_eq!(code, 0, "{ocean_graft_event}: {}", stderr(&out));
                 assert!(out.stdout.is_empty());
             }
         }
@@ -2188,12 +2193,12 @@ fn worktree_hooks_wait_for_the_project_lock() {
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert!(!victim.exists());
     assert_eq!(
-        env.git(&repo, &["show", "shoal/victim:src/app.txt"]),
+        env.git(&repo, &["show", "ocean-graft/victim:src/app.txt"]),
         "victim work\n"
     );
 }
 
-/// Overlay sessions unmounted (as after `shoal down` or a reboot) still work
+/// Overlay sessions unmounted (as after `ocean-graft down` or a reboot) still work
 /// with every hook: Stop remounts and checkpoints, WorktreeCreate inside
 /// forks with the parent's work, WorktreeRemove saves the work first.
 #[test]
@@ -2210,7 +2215,7 @@ fn overlay_hooks_work_after_unmount() {
     let s = fork(&env, "s");
     fs::write(s.join("src/app.txt"), "before unmount\n").unwrap();
     fs::write(s.join("deps/ignored.txt"), "ignored\n").unwrap();
-    env.shoal(&["down"]);
+    env.ocean_graft(&["down"]);
     assert!(
         !s.join("src/app.txt").exists(),
         "down should have unmounted the session"
@@ -2221,29 +2226,29 @@ fn overlay_hooks_work_after_unmount() {
     assert_eq!(auto_labels(&env, "s"), vec!["turn-1"]);
     assert_eq!(read(s.join("src/app.txt")), "before unmount\n");
 
-    env.shoal(&["down"]);
+    env.ocean_graft(&["down"]);
     let r = hook(&env, "worktree-create", &create_input("kid", &s), &s, None);
     let kid = expect_created(&env, &r, "kid");
     assert_eq!(read(kid.join("src/app.txt")), "before unmount\n");
     assert_eq!(read(kid.join("deps/ignored.txt")), "ignored\n");
 
-    env.shoal(&["down"]);
+    env.ocean_graft(&["down"]);
     let r = hook(&env, "session-start", &json!({"cwd": s}), &s, None);
     assert_eq!(r.code, 0);
     assert!(r.stdout.contains("\"s\""), "{:?}", r.stdout);
 
-    env.shoal(&["down"]);
+    env.ocean_graft(&["down"]);
     let r = hook(&env, "worktree-remove", &remove_input(&s), &repo, None);
     assert_eq!(r.code, 0, "{}", r.stderr);
     assert!(!s.exists());
     assert_eq!(
-        env.git(&repo, &["show", "shoal/s:src/app.txt"]),
+        env.git(&repo, &["show", "ocean-graft/s:src/app.txt"]),
         "before unmount\n"
     );
     // The fork that sat on s's frozen layer is unaffected (`down` unmounted
     // it too; exec mounts it again).
     assert_eq!(
-        env.shoal(&["exec", "kid", "cat", "src/app.txt"]),
+        env.ocean_graft(&["exec", "kid", "cat", "src/app.txt"]),
         "before unmount\n"
     );
     assert_eq!(read(kid.join("deps/ignored.txt")), "ignored\n");

@@ -1,5 +1,5 @@
 //! The tools Claude uses: one dispatcher, JSON in and JSON out. The MCP
-//! server and `shoal api` both call `call`; neither implements a tool.
+//! server and `ocean-graft api` both call `call`; neither implements a tool.
 
 use crate::config;
 use crate::conflicts;
@@ -38,7 +38,7 @@ pub fn definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "status",
-            "description": "Orientation in one call: the project, every shoal session (path, branch, commits, uncommitted files, checkpoints, preview URLs, idle time) and which sessions change the same files. Call this first, and whenever you are unsure which session you are in.",
+            "description": "Orientation in one call: the project, every ocean-graft session (path, branch, commits, uncommitted files, checkpoints, preview URLs, idle time) and which sessions change the same files. Call this first, and whenever you are unsure which session you are in.",
             "inputSchema": schema(json!({}), &[]),
         }),
         json!({
@@ -75,7 +75,7 @@ pub fn definitions() -> Vec<Value> {
             "description": "Deliver a session's work to the user's branch safely: rebase onto the latest target, run the tests through the job queue, then fast-forward the target (never a force). Returns status: landed, nothing_to_land, uncommitted_changes (pass commit_message), conflicts (files listed; the session is left unchanged), tests_failed (output included; rewind to the pre-land checkpoint to undo the rebase), timed_out (timeout_secs ran out: waiting for the project, a test slot or another land, or while tests ran; the tests did not fail, and if checkpoint is set the session was already rebased, which rewinding to that checkpoint undoes), target_blocked (the user's uncommitted edits, or untracked or ignored files listed in files, are in the way) or target_moving. The session cannot be checkpointed, rewound, forked or discarded while it is being landed.",
             "inputSchema": schema(json!({
                 "commit_message": {"type": "string", "description": "Commit uncommitted work with this message first."},
-                "test": {"type": "string", "description": "Test command; default from shoal.toml or detected. Empty string skips tests."},
+                "test": {"type": "string", "description": "Test command; default from ocean-graft.toml or detected. Empty string skips tests."},
                 "into": {"type": "string", "description": "Target branch (default: the branch the project tracks)."},
                 "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 1500, "description": "Time limit for the whole land, including waiting for a test slot and the tests (default 1200, at most 1500 so the call always answers before Claude Code's 30-minute tool limit)."}
             }), &[]),
@@ -84,13 +84,13 @@ pub fn definitions() -> Vec<Value> {
             "name": "preview",
             "description": "Start the session's app (dev server) and return a URL to give the user. The server sleeps when the session is idle and wakes on the next request. Pass stop=true to stop it.",
             "inputSchema": schema(json!({
-                "command": {"type": "string", "description": "Command to run; default from shoal.toml or package.json (dev/start). It must listen on $PORT."},
+                "command": {"type": "string", "description": "Command to run; default from ocean-graft.toml or package.json (dev/start). It must listen on $PORT."},
                 "stop": {"type": "boolean"}
             }), &[]),
         }),
         json!({
             "name": "discard",
-            "description": "Remove a session you no longer need, such as the losers of a best-of-N. By default its work is kept first: uncommitted changes are committed as WIP and the branch is saved in the source repository as shoal/<name>. keep_work=false deletes it outright.",
+            "description": "Remove a session you no longer need, such as the losers of a best-of-N. By default its work is kept first: uncommitted changes are committed as WIP and the branch is saved in the source repository as ocean-graft/<name>. keep_work=false deletes it outright.",
             "inputSchema": schema(json!({
                 "keep_work": {"type": "boolean", "description": "Default true."}
             }), &[]),
@@ -176,7 +176,7 @@ fn session_name(p: &Project, args: &Value) -> Result<String> {
     }
     if let Some(path) = opt_str(args, "path")? {
         return ops::session_for_path(p, Path::new(&path)).with_context(|| {
-            format!("{path} is not inside a shoal session; pass session, or fork one")
+            format!("{path} is not inside a ocean-graft session; pass session, or fork one")
         });
     }
     bail!("pass session (a name from status) or path (a directory inside the session)")
@@ -220,7 +220,7 @@ fn session_status(p: &Project, name: &str) -> Result<Value> {
         // parallel sessions do not overload the machine.
         "run": format!(
             "{} run --project {} {} -- <command>",
-            sys::shoal_command(),
+            sys::ocean_graft_command(),
             sys::shell_quote(&p.dir.to_string_lossy()),
             sys::shell_quote(name)
         ),
@@ -461,7 +461,7 @@ fn preview(args: &Value) -> Result<Value> {
     let command = match opt_str(args, "command")? {
         Some(c) if !c.trim().is_empty() => c,
         _ => config::load(&p.state.source)?.preview.context(
-            "no preview command: pass command (it must listen on $PORT), or set preview in shoal.toml",
+            "no preview command: pass command (it must listen on $PORT), or set preview in ocean-graft.toml",
         )?,
     };
     let svc = services::serve(

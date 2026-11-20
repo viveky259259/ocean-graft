@@ -1,5 +1,5 @@
 //! A checkpoint of a session that is being written to: the session's own
-//! services are paused while it is copied, and a writer shoal did not start
+//! services are paused while it is copied, and a writer ocean-graft did not start
 //! is caught by comparing HEAD and the fingerprint around the copy.
 //!
 //! Port range 6200-6299. The one service here writes a file and listens on
@@ -17,7 +17,7 @@ fn ok(r: Result<Value, String>, what: &str) -> Value {
 }
 
 fn session_path(env: &Env, name: &str) -> PathBuf {
-    PathBuf::from(env.shoal(&["path", name]).trim())
+    PathBuf::from(env.ocean_graft(&["path", name]).trim())
 }
 
 #[test]
@@ -26,7 +26,7 @@ fn a_session_that_never_stops_changing_still_gets_a_checkpoint_with_a_warning() 
     env.init("clone");
     ok(env.api("fork", json!({"name": "busy"})), "fork");
     let path = session_path(&env, "busy");
-    // Not a shoal service: nothing to pause, so only the comparison sees it.
+    // Not a ocean-graft service: nothing to pause, so only the comparison sees it.
     let mut writer = Command::new("sh")
         .args(["-c", "i=0; while :; do i=$((i+1)); echo $i > churn; done"])
         .current_dir(&path)
@@ -119,7 +119,7 @@ fn a_running_service_is_paused_for_the_copy_and_resumed_after() {
     env.init(backend);
     ok(env.api("fork", json!({"name": "web"})), "fork");
     let path = session_path(&env, "web");
-    env.shoal(&[
+    env.ocean_graft(&[
         "serve",
         "web",
         "--as",
@@ -179,5 +179,5 @@ fn a_running_service_is_paused_for_the_copy_and_resumed_after() {
             .join("counter")
             .exists());
     }
-    env.shoal(&["stop", "web"]);
+    env.ocean_graft(&["stop", "web"]);
 }

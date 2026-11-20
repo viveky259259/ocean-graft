@@ -5,7 +5,7 @@
 #
 #   demo/replay.sh [BASE_REPO]
 #
-# BASE_REPO defaults to ~/shoal-demo/notes-app. Exits non-zero if any check fails.
+# BASE_REPO defaults to ~/ocean-graft-demo/notes-app. Exits non-zero if any check fails.
 set -euo pipefail
 # Plain test output, whatever the caller's terminal settings (a Mac shell
 # often sets FORCE_COLOR or CLICOLOR_FORCE): results are matched as text.
@@ -15,7 +15,7 @@ strip_colors() { sed -e $'s/\x1b\\[[0-9;]*m//g'; }
 set -m # each background job gets its own process group, so servers can be stopped cleanly
 
 here="$(cd "$(dirname "$0")" && pwd)"
-repo="${1:-$HOME/shoal-demo/notes-app}"
+repo="${1:-$HOME/ocean-graft-demo/notes-app}"
 sessions=(search tags fix-limit validation)
 cd "$repo"
 
@@ -24,32 +24,32 @@ json() { node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const 
 
 echo "== Applying each agent's commits in its own session"
 for s in "${sessions[@]}"; do
-  path="$(shoal path "$s")"
-  git -C "$path" -c user.name="shoal demo" -c user.email=demo@example.invalid \
+  path="$(ocean-graft path "$s")"
+  git -C "$path" -c user.name="ocean-graft demo" -c user.email=demo@example.invalid \
     am -q "$here/agent-work/$s.patch"
   printf '  %-11s %s\n' "$s" "$(git -C "$path" log --oneline -1)"
 done
 # The validation agent installed zod; install it in that session only.
-shoal exec validation -- npm install --no-audit --no-fund --loglevel=error >/dev/null
+ocean-graft exec validation -- npm install --no-audit --no-fund --loglevel=error >/dev/null
 
 echo
 echo "== Tests and typecheck in every session"
 expected=(7 8 6 11)
 for i in "${!sessions[@]}"; do
   s="${sessions[$i]}"
-  result="$(shoal exec "$s" -- npx vitest run 2>&1 | strip_colors | grep -E 'Tests ' | tr -s ' ')"
-  shoal exec "$s" -- npx tsc --noEmit || fail "$s: typecheck"
+  result="$(ocean-graft exec "$s" -- npx vitest run 2>&1 | strip_colors | grep -E 'Tests ' | tr -s ' ')"
+  ocean-graft exec "$s" -- npx tsc --noEmit || fail "$s: typecheck"
   printf '  %-11s %s, typecheck ok\n' "$s" "$result"
   [[ "$result" == *"${expected[$i]} passed (${expected[$i]})"* ]] || fail "$s: expected ${expected[$i]} passing tests"
 done
 for s in search tags fix-limit; do
-  [ ! -d "$(shoal path "$s")/node_modules/zod" ] || fail "zod leaked into $s"
+  [ ! -d "$(ocean-graft path "$s")/node_modules/zod" ] || fail "zod leaked into $s"
 done
 echo "  zod is installed only in validation"
 
 echo
 echo "== Conflicts"
-report="$(shoal conflicts)"
+report="$(ocean-graft conflicts)"
 echo "$report"
 [ "$(grep -c 'CONFLICT in' <<<"$report")" = 5 ] || fail "expected 5 conflicting pairs"
 
@@ -57,7 +57,7 @@ echo
 echo "== All four servers at once"
 pids=()
 for s in "${sessions[@]}"; do
-  shoal exec "$s" -- npx tsx src/server.ts >/dev/null 2>&1 &
+  ocean-graft exec "$s" -- npx tsx src/server.ts >/dev/null 2>&1 &
   pids+=($!)
   disown # no "Terminated" job notices when the servers are stopped
 done
@@ -91,8 +91,8 @@ sleep 1
 
 echo
 echo "== Import into the base repository"
-shoal import --all
-git branch --list 'shoal/*' -v
+ocean-graft import --all
+git branch --list 'ocean-graft/*' -v
 [ -z "$(git status --porcelain)" ] || fail "base working tree changed"
 echo "  base working tree untouched"
 echo

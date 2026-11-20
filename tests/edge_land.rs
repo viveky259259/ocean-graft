@@ -1,5 +1,5 @@
 //! Edge-case tests for `land`: every status it can return, through the JSON
-//! API (`shoal api land`) and the CLI (`shoal land`), plus the invariants
+//! API (`ocean-graft api land`) and the CLI (`ocean-graft land`), plus the invariants
 //! that protect the user's work: the target branch is only ever
 //! fast-forwarded, the user's uncommitted edits in the source repository
 //! survive, and a failed land leaves the session where it was.
@@ -175,8 +175,8 @@ fn landed_with_target_checked_out_updates_tree_and_keeps_unrelated_edits() {
             !st.contains("src/app.txt"),
             "[{backend}] tree not in sync with main: {st}"
         );
-        // Recorded as shoal/<name> in the source repository.
-        assert_eq!(tip(&env, "shoal/a"), shead, "[{backend}]");
+        // Recorded as ocean-graft/<name> in the source repository.
+        assert_eq!(tip(&env, "ocean-graft/a"), shead, "[{backend}]");
         assert_eq!(
             env.git(&repo, &["symbolic-ref", "HEAD"]).trim(),
             "refs/heads/main",
@@ -220,7 +220,7 @@ fn landed_when_target_not_checked_out_moves_only_the_ref() {
         assert_eq!(read(repo.join("README.md")), "user edit on feature\n");
         assert_eq!(porcelain(&env, &repo).trim(), "M README.md");
         assert_eq!(tip(&env, "feature"), old_main, "feature must not move");
-        assert_eq!(tip(&env, "shoal/a"), shead2);
+        assert_eq!(tip(&env, "ocean-graft/a"), shead2);
     }
 }
 
@@ -394,7 +394,7 @@ fn uncommitted_changes_lists_files_then_commit_message_lands_them() {
             before,
             "[{backend}] land committed without being asked"
         );
-        assert!(!ref_exists(&env, "refs/heads/shoal/a"));
+        assert!(!ref_exists(&env, "refs/heads/ocean-graft/a"));
         assert_eq!(read(s.join("new.txt")), "brand new\n");
 
         let r = land(
@@ -675,7 +675,7 @@ fn tests_failed_returns_tail_and_checkpoint_that_rewinds_the_rebase() {
         // Nothing reached the target.
         assert_eq!(tip(&env, "main"), main_tip, "[{backend}]");
         assert!(
-            !ref_exists(&env, "refs/heads/shoal/a"),
+            !ref_exists(&env, "refs/heads/ocean-graft/a"),
             "[{backend}] recorded before tests passed"
         );
         assert_eq!(
@@ -735,7 +735,7 @@ fn test_command_runs_in_the_session_with_ci_env_and_null_stdin() {
     let out = env.root.path().join("test-env.txt");
     // `cat` would hang forever if stdin were inherited from a terminal/pipe.
     let test = format!(
-        "echo \"$CI|$SHOAL_SESSION|$SHOAL_PORT|$(pwd -P)\" > {}; cat; echo NOISE-ON-STDOUT; test -f src/app.txt",
+        "echo \"$CI|$OCEAN_GRAFT_SESSION|$OCEAN_GRAFT_PORT|$(pwd -P)\" > {}; cat; echo NOISE-ON-STDOUT; test -f src/app.txt",
         sh_quote(&out)
     );
     let start = Instant::now();
@@ -858,7 +858,7 @@ fn invalid_land_arguments_are_rejected_before_anything_happens() {
     }
     assert_eq!(tip(&env, "main"), old);
     assert_eq!(head(&env, &s), shead);
-    assert!(!ref_exists(&env, "refs/heads/shoal/a"));
+    assert!(!ref_exists(&env, "refs/heads/ocean-graft/a"));
 }
 
 // ---------------------------------------------------------------------------
@@ -885,8 +885,15 @@ fn target_blocked_by_user_edit_keeps_the_edit_and_lands_after() {
         );
         assert_eq!(tip(&env, "main"), old, "[{backend}]");
         assert_eq!(r["head"], shead.as_str());
-        assert_eq!(tip(&env, "shoal/a"), shead, "work must be saved as shoal/a");
-        assert!(r["message"].as_str().unwrap().contains("shoal/a"), "{r}");
+        assert_eq!(
+            tip(&env, "ocean-graft/a"),
+            shead,
+            "work must be saved as ocean-graft/a"
+        );
+        assert!(
+            r["message"].as_str().unwrap().contains("ocean-graft/a"),
+            "{r}"
+        );
         assert!(!rebase_in_progress(&env, &repo));
         assert!(!repo.join(".git/MERGE_HEAD").exists());
 
@@ -967,7 +974,7 @@ fn target_checked_out_in_a_linked_worktree_is_never_desynchronised() {
         "target_blocked" => {
             assert_eq!(tip(&env, "main"), old);
             assert!(st.is_empty(), "{st}");
-            assert_eq!(tip(&env, "shoal/a"), shead);
+            assert_eq!(tip(&env, "ocean-graft/a"), shead);
         }
         other => panic!("unexpected status {other}: {r}"),
     }
@@ -1051,9 +1058,9 @@ fn into_a_missing_branch_is_a_clear_error() {
     );
     assert_eq!(tip(&env, "main"), old);
     assert_eq!(head(&env, &s), shead);
-    assert!(!ref_exists(&env, "refs/heads/shoal/a"));
+    assert!(!ref_exists(&env, "refs/heads/ocean-graft/a"));
     // CLI: non-zero and the same message on stderr.
-    let out = env.shoal_in(
+    let out = env.ocean_graft_in(
         &env.repo(),
         &["land", "a", "--no-test", "--into", "no-such-branch"],
     );
@@ -1125,17 +1132,17 @@ fn into_revision_expressions_and_malformed_names_never_touch_main() {
 }
 
 // ---------------------------------------------------------------------------
-// shoal.toml test command
+// ocean-graft.toml test command
 // ---------------------------------------------------------------------------
 
 #[test]
-fn tests_come_from_shoal_toml_and_empty_test_skips_them() {
+fn tests_come_from_ocean_graft_toml_and_empty_test_skips_them() {
     let env = setup(5387, "clone");
     let repo = env.repo();
     let marker = env.root.path().join("toml-test-ran");
     let cmd = format!("touch {}; echo toml-test-output; exit 4", sh_quote(&marker));
     fs::write(
-        repo.join("shoal.toml"),
+        repo.join("ocean-graft.toml"),
         format!("test = {}\n", toml_str(&cmd)),
     )
     .unwrap();
@@ -1154,32 +1161,32 @@ fn tests_come_from_shoal_toml_and_empty_test_skips_them() {
     assert!(marker.exists());
     assert_eq!(tip(&env, "main"), old);
 
-    // An explicit test overrides shoal.toml.
+    // An explicit test overrides ocean-graft.toml.
     fs::remove_file(&marker).unwrap();
     let r = land(&env, json!({"session": "a", "test": "true"}));
     assert_eq!(r["status"], "landed", "{r}");
     assert_eq!(r["tests"]["command"], "true");
     assert!(
         !marker.exists(),
-        "shoal.toml test ran despite an explicit test"
+        "ocean-graft.toml test ran despite an explicit test"
     );
 
-    // test="" skips even though shoal.toml has a failing test.
+    // test="" skips even though ocean-graft.toml has a failing test.
     let s2 = fork(&env, "b");
     commit_file(&env, &s2, "README.md", "b\n", "b");
     let r = land(&env, json!({"session": "b", "test": ""}));
     assert_eq!(r["status"], "landed", "{r}");
     assert!(r["tests"].is_null(), "{r}");
-    assert!(!marker.exists(), "shoal.toml test ran with test=\"\"");
+    assert!(!marker.exists(), "ocean-graft.toml test ran with test=\"\"");
     // Whitespace-only test also skips.
     commit_file(&env, &s2, "README.md", "b2\n", "b2");
     let r = land(&env, json!({"session": "b", "test": "   "}));
     assert_eq!(r["status"], "landed", "{r}");
     assert!(!marker.exists());
 
-    // CLI: --no-test skips it, plain `shoal land` runs it.
+    // CLI: --no-test skips it, plain `ocean-graft land` runs it.
     commit_file(&env, &s2, "README.md", "b3\n", "b3");
-    let out = env.shoal_in(&repo, &["land", "b"]);
+    let out = env.ocean_graft_in(&repo, &["land", "b"]);
     assert_eq!(
         out.status.code(),
         Some(3),
@@ -1198,7 +1205,7 @@ fn tests_come_from_shoal_toml_and_empty_test_skips_them() {
         stdout(&out)
     );
     assert!(marker.exists());
-    let out = env.shoal_in(&repo, &["land", "b", "--no-test"]);
+    let out = env.ocean_graft_in(&repo, &["land", "b", "--no-test"]);
     assert_eq!(
         out.status.code(),
         Some(0),
@@ -1223,7 +1230,7 @@ fn cli_land_statuses_and_exit_codes() {
     let repo = env.repo();
     let s = fork(&env, "a");
 
-    let out = env.shoal_in(&repo, &["land", "a", "--no-test"]);
+    let out = env.ocean_graft_in(&repo, &["land", "a", "--no-test"]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert!(
         stdout(&out).starts_with("nothing_to_land:"),
@@ -1232,7 +1239,7 @@ fn cli_land_statuses_and_exit_codes() {
     );
 
     fs::write(s.join("src/app.txt"), APP2).unwrap();
-    let out = env.shoal_in(&repo, &["land", "a", "--no-test"]);
+    let out = env.ocean_graft_in(&repo, &["land", "a", "--no-test"]);
     assert_eq!(out.status.code(), Some(3));
     let o = stdout(&out);
     assert!(
@@ -1240,11 +1247,11 @@ fn cli_land_statuses_and_exit_codes() {
         "{o}"
     );
 
-    let out = env.shoal_in(&repo, &["land", "a", "--test", "true", "--no-test"]);
+    let out = env.ocean_graft_in(&repo, &["land", "a", "--test", "true", "--no-test"]);
     assert!(!out.status.success(), "--test and --no-test must conflict");
     assert_eq!(read(s.join("src/app.txt")), APP2);
 
-    let out = env.shoal_in(&repo, &["land", "a", "-m", "feat: cli", "--test", "exit 9"]);
+    let out = env.ocean_graft_in(&repo, &["land", "a", "-m", "feat: cli", "--test", "exit 9"]);
     assert_eq!(out.status.code(), Some(3));
     let o = stdout(&out);
     assert!(
@@ -1252,14 +1259,14 @@ fn cli_land_statuses_and_exit_codes() {
         "{o}"
     );
 
-    let out = env.shoal_in(
+    let out = env.ocean_graft_in(
         &repo,
         &["land", "a", "--test", "sleep 20", "--timeout", "1"],
     );
     assert_eq!(out.status.code(), Some(3));
     assert!(stdout(&out).contains("timed out"), "{}", stdout(&out));
 
-    let out = env.shoal_in(&repo, &["land", "a", "--test", "true"]);
+    let out = env.ocean_graft_in(&repo, &["land", "a", "--test", "true"]);
     assert_eq!(
         out.status.code(),
         Some(0),
@@ -1274,7 +1281,7 @@ fn cli_land_statuses_and_exit_codes() {
     );
     assert_eq!(read(repo.join("src/app.txt")), APP2);
 
-    let out = env.shoal_in(&repo, &["land", "ghost", "--no-test"]);
+    let out = env.ocean_graft_in(&repo, &["land", "ghost", "--no-test"]);
     assert!(!out.status.success());
     assert!(stderr(&out).contains("ghost"), "{}", stderr(&out));
 }
@@ -1316,8 +1323,8 @@ fn two_sessions_land_in_sequence_and_the_second_rebases_over_the_first() {
         }
         assert_eq!(read(repo.join("README.md")), "from a\n");
         assert_eq!(read(repo.join("src/app.txt")), APP2);
-        assert_eq!(tip(&env, "shoal/b"), new);
-        assert_eq!(tip(&env, "shoal/a"), ah);
+        assert_eq!(tip(&env, "ocean-graft/b"), new);
+        assert_eq!(tip(&env, "ocean-graft/a"), ah);
         assert!(porcelain(&env, &repo).is_empty());
     }
 }
@@ -1353,7 +1360,7 @@ fn moves_once_during_tests(env: &Env, checked_out: bool) {
             let cmd = |args: &[&str]| {
                 let out = std::process::Command::new("git")
                     .current_dir(&repo)
-                    .env("SHOAL_HOME", &home)
+                    .env("OCEAN_GRAFT_HOME", &home)
                     .env("GIT_AUTHOR_NAME", "Bg")
                     .env("GIT_AUTHOR_EMAIL", "bg@example.invalid")
                     .env("GIT_COMMITTER_NAME", "Bg")
@@ -1502,7 +1509,7 @@ impl Env2 {
     fn git(&self, args: &[&str]) -> Option<String> {
         let out = std::process::Command::new("git")
             .current_dir(&self.repo)
-            .env("SHOAL_HOME", &self.home)
+            .env("OCEAN_GRAFT_HOME", &self.home)
             .env("GIT_AUTHOR_NAME", "Bg")
             .env("GIT_AUTHOR_EMAIL", "bg@example.invalid")
             .env("GIT_COMMITTER_NAME", "Bg")

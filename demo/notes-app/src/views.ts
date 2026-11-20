@@ -4,7 +4,7 @@ const escape = (text: string) =>
   text.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 
 export function renderPage(notes: Note[], total: number): string {
-  const session = process.env.SHOAL_SESSION ?? "local";
+  const session = process.env.OCEAN_GRAFT_SESSION ?? "local";
   const items = notes
     .map(
       (note) => `

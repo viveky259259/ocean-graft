@@ -14,7 +14,7 @@ struct Unmount<'a>(&'a Env);
 
 impl Drop for Unmount<'_> {
     fn drop(&mut self) {
-        let _ = self.0.shoal_in(&self.0.repo(), &["down"]);
+        let _ = self.0.ocean_graft_in(&self.0.repo(), &["down"]);
     }
 }
 
@@ -45,8 +45,8 @@ impl Env {
     fn command(&self, program: &str, dir: &Path) -> Command {
         let mut cmd = Command::new(program);
         cmd.current_dir(dir)
-            .env("SHOAL_HOME", self.root.path().join("home"))
-            .env_remove("SHOAL_PROJECT")
+            .env("OCEAN_GRAFT_HOME", self.root.path().join("home"))
+            .env_remove("OCEAN_GRAFT_PROJECT")
             .env("GIT_AUTHOR_NAME", "Test")
             .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
             .env("GIT_COMMITTER_NAME", "Test")
@@ -60,18 +60,18 @@ impl Env {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
-    fn shoal_in(&self, dir: &Path, args: &[&str]) -> Output {
-        self.command(env!("CARGO_BIN_EXE_shoal"), dir)
+    fn ocean_graft_in(&self, dir: &Path, args: &[&str]) -> Output {
+        self.command(env!("CARGO_BIN_EXE_ocean-graft"), dir)
             .args(args)
             .output()
             .unwrap()
     }
 
-    fn shoal(&self, args: &[&str]) -> String {
-        let out = self.shoal_in(&self.repo(), args);
+    fn ocean_graft(&self, args: &[&str]) -> String {
+        let out = self.ocean_graft_in(&self.repo(), args);
         assert!(
             out.status.success(),
-            "shoal {args:?} failed:\n{}{}",
+            "ocean-graft {args:?} failed:\n{}{}",
             stdout(&out),
             stderr(&out)
         );
@@ -79,7 +79,7 @@ impl Env {
     }
 
     fn path(&self, session: &str) -> PathBuf {
-        PathBuf::from(self.shoal(&["path", session]).trim())
+        PathBuf::from(self.ocean_graft(&["path", session]).trim())
     }
 }
 
@@ -101,7 +101,7 @@ fn lifecycle(backend: &str) {
     let repo = env.repo();
 
     // A warm template: the setup command's output is in every session.
-    env.shoal(&[
+    env.ocean_graft(&[
         "init",
         "--backend",
         backend,
@@ -112,12 +112,15 @@ fn lifecycle(backend: &str) {
         "--copy",
         ".env",
     ]);
-    env.shoal(&["new", "a"]);
-    env.shoal(&["new", "b"]);
+    env.ocean_graft(&["new", "a"]);
+    env.ocean_graft(&["new", "b"]);
     let (a, b) = (env.path("a"), env.path("b"));
     assert_eq!(read(a.join("deps/installed.txt")), "lib 1.0\n");
     assert_eq!(read(a.join(".env")), "SECRET=1\n");
-    assert_eq!(env.git(&a, &["branch", "--show-current"]).trim(), "shoal/a");
+    assert_eq!(
+        env.git(&a, &["branch", "--show-current"]).trim(),
+        "ocean-graft/a"
+    );
 
     // Isolation: edits, new files and deletes stay in their session.
     fs::write(
@@ -138,27 +141,27 @@ fn lifecycle(backend: &str) {
         "line one\nline two\nline three\n"
     );
 
-    let status = env.shoal(&["status", "a"]);
+    let status = env.ocean_graft(&["status", "a"]);
     assert!(status.contains("M src/app.txt"), "{status}");
     assert!(status.contains("D README.md"), "{status}");
     if backend == "overlay" {
         // The volume delta also sees the ignored dependency directory.
         assert!(status.contains("deps"), "{status}");
     }
-    let diff = env.shoal(&["diff", "a", "--stat"]);
+    let diff = env.ocean_graft(&["diff", "a", "--stat"]);
     assert!(diff.contains("src/app.txt"), "{diff}");
 
     // Each session gets its own port in the environment.
-    let ports = env.shoal(&[
+    let ports = env.ocean_graft(&[
         "exec",
         "a",
         "--",
         "sh",
         "-c",
-        "echo $SHOAL_SESSION:$SHOAL_PORT",
+        "echo $OCEAN_GRAFT_SESSION:$OCEAN_GRAFT_PORT",
     ]);
     assert_eq!(ports.trim(), "a:4100");
-    let ports = env.shoal(&["exec", "b", "sh", "-c", "echo $SHOAL_SESSION:$PORT"]);
+    let ports = env.ocean_graft(&["exec", "b", "sh", "-c", "echo $OCEAN_GRAFT_SESSION:$PORT"]);
     assert_eq!(ports.trim(), "b:4110");
 
     // Conflicts are found from what is on disk, before anything is committed.
@@ -167,14 +170,14 @@ fn lifecycle(backend: &str) {
         "line one\nchanged by b\nline three\n",
     )
     .unwrap();
-    let report = env.shoal(&["conflicts"]);
+    let report = env.ocean_graft(&["conflicts"]);
     assert!(report.contains("CONFLICT in: src/app.txt"), "{report}");
 
     // Checkpoint, wreck, rewind: uncommitted and ignored files come back.
-    env.shoal(&["checkpoint", "a", "before"]);
+    env.ocean_graft(&["checkpoint", "a", "before"]);
     fs::remove_dir_all(a.join("src")).unwrap();
     fs::remove_dir_all(a.join("deps")).unwrap();
-    env.shoal(&["rewind", "a", "before"]);
+    env.ocean_graft(&["rewind", "a", "before"]);
     let a = env.path("a");
     assert_eq!(
         read(a.join("src/app.txt")),
@@ -183,55 +186,58 @@ fn lifecycle(backend: &str) {
     assert_eq!(read(a.join("deps/extra.txt")), "only in a\n");
 
     // Fork keeps the parent's uncommitted and ignored state; then they diverge.
-    env.shoal(&["fork", "a", "c"]);
+    env.ocean_graft(&["fork", "a", "c"]);
     let c = env.path("c");
     assert_eq!(
         read(c.join("src/app.txt")),
         "line one\nchanged by a\nline three\n"
     );
     assert_eq!(read(c.join("deps/extra.txt")), "only in a\n");
-    assert_eq!(env.git(&c, &["branch", "--show-current"]).trim(), "shoal/c");
+    assert_eq!(
+        env.git(&c, &["branch", "--show-current"]).trim(),
+        "ocean-graft/c"
+    );
     fs::write(c.join("deps/extra.txt"), "changed in c\n").unwrap();
     assert_eq!(read(a.join("deps/extra.txt")), "only in a\n");
 
     // Commits come back to the source repository as branches.
     env.git(&a, &["add", "-A"]);
     env.git(&a, &["commit", "-q", "-m", "change from a"]);
-    let imported = env.shoal(&["import", "a"]);
+    let imported = env.ocean_graft(&["import", "a"]);
     assert!(
-        imported.contains("1 commit(s) imported as shoal/a"),
+        imported.contains("1 commit(s) imported as ocean-graft/a"),
         "{imported}"
     );
-    let log = env.git(&repo, &["log", "-1", "--format=%s", "shoal/a"]);
+    let log = env.git(&repo, &["log", "-1", "--format=%s", "ocean-graft/a"]);
     assert_eq!(log.trim(), "change from a");
 
     // Refresh: the source moves on and the lockfile changed, so setup re-runs.
     fs::write(repo.join("deps.lock"), "lib 2.0\n").unwrap();
     env.git(&repo, &["commit", "-q", "-am", "bump lib"]);
-    let refreshed = env.shoal(&["refresh"]);
+    let refreshed = env.ocean_graft(&["refresh"]);
     assert!(refreshed.contains("Template g2"), "{refreshed}");
     assert!(refreshed.contains("setup re-run"), "{refreshed}");
-    env.shoal(&["new", "d"]);
+    env.ocean_graft(&["new", "d"]);
     let d = env.path("d");
     assert_eq!(read(d.join("deps/installed.txt")), "lib 2.0\n");
     assert_eq!(read(b.join("deps/installed.txt")), "lib 1.0\n");
-    let listing = env.shoal(&["ls"]);
+    let listing = env.ocean_graft(&["ls"]);
     assert!(listing.contains("g2"), "{listing}");
 
     // rm refuses to lose work unless forced.
-    let refused = env.shoal_in(&repo, &["rm", "b"]);
+    let refused = env.ocean_graft_in(&repo, &["rm", "b"]);
     assert!(!refused.status.success());
     assert!(stderr(&refused).contains("uncommitted"));
-    env.shoal(&["rm", "b", "--force"]);
-    env.shoal(&["rm", "d"]);
-    assert!(!env.shoal(&["ls"]).contains("\nb "));
+    env.ocean_graft(&["rm", "b", "--force"]);
+    env.ocean_graft(&["rm", "d"]);
+    assert!(!env.ocean_graft(&["ls"]).contains("\nb "));
 
     // Sessions come back after being unmounted (as after a reboot).
-    env.shoal(&["down"]);
+    env.ocean_graft(&["down"]);
     assert_eq!(read(env.path("c").join("deps/extra.txt")), "changed in c\n");
 
-    env.shoal(&["gc"]);
-    let info = env.shoal(&["info"]);
+    env.ocean_graft(&["gc"]);
+    let info = env.ocean_graft(&["info"]);
     assert!(info.contains("g2"), "{info}");
 }
 
@@ -267,9 +273,9 @@ fn sandbox_confines_writes() {
     }
     let env = Env::new();
     let _unmount = Unmount(&env);
-    env.shoal(&["init"]);
-    env.shoal(&["new", "a"]);
-    env.shoal(&["new", "b"]);
+    env.ocean_graft(&["init"]);
+    env.ocean_graft(&["new", "a"]);
+    env.ocean_graft(&["new", "b"]);
     let b = env.path("b");
     let outside = env.root.path().join("outside.txt");
     let script = format!(
@@ -282,7 +288,7 @@ fn sandbox_confines_writes() {
         outside = outside.display(),
         b = b.display()
     );
-    let out = env.shoal(&["exec", "--sandbox", "a", "--", "sh", "-c", &script]);
+    let out = env.ocean_graft(&["exec", "--sandbox", "a", "--", "sh", "-c", &script]);
     // Under /tmp the sandbox's own empty tmpfs takes the write; what matters
     // is that nothing reaches the real file (checked below).
     if !outside.starts_with("/tmp") {
@@ -303,7 +309,7 @@ fn sandbox_confines_writes() {
         assert!(!Path::new(&tmpdir).exists(), "{tmpdir} was left behind");
     }
     // A shell's own exit code comes through.
-    let out = env.shoal_in(
+    let out = env.ocean_graft_in(
         &env.repo(),
         &["exec", "--sandbox", "a", "--", "sh", "-c", "exit 3"],
     );
@@ -319,7 +325,7 @@ fn alive(pid: i32) -> bool {
     unsafe { libc_kill(pid, 0) == 0 }
 }
 
-/// The PID column of `shoal services` for one session's service.
+/// The PID column of `ocean-graft services` for one session's service.
 fn service_pid(listing: &str, session: &str) -> Option<i32> {
     listing
         .lines()
@@ -333,9 +339,9 @@ fn queue_limits_concurrent_jobs() {
     use std::time::{Duration, Instant};
     let env = Env::new();
     let _unmount = Unmount(&env);
-    env.shoal(&["init", "--backend", "clone"]);
-    env.shoal(&["new", "a"]);
-    env.shoal(&["queue", "--slots", "2"]);
+    env.ocean_graft(&["init", "--backend", "clone"]);
+    env.ocean_graft(&["new", "a"]);
+    env.ocean_graft(&["queue", "--slots", "2"]);
 
     // Each job records how many jobs are running when it starts.
     let marks = env.root.path().join("marks");
@@ -347,7 +353,7 @@ fn queue_limits_concurrent_jobs() {
     let start = Instant::now();
     let jobs: Vec<_> = (0..5)
         .map(|_| {
-            env.command(env!("CARGO_BIN_EXE_shoal"), &env.repo())
+            env.command(env!("CARGO_BIN_EXE_ocean-graft"), &env.repo())
                 .args(["run", "a", "--", "sh", "-c", &script])
                 .stderr(std::process::Stdio::null())
                 .spawn()
@@ -355,7 +361,7 @@ fn queue_limits_concurrent_jobs() {
         })
         .collect();
     std::thread::sleep(Duration::from_millis(400));
-    let queue = env.shoal(&["queue"]);
+    let queue = env.ocean_graft(&["queue"]);
     assert!(
         queue.contains("2 of 2 slot(s) busy, 3 job(s) waiting"),
         "{queue}"
@@ -380,13 +386,13 @@ fn queue_limits_concurrent_jobs() {
         start.elapsed()
     );
     assert!(env
-        .shoal(&["queue"])
+        .ocean_graft(&["queue"])
         .contains("0 of 2 slot(s) busy, 0 job(s) waiting"));
 
     // Inside a session, `run` finds the session from the working directory.
     let out = env
-        .command(env!("CARGO_BIN_EXE_shoal"), &env.path("a"))
-        .args(["run", "--", "sh", "-c", "echo $SHOAL_SESSION"])
+        .command(env!("CARGO_BIN_EXE_ocean-graft"), &env.path("a"))
+        .args(["run", "--", "sh", "-c", "echo $OCEAN_GRAFT_SESSION"])
         .output()
         .unwrap();
     assert_eq!(stdout(&out).trim(), "a", "{}", stderr(&out));
@@ -397,23 +403,23 @@ fn idle_services_are_stopped_and_woken() {
     use std::time::Duration;
     let env = Env::new();
     let _unmount = Unmount(&env);
-    env.shoal(&["init", "--backend", "clone"]);
-    env.shoal(&["new", "a"]);
-    env.shoal(&["new", "b"]);
+    env.ocean_graft(&["init", "--backend", "clone"]);
+    env.ocean_graft(&["new", "a"]);
+    env.ocean_graft(&["new", "b"]);
     let server = ["sh", "-c", "echo listening on $PORT; exec sleep 300"];
-    let started = env.shoal(&[&["serve", "a", "--"][..], &server[..]].concat());
+    let started = env.ocean_graft(&[&["serve", "a", "--"][..], &server[..]].concat());
     assert!(
         started.contains("Started web in a on port 4100"),
         "{started}"
     );
-    env.shoal(&[&["serve", "b", "--"][..], &server[..]].concat());
-    let listing = env.shoal(&["services"]);
+    env.ocean_graft(&[&["serve", "b", "--"][..], &server[..]].concat());
+    let listing = env.ocean_graft(&["services"]);
     let (pid_a, pid_b) = (
         service_pid(&listing, "a").unwrap(),
         service_pid(&listing, "b").unwrap(),
     );
     assert!(alive(pid_a) && alive(pid_b), "{listing}");
-    let twice = env.shoal_in(
+    let twice = env.ocean_graft_in(
         &env.repo(),
         &[&["serve", "a", "--"][..], &server[..]].concat(),
     );
@@ -422,25 +428,25 @@ fn idle_services_are_stopped_and_woken() {
     // Both go quiet; then someone works in b.
     std::thread::sleep(Duration::from_secs(2));
     fs::write(env.path("b").join("notes.txt"), "still working\n").unwrap();
-    let reaped = env.shoal(&["reap", "--idle", "1s"]);
+    let reaped = env.ocean_graft(&["reap", "--idle", "1s"]);
     assert!(reaped.contains("stopped 1 service(s) in a"), "{reaped}");
     assert!(!reaped.contains("in b"), "{reaped}");
     assert!(!alive(pid_a), "a's server should have stopped");
     assert!(alive(pid_b), "b is active, so its server keeps running");
-    let listing = env.shoal(&["services"]);
+    let listing = env.ocean_graft(&["services"]);
     assert!(listing.contains("stopped (idle)"), "{listing}");
-    assert!(env.shoal(&["ls"]).contains("1 idle-stopped"));
+    assert!(env.ocean_graft(&["ls"]).contains("1 idle-stopped"));
 
     // Wake brings a's server back on the same port.
-    let woke = env.shoal(&["wake", "a"]);
+    let woke = env.ocean_graft(&["wake", "a"]);
     assert!(woke.contains("Started web in a on port 4100"), "{woke}");
-    let pid_a = service_pid(&env.shoal(&["services"]), "a").unwrap();
+    let pid_a = service_pid(&env.ocean_graft(&["services"]), "a").unwrap();
     assert!(alive(pid_a));
 
-    let stopped = env.shoal(&["stop", "b"]);
+    let stopped = env.ocean_graft(&["stop", "b"]);
     assert!(stopped.contains("Stopped 1 service(s) in b"), "{stopped}");
     assert!(!alive(pid_b));
-    env.shoal(&["rm", "a", "--force"]);
+    env.ocean_graft(&["rm", "a", "--force"]);
     assert!(!alive(pid_a), "rm stops the session's services");
 }
 
@@ -448,9 +454,9 @@ fn idle_services_are_stopped_and_woken() {
 fn conflict_check_is_incremental() {
     let env = Env::new();
     let _unmount = Unmount(&env);
-    env.shoal(&["init", "--backend", "clone"]);
+    env.ocean_graft(&["init", "--backend", "clone"]);
     for name in ["a", "b", "c"] {
-        env.shoal(&["new", name]);
+        env.ocean_graft(&["new", name]);
     }
     let original = read(env.path("b").join("src/app.txt"));
     fs::write(
@@ -465,7 +471,7 @@ fn conflict_check_is_incremental() {
     .unwrap();
     fs::write(env.path("c").join("README.md"), "c was here\n").unwrap();
 
-    let first = env.shoal(&["conflicts"]);
+    let first = env.ocean_graft(&["conflicts"]);
     assert!(
         first.contains("a + b") && first.contains("CONFLICT in: src/app.txt"),
         "{first}"
@@ -480,7 +486,7 @@ fn conflict_check_is_incremental() {
     );
 
     // Nothing changed: no new snapshots, no new merges, same answer.
-    let again = env.shoal(&["conflicts"]);
+    let again = env.ocean_graft(&["conflicts"]);
     assert!(
         again.contains("(0 changed since the last check)"),
         "{again}"
@@ -490,7 +496,7 @@ fn conflict_check_is_incremental() {
 
     // b takes its edit back: only b is looked at again, and the conflict is gone.
     fs::write(env.path("b").join("src/app.txt"), &original).unwrap();
-    let after = env.shoal(&["conflicts"]);
+    let after = env.ocean_graft(&["conflicts"]);
     assert!(
         after.contains("(1 changed since the last check)"),
         "{after}"
@@ -499,7 +505,7 @@ fn conflict_check_is_incremental() {
 
     // A committed change counts too, even when the files are the same on disk.
     env.git(&env.path("a"), &["commit", "-q", "-am", "a commits"]);
-    let committed = env.shoal(&["conflicts"]);
+    let committed = env.ocean_graft(&["conflicts"]);
     assert!(
         committed.contains("(1 changed since the last check)"),
         "{committed}"
@@ -531,9 +537,9 @@ fn on_demand_service_wakes_on_first_request() {
     }
     let env = Env::new();
     let _unmount = Unmount(&env);
-    env.shoal(&["init", "--backend", "clone", "--port-base", "4700"]);
-    env.shoal(&["new", "a"]);
-    let started = env.shoal(&[
+    env.ocean_graft(&["init", "--backend", "clone", "--port-base", "4700"]);
+    env.ocean_graft(&["new", "a"]);
+    let started = env.ocean_graft(&[
         "serve",
         "a",
         "--on-demand",
@@ -546,28 +552,34 @@ fn on_demand_service_wakes_on_first_request() {
     // The server needs a moment to bind its private port; the gateway waits.
     let first = http_get(4700).expect("the gateway answers");
     assert!(first.contains("200"), "{first}");
-    assert!(env.shoal(&["services"]).contains("running (on demand)"));
+    assert!(env
+        .ocean_graft(&["services"])
+        .contains("running (on demand)"));
 
     // Idle: reap stops the server but the gateway stays.
     std::thread::sleep(Duration::from_secs(2));
-    let reaped = env.shoal(&["reap", "--idle", "1s"]);
+    let reaped = env.ocean_graft(&["reap", "--idle", "1s"]);
     assert!(reaped.contains("stopped 1 service(s) in a"), "{reaped}");
-    assert!(env.shoal(&["services"]).contains("asleep (on demand)"));
+    assert!(env
+        .ocean_graft(&["services"])
+        .contains("asleep (on demand)"));
 
     // The next request wakes it and is answered.
     let start = Instant::now();
     let woken = http_get(4700).expect("the gateway answers after reap");
     assert!(woken.contains("200"), "{woken}");
     eprintln!("woke and answered in {:?}", start.elapsed());
-    assert!(env.shoal(&["services"]).contains("running (on demand)"));
+    assert!(env
+        .ocean_graft(&["services"])
+        .contains("running (on demand)"));
 
     // Requests count as activity: a session in use is not reaped.
     std::thread::sleep(Duration::from_secs(2));
     assert!(http_get(4700).unwrap().contains("200"));
-    let kept = env.shoal(&["reap", "--idle", "1s"]);
+    let kept = env.ocean_graft(&["reap", "--idle", "1s"]);
     assert!(!kept.contains("in a"), "a was just used: {kept}");
 
     // stop removes the gateway too: nothing listens any more.
-    env.shoal(&["stop", "a"]);
+    env.ocean_graft(&["stop", "a"]);
     assert!(http_get(4700).is_none(), "the gateway should be gone");
 }

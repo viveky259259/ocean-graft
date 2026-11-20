@@ -1,7 +1,7 @@
 {
   "mcpServers": {
-    "shoal": {
-      "command": "${CLAUDE_PLUGIN_ROOT}/libexec/shoal-plugin",
+    "ocean-graft": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/libexec/ocean-graft-plugin",
       "args": ["mcp"]
     }
   }

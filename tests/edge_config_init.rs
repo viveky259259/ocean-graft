@@ -1,4 +1,4 @@
-//! Edge-case tests for project configuration and initialisation: `shoal.toml`
+//! Edge-case tests for project configuration and initialisation: `ocean-graft.toml`
 //! parsing and validation, detection without a file, auto-initialisation on
 //! the first fork from main, `refresh` (new template generations) and the
 //! rule that sessions never modify the template.
@@ -8,7 +8,7 @@
 //! port_base inside the range. The one exception is the port-overflow test,
 //! which records ports near 65535 on purpose and still listens on nothing.
 //!
-//! Every shoal call runs with GIT_CEILING_DIRECTORIES at the test's
+//! Every ocean-graft call runs with GIT_CEILING_DIRECTORIES at the test's
 //! temporary root: target/tmp may live inside another git repository, and a
 //! "non-git directory" would otherwise resolve to that enclosing repository.
 
@@ -44,7 +44,7 @@ fn commit_all(env: &Env, msg: &str) {
 }
 
 fn set_toml(env: &Env, body: &str) {
-    write(env.repo().join("shoal.toml"), body);
+    write(env.repo().join("ocean-graft.toml"), body);
 }
 
 /// The standard project file: the harness's "install", .env copied, the
@@ -56,7 +56,7 @@ fn standard_toml(env: &Env, backend: &str) -> String {
     )
 }
 
-fn shoal_cmd(env: &Env, dir: &Path, args: &[&str], extra: &[(&str, String)]) -> Command {
+fn ocean_graft_cmd(env: &Env, dir: &Path, args: &[&str], extra: &[(&str, String)]) -> Command {
     let mut cmd = env.command(BIN, dir);
     cmd.args(args)
         .env("GIT_CEILING_DIRECTORIES", env.root.path())
@@ -78,7 +78,7 @@ fn parse_api(tool: &str, ok: bool, text: &str, err_text: &str) -> Result<Value, 
     }
 }
 
-/// `shoal api <tool>` in `dir` with extra environment variables.
+/// `ocean-graft api <tool>` in `dir` with extra environment variables.
 fn call_env(
     env: &Env,
     dir: &Path,
@@ -86,7 +86,7 @@ fn call_env(
     args: Value,
     extra: &[(&str, String)],
 ) -> Result<Value, String> {
-    let out = shoal_cmd(env, dir, &["api", tool, &args.to_string()], extra)
+    let out = ocean_graft_cmd(env, dir, &["api", tool, &args.to_string()], extra)
         .output()
         .unwrap();
     parse_api(tool, out.status.success(), &stdout(&out), &stderr(&out))
@@ -118,7 +118,7 @@ fn spath(r: &Value) -> PathBuf {
 
 static SEQ: AtomicUsize = AtomicUsize::new(0);
 
-/// Run shoal with a deadline. None when it had to be killed. Output goes to
+/// Run ocean-graft with a deadline. None when it had to be killed. Output goes to
 /// files so a chatty child cannot block on a full pipe.
 fn run_with_deadline(
     env: &Env,
@@ -129,7 +129,7 @@ fn run_with_deadline(
     let n = SEQ.fetch_add(1, Ordering::SeqCst);
     let out_path = env.root.path().join(format!("deadline-{n}.out"));
     let err_path = env.root.path().join(format!("deadline-{n}.err"));
-    let mut cmd = shoal_cmd(env, dir, args, &[]);
+    let mut cmd = ocean_graft_cmd(env, dir, args, &[]);
     cmd.stdout(Stdio::from(fs::File::create(&out_path).unwrap()))
         .stderr(Stdio::from(fs::File::create(&err_path).unwrap()));
     let mut child = cmd.spawn().unwrap();
@@ -151,7 +151,7 @@ fn run_with_deadline(
     }
 }
 
-/// Directories under SHOAL_HOME/projects (lock files are not projects).
+/// Directories under OCEAN_GRAFT_HOME/projects (lock files are not projects).
 fn project_dirs(env: &Env) -> Vec<PathBuf> {
     match fs::read_dir(env.home().join("projects")) {
         Ok(rd) => rd
@@ -256,7 +256,7 @@ fn lines(path: impl AsRef<Path>) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// shoal.toml is used on the first fork
+// ocean-graft.toml is used on the first fork
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -264,7 +264,7 @@ fn toml_setup_copy_port_and_backend_are_used_on_first_fork() {
     for (i, backend) in backends().into_iter().enumerate() {
         let env = Env::new(5700 + i as u16);
         set_toml(&env, &standard_toml(&env, backend));
-        commit_all(&env, "add shoal.toml");
+        commit_all(&env, "add ocean-graft.toml");
         assert!(project_dirs(&env).is_empty());
 
         let r = fork_ok(&env);
@@ -319,7 +319,7 @@ fn toml_setup_copy_port_and_backend_are_used_on_first_fork() {
 }
 
 #[test]
-fn uncommitted_shoal_toml_in_the_working_tree_is_honoured() {
+fn uncommitted_ocean_graft_toml_in_the_working_tree_is_honoured() {
     let env = Env::new(5703);
     set_toml(&env, &standard_toml(&env, "clone"));
     let r = fork_ok(&env);
@@ -329,11 +329,11 @@ fn uncommitted_shoal_toml_in_the_working_tree_is_honoured() {
     assert_eq!(read(path.join(".env")), "SECRET=1\n");
     // The template is built from the commit, so the uncommitted file itself
     // is not in the session.
-    assert!(!path.join("shoal.toml").exists());
+    assert!(!path.join("ocean-graft.toml").exists());
 }
 
 #[test]
-fn shoal_toml_from_the_repository_root_is_used_when_forking_from_a_subdirectory() {
+fn ocean_graft_toml_from_the_repository_root_is_used_when_forking_from_a_subdirectory() {
     let env = Env::new(5705);
     set_toml(&env, &standard_toml(&env, "clone"));
     commit_all(&env, "toml");
@@ -356,13 +356,13 @@ fn shoal_toml_from_the_repository_root_is_used_when_forking_from_a_subdirectory(
 }
 
 #[test]
-fn setup_runs_in_the_template_with_shoal_template_set() {
+fn setup_runs_in_the_template_with_ocean_graft_template_set() {
     for (i, backend) in backends().into_iter().enumerate() {
         let env = Env::new(5707 + i as u16);
         set_toml(
             &env,
             &format!(
-                "setup = 'mkdir -p deps && echo \"$SHOAL_TEMPLATE\" > deps/flag && pwd > deps/where'\nport_base = {}\nbackend = \"{backend}\"\n",
+                "setup = 'mkdir -p deps && echo \"$OCEAN_GRAFT_TEMPLATE\" > deps/flag && pwd > deps/where'\nport_base = {}\nbackend = \"{backend}\"\n",
                 env.port_base
             ),
         );
@@ -383,11 +383,11 @@ fn setup_runs_in_the_template_with_shoal_template_set() {
 }
 
 // ---------------------------------------------------------------------------
-// Detection without shoal.toml
+// Detection without ocean-graft.toml
 // ---------------------------------------------------------------------------
 
 #[test]
-fn package_lock_without_shoal_toml_detects_npm_ci() {
+fn package_lock_without_ocean_graft_toml_detects_npm_ci() {
     let env = Env::new(5710);
     write(env.repo().join("package-lock.json"), "{}\n");
     commit_all(&env, "lockfile");
@@ -395,7 +395,7 @@ fn package_lock_without_shoal_toml_detects_npm_ci() {
         &env,
         &[(
             "npm",
-            "mkdir -p deps && echo \"npm $* T=$SHOAL_TEMPLATE\" > deps/npm-ran.txt",
+            "mkdir -p deps && echo \"npm $* T=$OCEAN_GRAFT_TEMPLATE\" > deps/npm-ran.txt",
         )],
     );
     let r = call_env(&env, &env.repo(), "fork", json!({}), &path_env).unwrap();
@@ -410,7 +410,7 @@ fn package_lock_without_shoal_toml_detects_npm_ci() {
         "clone"
     };
     assert_eq!(st["backend"], auto, "automatic backend: {st}");
-    // Without shoal.toml, the default lockfile inputs apply.
+    // Without ocean-graft.toml, the default lockfile inputs apply.
     let inputs = env.state()["setup_inputs"].clone();
     assert!(
         inputs
@@ -469,7 +469,7 @@ fn repo_without_lockfile_has_no_setup_and_sessions_still_work() {
     assert_eq!(
         env.git(&path, &["rev-parse", "--abbrev-ref", "HEAD"])
             .trim(),
-        format!("shoal/{}", r["sessions"][0]["name"].as_str().unwrap())
+        format!("ocean-graft/{}", r["sessions"][0]["name"].as_str().unwrap())
     );
     let r2 = fork_ok(&env);
     assert_eq!(r2["sessions"][0]["port"], 4110);
@@ -507,7 +507,7 @@ fn empty_setup_string_disables_the_detected_setup() {
 }
 
 #[test]
-fn empty_and_crlf_shoal_toml_files_are_valid() {
+fn empty_and_crlf_ocean_graft_toml_files_are_valid() {
     let env = Env::new(5720);
     set_toml(&env, "");
     let r = fork_ok(&env);
@@ -529,20 +529,20 @@ fn empty_and_crlf_shoal_toml_files_are_valid() {
 
 /// A UTF-8 byte-order mark (common from Windows editors) is accepted.
 #[test]
-fn shoal_toml_with_a_byte_order_mark_is_accepted() {
+fn ocean_graft_toml_with_a_byte_order_mark_is_accepted() {
     let env = Env::new(5722);
     set_toml(&env, &format!("\u{feff}port_base = {}\n", env.port_base));
     let r = fork(&env);
-    let r = r.unwrap_or_else(|e| panic!("BOM-prefixed shoal.toml rejected: {e}"));
+    let r = r.unwrap_or_else(|e| panic!("BOM-prefixed ocean-graft.toml rejected: {e}"));
     assert_eq!(r["sessions"][0]["port"], env.port_base);
 }
 
 // ---------------------------------------------------------------------------
-// Invalid shoal.toml
+// Invalid ocean-graft.toml
 // ---------------------------------------------------------------------------
 
 #[test]
-fn invalid_shoal_toml_is_a_clear_error_naming_the_file_and_creates_nothing() {
+fn invalid_ocean_graft_toml_is_a_clear_error_naming_the_file_and_creates_nothing() {
     let env = Env::new(5724);
     let cases: &[(&str, &str)] = &[
         ("setp = \"typo\"\n", "setp"),
@@ -569,7 +569,7 @@ fn invalid_shoal_toml_is_a_clear_error_naming_the_file_and_creates_nothing() {
         set_toml(&env, body);
         let err = fork(&env).expect_err(&format!("{body:?} must be rejected"));
         assert!(
-            err.contains("shoal.toml"),
+            err.contains("ocean-graft.toml"),
             "{body:?}: error must name the file: {err}"
         );
         assert!(
@@ -585,33 +585,33 @@ fn invalid_shoal_toml_is_a_clear_error_naming_the_file_and_creates_nothing() {
 }
 
 #[test]
-fn shoal_toml_that_is_a_directory_is_a_clear_error() {
+fn ocean_graft_toml_that_is_a_directory_is_a_clear_error() {
     let env = Env::new(5726);
-    fs::create_dir_all(env.repo().join("shoal.toml")).unwrap();
+    fs::create_dir_all(env.repo().join("ocean-graft.toml")).unwrap();
     let err = fork(&env).expect_err("a directory is not a project file");
-    assert!(err.contains("shoal.toml"), "{err}");
-    assert_no_project(&env, "directory shoal.toml");
+    assert!(err.contains("ocean-graft.toml"), "{err}");
+    assert_no_project(&env, "directory ocean-graft.toml");
 }
 
-// Fixed bug: shoal.toml is opened with a plain read, so a FIFO named shoal.toml in
+// Fixed bug: ocean-graft.toml is opened with a plain read, so a FIFO named ocean-graft.toml in
 // the repository blocks the first fork forever (the MCP tool call or the
 // WorktreeCreate hook never returns) instead of being rejected as not a
 // regular file.
 #[test]
-fn shoal_toml_that_is_a_fifo_does_not_hang_the_first_fork() {
+fn ocean_graft_toml_that_is_a_fifo_does_not_hang_the_first_fork() {
     let env = Env::new(5727);
-    let fifo = env.repo().join("shoal.toml");
+    let fifo = env.repo().join("ocean-graft.toml");
     let st = Command::new("mkfifo").arg(&fifo).status().unwrap();
     assert!(st.success());
     let result = run_with_deadline(&env, &env.repo(), &["api", "fork", "{}"], 10);
     let _ = fs::remove_file(&fifo);
-    let (ok, out, err) = result.expect("fork hung on a FIFO shoal.toml");
+    let (ok, out, err) = result.expect("fork hung on a FIFO ocean-graft.toml");
     assert!(!ok, "a FIFO is not a project file: {out}");
-    assert!(out.contains("shoal.toml"), "{out}\n{err}");
+    assert!(out.contains("ocean-graft.toml"), "{out}\n{err}");
 }
 
 #[test]
-fn invalid_shoal_toml_through_mcp_is_a_tool_error_and_the_server_survives() {
+fn invalid_ocean_graft_toml_through_mcp_is_a_tool_error_and_the_server_survives() {
     let env = Env::new(5728);
     set_toml(&env, "backend = \"zfs\"\nport_base = 1\n");
     let mut mcp = env.mcp();
@@ -620,7 +620,7 @@ fn invalid_shoal_toml_through_mcp_is_a_tool_error_and_the_server_survives() {
     assert!(is_err, "{text}");
     let text = text.as_str().unwrap().to_string();
     assert!(
-        text.contains("shoal.toml") && text.contains("zfs"),
+        text.contains("ocean-graft.toml") && text.contains("zfs"),
         "{text}"
     );
 
@@ -871,7 +871,7 @@ fn setup_output_and_stdin_never_touch_the_mcp_protocol() {
 }
 
 #[test]
-fn worktree_create_hook_auto_initialises_from_shoal_toml_with_only_the_path_on_stdout() {
+fn worktree_create_hook_auto_initialises_from_ocean_graft_toml_with_only_the_path_on_stdout() {
     let env = Env::new(5746);
     set_toml(
         &env,
@@ -954,7 +954,7 @@ fn repository_paths_with_spaces_and_unicode_and_same_named_repositories() {
         write(repo.join(".gitignore"), "deps/\n");
         write(repo.join("deps.lock"), format!("lock {i}\n").as_str());
         write(
-            repo.join("shoal.toml"),
+            repo.join("ocean-graft.toml"),
             &format!(
                 "setup = \"{SETUP}\"\nport_base = {}\nbackend = \"{backend}\"\n",
                 env.port_base + i as u16
@@ -1199,7 +1199,7 @@ fn refresh_when_nothing_changed_reports_up_to_date_and_ignores_uncommitted_sourc
     set_toml(&env, &standard_toml(&env, "clone"));
     commit_all(&env, "toml");
     fork_ok(&env);
-    let out = env.shoal(&["refresh"]);
+    let out = env.ocean_graft(&["refresh"]);
     assert!(out.contains("already at"), "{out}");
     assert_eq!(generations(&env), 1);
 
@@ -1215,11 +1215,11 @@ fn refresh_when_nothing_changed_reports_up_to_date_and_ignores_uncommitted_sourc
     write(env.repo().join("src/new.txt"), "new\n");
     commit_all(&env, "new file");
     assert_eq!(status(&env)["template"]["behind_source"], true);
-    let out = env.shoal(&["refresh"]);
+    let out = env.ocean_graft(&["refresh"]);
     assert!(out.contains("g2"), "{out}");
     assert_eq!(generations(&env), 2);
     assert_eq!(status(&env)["template"]["behind_source"], false);
-    let out = env.shoal(&["refresh"]);
+    let out = env.ocean_graft(&["refresh"]);
     assert!(out.contains("already at"), "{out}");
     let r = fork_ok(&env);
     assert!(r["refreshed"].is_null(), "{r}");
@@ -1405,8 +1405,8 @@ fn tracked_branch_that_disappears_is_a_clear_error_and_existing_sessions_survive
 }
 
 // Fixed bug: the setup command and setup_inputs are copied into state.json when
-// the project is first created and never read from shoal.toml again. A
-// committed change to `setup` in shoal.toml is ignored by every later
+// the project is first created and never read from ocean-graft.toml again. A
+// committed change to `setup` in ocean-graft.toml is ignored by every later
 // refresh (status keeps reporting the old command), while `test` and
 // `preview` are read live from the same file. The only way to pick up a new
 // setup command is to delete the project.
@@ -1420,7 +1420,7 @@ fn a_committed_change_to_the_setup_command_is_used_by_the_next_refresh() {
     set_toml(
         &env,
         &format!(
-            "setup = \"{new_setup}\"\nsetup_inputs = [\"deps.lock\", \"shoal.toml\"]\ncopy = [\".env\"]\nport_base = {}\nbackend = \"clone\"\n",
+            "setup = \"{new_setup}\"\nsetup_inputs = [\"deps.lock\", \"ocean-graft.toml\"]\ncopy = [\".env\"]\nport_base = {}\nbackend = \"clone\"\n",
             env.port_base
         ),
     );
@@ -1547,7 +1547,7 @@ fn explicit_init_twice_is_refused_and_keeps_the_existing_project() {
     env.init("clone");
     let a = fork_ok(&env);
     let before = env.state();
-    let out = shoal_cmd(
+    let out = ocean_graft_cmd(
         &env,
         &env.repo(),
         &["init", "--backend", "clone", "--setup", "exit 1"],
@@ -1557,13 +1557,13 @@ fn explicit_init_twice_is_refused_and_keeps_the_existing_project() {
     .unwrap();
     assert!(!out.status.success());
     assert!(
-        stderr(&out).contains("already has a shoal project"),
+        stderr(&out).contains("already has a ocean-graft project"),
         "{}",
         stderr(&out)
     );
     assert_eq!(env.state(), before, "state untouched");
     assert!(spath(&a).join("deps/installed.txt").exists());
-    // shoal.toml written after init does not re-initialise anything.
+    // ocean-graft.toml written after init does not re-initialise anything.
     set_toml(&env, "port_base = 5999\n");
     let b = fork_ok(&env);
     assert_eq!(b["sessions"][0]["port"], env.port_base + 10);
@@ -1573,7 +1573,7 @@ fn explicit_init_twice_is_refused_and_keeps_the_existing_project() {
 fn explicit_init_rejects_copy_paths_outside_the_repository() {
     let env = Env::new(5791);
     for bad in ["../outside", "/etc/passwd", "", "a/../../b"] {
-        let out = shoal_cmd(
+        let out = ocean_graft_cmd(
             &env,
             &env.repo(),
             &["init", "--backend", "clone", "--copy", bad],

@@ -1,5 +1,5 @@
-//! Shared harness for shoal's end-to-end tests. Every test drives the real
-//! binary in a throwaway repository and SHOAL_HOME, under target/tmp (not
+//! Shared harness for ocean-graft's end-to-end tests. Every test drives the real
+//! binary in a throwaway repository and OCEAN_GRAFT_HOME, under target/tmp (not
 //! /tmp, which the sandbox replaces).
 //!
 //! Each test file owns a port range (pass it to `Env::new`) so services in
@@ -15,7 +15,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 use std::sync::mpsc::{channel, Receiver};
 use std::time::Duration;
 
-pub const BIN: &str = env!("CARGO_BIN_EXE_shoal");
+pub const BIN: &str = env!("CARGO_BIN_EXE_ocean-graft");
 
 /// A static file server on $PORT for preview and gateway tests. Not
 /// `python3 -m http.server`: its bind does a reverse DNS lookup, and its
@@ -144,7 +144,7 @@ impl Env {
         self.root.path().join("home")
     }
 
-    /// The single project directory under SHOAL_HOME (panics if not exactly one).
+    /// The single project directory under OCEAN_GRAFT_HOME (panics if not exactly one).
     pub fn project_dir(&self) -> PathBuf {
         let mut dirs: Vec<PathBuf> = fs::read_dir(self.home().join("projects"))
             .unwrap()
@@ -163,8 +163,8 @@ impl Env {
     pub fn command(&self, program: &str, dir: &Path) -> Command {
         let mut cmd = Command::new(program);
         cmd.current_dir(dir)
-            .env("SHOAL_HOME", self.home())
-            .env_remove("SHOAL_PROJECT")
+            .env("OCEAN_GRAFT_HOME", self.home())
+            .env_remove("OCEAN_GRAFT_PROJECT")
             .env_remove("CLAUDE_PROJECT_DIR")
             .env("GIT_AUTHOR_NAME", "Test")
             .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
@@ -184,25 +184,25 @@ impl Env {
         stdout(&out)
     }
 
-    pub fn shoal_in(&self, dir: &Path, args: &[&str]) -> Output {
+    pub fn ocean_graft_in(&self, dir: &Path, args: &[&str]) -> Output {
         self.command(BIN, dir).args(args).output().unwrap()
     }
 
-    /// Run shoal in the repository and require success.
-    pub fn shoal(&self, args: &[&str]) -> String {
-        let out = self.shoal_in(&self.repo(), args);
+    /// Run ocean-graft in the repository and require success.
+    pub fn ocean_graft(&self, args: &[&str]) -> String {
+        let out = self.ocean_graft_in(&self.repo(), args);
         assert!(
             out.status.success(),
-            "shoal {args:?} failed:\n{}{}",
+            "ocean-graft {args:?} failed:\n{}{}",
             stdout(&out),
             stderr(&out)
         );
         stdout(&out)
     }
 
-    /// `shoal init` with a setup that "installs" deps/installed.txt.
+    /// `ocean-graft init` with a setup that "installs" deps/installed.txt.
     pub fn init(&self, backend: &str) -> String {
-        self.shoal(&[
+        self.ocean_graft(&[
             "init",
             "--backend",
             backend,
@@ -217,7 +217,7 @@ impl Env {
         ])
     }
 
-    /// Call a tool through `shoal api` in `dir`. Ok(result) or Err(message).
+    /// Call a tool through `ocean-graft api` in `dir`. Ok(result) or Err(message).
     pub fn api_in(&self, dir: &Path, tool: &str, args: Value) -> Result<Value, String> {
         let out = self
             .command(BIN, dir)
@@ -242,7 +242,7 @@ impl Env {
         self.api_in(&self.repo(), tool, args)
     }
 
-    /// Run `shoal hook <event>` with `input` on stdin, from `dir`.
+    /// Run `ocean-graft hook <event>` with `input` on stdin, from `dir`.
     /// `project_dir` sets CLAUDE_PROJECT_DIR when given.
     pub fn hook(
         &self,
@@ -274,7 +274,7 @@ impl Env {
         }
     }
 
-    /// Start `shoal mcp` with its working directory in the repository.
+    /// Start `ocean-graft mcp` with its working directory in the repository.
     pub fn mcp(&self) -> Mcp {
         self.mcp_in(&self.repo())
     }
@@ -350,7 +350,7 @@ impl HookResult {
     }
 }
 
-/// A live `shoal mcp` process.
+/// A live `ocean-graft mcp` process.
 pub struct Mcp {
     pub child: Child,
     stdin: Option<ChildStdin>,

@@ -1,16 +1,16 @@
-# shoal plugin for Claude Code: architecture
+# ocean-graft plugin for Claude Code: architecture
 
-Claude is the operator. The person talks to Claude; Claude uses shoal the
-way it uses git. This plugin is how Claude Code reaches shoal: MCP tools for
+Claude is the operator. The person talks to Claude; Claude uses ocean-graft the
+way it uses git. This plugin is how Claude Code reaches ocean-graft: MCP tools for
 deliberate actions, hooks for automatic ones, and a skill that says when to
 use which.
 
 ## Layers
 
 ```
-Claude Code ──MCP stdio──▶ shoal mcp ──────────────┐
-            ──hooks (JSON on stdin)─▶ shoal hook <event> ─┤
-scripts, CI ──▶ shoal api <tool> '<json>' ─────────┤
+Claude Code ──MCP stdio──▶ ocean-graft mcp ──────────────┐
+            ──hooks (JSON on stdin)─▶ ocean-graft hook <event> ─┤
+scripts, CI ──▶ ocean-graft api <tool> '<json>' ─────────┤
                                                     ▼
                                       tools.rs   one dispatcher: JSON in, JSON out
                                                     ▼
@@ -46,11 +46,11 @@ Rules that keep the integration correct:
    command that opens the project.
 4. **Nothing lost.** Any path that removes a session first saves its work:
    uncommitted changes are committed as WIP, the branch is imported into the
-   source repository as `shoal/<name>`, and other local branches and stashes
-   as `shoal/<name>--<branch>` and `shoal/<name>--stash-N`. Saving never
-   moves an existing branch except forward: if `shoal/<name>` holds other
+   source repository as `ocean-graft/<name>`, and other local branches and stashes
+   as `ocean-graft/<name>--<branch>` and `ocean-graft/<name>--stash-N`. Saving never
+   moves an existing branch except forward: if `ocean-graft/<name>` holds other
    work (an earlier session of the same name), the save goes to
-   `shoal/<name>-2`. A session in the middle of a rebase or merge is not
+   `ocean-graft/<name>-2`. A session in the middle of a rebase or merge is not
    removed. `rewind` always checkpoints the state it replaces
    (`pre-rewind-N`; the newest 10 are kept, pruned only after a successful
    rewind and never the checkpoint being restored; a rewind that fails
@@ -62,15 +62,15 @@ Rules that keep the integration correct:
    WorktreeCreate and WorktreeRemove fail loudly (exit 1) because Claude
    Code must not continue with a half-made or wrongly deleted directory.
    Nothing ever exits 2 (which blocks a prompt or a stop): the launcher
-   `libexec/shoal-plugin` maps every exit code, so a binary that is missing,
+   `libexec/ocean-graft-plugin` maps every exit code, so a binary that is missing,
    older than the plugin, or crashes cannot block Claude.
-7. **The binary is verified, not trusted.** The launcher uses `$SHOAL_BIN`,
+7. **The binary is verified, not trusted.** The launcher uses `$OCEAN_GRAFT_BIN`,
    a binary bundled beside it, or a development build; otherwise it
    downloads the release binary for this platform once into the plugin's
    data directory. The download is checked against the SHA-256 in
    `libexec/release.txt`, which the release workflow commits with the
    plugin, so a tampered or truncated download is never run. On any failure
-   it falls back to `shoal` on PATH, and keeps the exit-code rule above.
+   it falls back to `ocean-graft` on PATH, and keeps the exit-code rule above.
 6. **Crash safety.** state.json is written durably (fsync, rename, fsync
    of the directory). Removal forgets a session before deleting its files.
    A rewind copies the checkpoint aside and swaps it in with renames; the
@@ -82,13 +82,13 @@ Rules that keep the integration correct:
    be unmounted; if that is interrupted, the `pre-rewind-N` checkpoint is
    the way back. A rewind's safety checkpoint is dropped only when the
    session is provably unchanged. Setup and
-   test commands are killed with shoal if shoal itself is killed.
+   test commands are killed with ocean-graft if ocean-graft itself is killed.
    Service process groups are only signalled while their leader's start
    time matches the one recorded, so a reused pid is never killed.
 
 ## MCP tools
 
-Seen by Claude as `mcp__plugin_shoal_shoal__<tool>`. Each takes `session`
+Seen by Claude as `mcp__plugin_ocean-graft_ocean-graft__<tool>`. Each takes `session`
 (a name) or `path` (any path inside a session) where a session is needed,
 and an optional `project` (path to the repository) when the server's working
 directory is not the repository.
@@ -111,15 +111,15 @@ them. Errors set `isError` and say how to fix the problem.
 
 | Event | Handler | Behaviour |
 |---|---|---|
-| WorktreeCreate | `shoal hook worktree-create` | Creates a shoal session for `claude --worktree`, subagents with `isolation: worktree`, and background sessions. Inside an existing session it forks that session, so a subagent starts with the parent's uncommitted work; otherwise it starts from the latest template (auto-initialising the project on first use, and falling back to the last good template if a refresh fails). Prints the path as the last stdout line. Claude Code never sends WorktreeRemove for subagent or workflow worktrees (and sends no field that tells them apart), so hook-made sessions are swept by a background `shoal sweep` once idle for 72 hours (`SHOAL_WORKTREE_IDLE_HOURS`, 0 turns it off), their work saved first, unless a main session ran in them: SessionStart, UserPromptSubmit or a main-session Stop (not SubagentStop) firing inside a session marks it interactive for good, through a marker file that needs no lock. Sessions running a service and sessions any process is working in are never swept; if the process list cannot be read, nothing is. The hook waits at most 60 s for another refresh and gives setup 600 s (hook timeout 900 s); past that it starts from the last good template and finishes the refresh in the background. First-time setup that is too slow for a hook goes on in the background too (the hook fails once, saying so). |
-| WorktreeRemove | `shoal hook worktree-remove` | Saves the session's work (WIP commit, import as `shoal/<name>`), then removes it. Refuses paths that are not shoal sessions. |
-| Stop, SubagentStop | `shoal hook stop` | Checkpoints the session the agent is in, when anything changed (ignored files included) and checkpoints are cheap (overlay, or copy-on-write clones). Keeps the 20 newest automatic checkpoints. `status` reports `auto_checkpoints`. |
-| SessionStart | `shoal hook session-start` | Inside a session, tells Claude which session, branch and port it has, whether checkpoints are automatic, and which tools exist. |
-| UserPromptSubmit | `shoal hook prompt` | Marks the session active, so idle shutdown leaves it alone. |
+| WorktreeCreate | `ocean-graft hook worktree-create` | Creates a ocean-graft session for `claude --worktree`, subagents with `isolation: worktree`, and background sessions. Inside an existing session it forks that session, so a subagent starts with the parent's uncommitted work; otherwise it starts from the latest template (auto-initialising the project on first use, and falling back to the last good template if a refresh fails). Prints the path as the last stdout line. Claude Code never sends WorktreeRemove for subagent or workflow worktrees (and sends no field that tells them apart), so hook-made sessions are swept by a background `ocean-graft sweep` once idle for 72 hours (`OCEAN_GRAFT_WORKTREE_IDLE_HOURS`, 0 turns it off), their work saved first, unless a main session ran in them: SessionStart, UserPromptSubmit or a main-session Stop (not SubagentStop) firing inside a session marks it interactive for good, through a marker file that needs no lock. Sessions running a service and sessions any process is working in are never swept; if the process list cannot be read, nothing is. The hook waits at most 60 s for another refresh and gives setup 600 s (hook timeout 900 s); past that it starts from the last good template and finishes the refresh in the background. First-time setup that is too slow for a hook goes on in the background too (the hook fails once, saying so). |
+| WorktreeRemove | `ocean-graft hook worktree-remove` | Saves the session's work (WIP commit, import as `ocean-graft/<name>`), then removes it. Refuses paths that are not ocean-graft sessions. |
+| Stop, SubagentStop | `ocean-graft hook stop` | Checkpoints the session the agent is in, when anything changed (ignored files included) and checkpoints are cheap (overlay, or copy-on-write clones). Keeps the 20 newest automatic checkpoints. `status` reports `auto_checkpoints`. |
+| SessionStart | `ocean-graft hook session-start` | Inside a session, tells Claude which session, branch and port it has, whether checkpoints are automatic, and which tools exist. |
+| UserPromptSubmit | `ocean-graft hook prompt` | Marks the session active, so idle shutdown leaves it alone. |
 
 ## Project file
 
-`shoal.toml` at the repository root, all keys optional. Without it, shoal
+`ocean-graft.toml` at the repository root, all keys optional. Without it, ocean-graft
 detects the setup, test and preview commands from the lockfile and manifest.
 
 ```toml
@@ -133,13 +133,13 @@ port_base = 4100           # 1..65526; each session reserves a block of ten
 backend = "clone"           # or "overlay" (Linux, root)
 ```
 
-shoal.toml must be a regular file (not a symlink or FIFO). `copy` entries
+ocean-graft.toml must be a regular file (not a symlink or FIFO). `copy` entries
 must resolve inside the repository. A committed change to `setup` takes
 effect at the next template refresh. Setup is killed after
-`SHOAL_SETUP_TIMEOUT_SECS` (default 1200). A refresh that fails is
+`OCEAN_GRAFT_SETUP_TIMEOUT_SECS` (default 1200). A refresh that fails is
 remembered for its commit: forks use the last good template (reporting
 `refresh_error`) and do not retry the same commit for ten minutes, or until
-`shoal refresh`.
+`ocean-graft refresh`.
 
 ## Land, step by step
 
@@ -162,7 +162,7 @@ remembered for its commit: forks use the last good template (reporting
    the user's uncommitted edits, or any untracked or ignored file.
    Otherwise the branch ref is fetched fast-forward-only. If the target
    moved meanwhile, go back to step 2, at most three times.
-6. The work is recorded as `shoal/<name>` in the source repository before
+6. The work is recorded as `ocean-graft/<name>` in the source repository before
    step 5, without ever moving that branch backwards (see rule 4).
 
 The session is locked for the whole land: `rewind`, `checkpoint`, `fork`
@@ -172,21 +172,21 @@ is `timed_out`.
 
 ## macOS
 
-shoal ships for macOS first; there it uses the clone backend (APFS
+ocean-graft ships for macOS first; there it uses the clone backend (APFS
 `clonefile`) and runs as the user, not root. Rules that follow from that:
 
 - **Names are lower case.** APFS matches file names, and git matches loose
   refs, without regard to case by default. Session names are lower-cased
   (a mixed-case name is refused), checkpoint labels are compared ignoring
-  case, saved `shoal/` branches skip names that differ only in case, and a
+  case, saved `ocean-graft/` branches skip names that differ only in case, and a
   repository with paths that differ only in case is refused on a
-  case-insensitive SHOAL_HOME rather than checked out wrongly. A case-only
+  case-insensitive OCEAN_GRAFT_HOME rather than checked out wrongly. A case-only
   rename is landed normally.
 - **Trees are removed with `remove_tree`,** which opens read-only
   directories first (Go module caches, `chmod a-w` output): without root,
   `remove_dir_all` cannot empty them.
 - **Clones are probed, not assumed.** Automatic checkpoints are on only if
-  `clonefile` works where SHOAL_HOME lives (not on HFS+, exFAT or a network
+  `clonefile` works where OCEAN_GRAFT_HOME lives (not on HFS+, exFAT or a network
   home); sizes printed on macOS are logical, since clones share blocks.
 - **Process start times come from the kernel** (`proc_pidinfo`), not from
   `ps` text, which changes with the time zone and locale.

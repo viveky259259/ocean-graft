@@ -1,6 +1,6 @@
 # notes-app
 
-A small notes service used as the base repository when trying shoal: Hono on
+A small notes service used as the base repository when trying ocean-graft: Hono on
 Node, tested with Vitest, run with tsx.
 
 ```bash

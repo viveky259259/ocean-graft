@@ -1,5 +1,5 @@
 {
-  "name": "shoal",
+  "name": "ocean-graft",
   "version": "0.2.0",
   "description": "Instant copy-on-write sessions for Claude: fork the repository in milliseconds with dependencies installed, checkpoint and rewind, run variants in parallel, and land tested work on your branch.",
   "keywords": [
@@ -10,8 +10,8 @@
     "isolation"
   ],
   "license": "MIT",
-  "repository": "https://github.com/viveky259259/ocean_fs",
-  "homepage": "https://github.com/viveky259259/ocean_fs",
+  "repository": "https://github.com/viveky259259/ocean-graft",
+  "homepage": "https://github.com/viveky259259/ocean-graft",
   "author": {
     "name": "viveky259259",
     "url": "https://github.com/viveky259259"

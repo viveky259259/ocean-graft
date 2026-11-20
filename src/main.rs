@@ -1,4 +1,4 @@
-//! shoal: copy-on-write session volumes for running coding agents in parallel.
+//! ocean-graft: copy-on-write session volumes for running coding agents in parallel.
 //!
 //! A template is built once from a git repository and made warm by a setup
 //! command (`npm ci`, `cargo fetch`, ...). Every session is a copy-on-write
@@ -40,13 +40,13 @@ use std::time::Instant;
 
 #[derive(Parser)]
 #[command(
-    name = "shoal",
+    name = "ocean-graft",
     version,
     about = "Copy-on-write session volumes for running coding agents in parallel"
 )]
 struct Cli {
     /// Project directory (default: found from the current directory)
-    #[arg(long, global = true, env = "SHOAL_PROJECT")]
+    #[arg(long, global = true, env = "OCEAN_GRAFT_PROJECT")]
     project: Option<PathBuf>,
     #[command(subcommand)]
     command: Cmd,
@@ -80,7 +80,7 @@ enum Cmd {
         /// Commit uncommitted work with this message first
         #[arg(long, short)]
         message: Option<String>,
-        /// Test command (default: shoal.toml or detected)
+        /// Test command (default: ocean-graft.toml or detected)
         #[arg(long, conflicts_with = "no_test")]
         test: Option<String>,
         /// Skip tests
@@ -102,12 +102,12 @@ enum Cmd {
     /// Serve the tools over MCP on stdin/stdout (for Claude Code, Codex,
     /// Cursor, Gemini CLI, OpenCode or any other MCP client)
     Mcp,
-    /// Make shoal available to Codex, Cursor, Gemini CLI or OpenCode: register
+    /// Make ocean-graft available to Codex, Cursor, Gemini CLI or OpenCode: register
     /// its MCP server in each agent's config and add its instructions to the
     /// repository's AGENTS.md (GEMINI.md for Gemini CLI)
     Setup(agents::SetupArgs),
-    /// Print shoal's instructions for agents other than Claude Code: what
-    /// `shoal setup` writes to AGENTS.md
+    /// Print ocean-graft's instructions for agents other than Claude Code: what
+    /// `ocean-graft setup` writes to AGENTS.md
     Instructions,
     /// Handle a Claude Code hook event, reading its JSON from stdin
     Hook {
@@ -139,7 +139,7 @@ enum Cmd {
         #[arg(long)]
         stat: bool,
     },
-    /// Run a command in a session (sets SHOAL_SESSION, SHOAL_PORT and PORT)
+    /// Run a command in a session (sets OCEAN_GRAFT_SESSION, OCEAN_GRAFT_PORT and PORT)
     Exec {
         /// Linux: make everything outside the session read-only and hide other sessions
         /// Let the command write only inside the session, and hide the rest
@@ -189,7 +189,7 @@ enum Cmd {
     Gateway {
         name: String,
         service: String,
-        /// Public port to listen on (given by shoal, so the gateway can bind
+        /// Public port to listen on (given by ocean-graft, so the gateway can bind
         /// before it waits for the project lock)
         #[arg(long)]
         listen: Option<u16>,
@@ -229,7 +229,7 @@ enum Cmd {
     Checkpoint { name: String, label: Option<String> },
     /// Restore a session to a checkpoint
     Rewind { name: String, label: String },
-    /// Copy session commits into the source repository as branches shoal/<name>
+    /// Copy session commits into the source repository as branches ocean-graft/<name>
     Import {
         names: Vec<String>,
         #[arg(long)]
@@ -278,16 +278,16 @@ struct InitArgs {
     #[arg(long, value_enum)]
     backend: Option<Backend>,
     /// First port handed to sessions; each session gets a block of ten
-    #[arg(long, default_value_t = 4100, value_parser = clap::value_parser!(u16).range(1..=i64::from(shoal_port_max())))]
+    #[arg(long, default_value_t = 4100, value_parser = clap::value_parser!(u16).range(1..=i64::from(ocean_graft_port_max())))]
     port_base: u16,
 }
 
-const fn shoal_port_max() -> u16 {
+const fn ocean_graft_port_max() -> u16 {
     config::PORT_BASE_MAX
 }
 
 fn main() {
-    // Exit quietly when the reader goes away (`shoal ls | head`), like other CLIs,
+    // Exit quietly when the reader goes away (`ocean-graft ls | head`), like other CLIs,
     // instead of panicking on a broken pipe.
     let cli = Cli::parse();
     // The MCP server must survive its client closing a pipe: SIGPIPE stays
@@ -299,7 +299,7 @@ fn main() {
     match run(cli) {
         Ok(code) => std::process::exit(code),
         Err(err) => {
-            eprintln!("shoal: {err:#}");
+            eprintln!("ocean-graft: {err:#}");
             std::process::exit(1);
         }
     }
@@ -336,7 +336,7 @@ fn run(cli: Cli) -> Result<i32> {
             ops::refresh(&dir, false, ops::RefreshLimits::default())?;
             return Ok(0);
         }
-        // Started by shoal with its ports: bind at once, without the project
+        // Started by ocean-graft with its ports: bind at once, without the project
         // lock its starter may still hold.
         Cmd::Gateway {
             name,
@@ -479,7 +479,7 @@ fn cmd_init(args: InitArgs) -> Result<()> {
         sys::human_duration(std::time::Duration::from_millis(r.elapsed_ms))
     );
     println!("Project: {}", r.project.display());
-    println!("Next: shoal new <name>");
+    println!("Next: ocean-graft new <name>");
     Ok(())
 }
 
@@ -637,7 +637,7 @@ fn summarize(p: &Project, s: &Session) -> Result<SessionSummary> {
 
 fn cmd_ls(p: &Project) -> Result<()> {
     if p.state.sessions.is_empty() {
-        println!("No sessions. Create one with `shoal new <name>`.");
+        println!("No sessions. Create one with `ocean-graft new <name>`.");
         return Ok(());
     }
     let width = p
@@ -956,9 +956,9 @@ fn session_command(
         (cmd, TempDir(None))
     };
     cmd.current_dir(path)
-        .env("SHOAL_SESSION", name)
-        .env("SHOAL_PORT", port.to_string())
-        .env("SHOAL_PROJECT", project_dir);
+        .env("OCEAN_GRAFT_SESSION", name)
+        .env("OCEAN_GRAFT_PORT", port.to_string())
+        .env("OCEAN_GRAFT_PROJECT", project_dir);
     if std::env::var_os("PORT").is_none() {
         cmd.env("PORT", port.to_string());
     }
@@ -1007,7 +1007,7 @@ fn cmd_run(
     let queued = Instant::now();
     let held = queue::acquire(&job, |status| {
         eprintln!(
-            "shoal: waiting for a queue slot ({} of {} busy, {} waiting)",
+            "ocean-graft: waiting for a queue slot ({} of {} busy, {} waiting)",
             status.busy,
             status.slots,
             status.waiting.len()
@@ -1015,7 +1015,10 @@ fn cmd_run(
     })?;
     let waited = queued.elapsed();
     if waited.as_millis() >= 100 {
-        eprintln!("shoal: got a slot after {}", sys::human_duration(waited));
+        eprintln!(
+            "ocean-graft: got a slot after {}",
+            sys::human_duration(waited)
+        );
     }
     let (mut cmd, _tmp) = session_command(&project_dir, &path, &name, port, sandbox, &command)?;
     let code = sys::supervised(&mut cmd);
@@ -1128,7 +1131,7 @@ fn cmd_services(p: &Project) -> Result<()> {
         .flat_map(|s| s.services.iter().map(move |svc| (s, svc)))
         .collect();
     if rows.is_empty() {
-        println!("No services. Start one with `shoal serve <session> -- <command>`.");
+        println!("No services. Start one with `ocean-graft serve <session> -- <command>`.");
         return Ok(());
     }
     println!(
@@ -1197,7 +1200,7 @@ fn reap_once(idle: u64) -> Result<()> {
         let mut p = match Project::open(dir.clone()) {
             Ok(p) => p,
             Err(err) => {
-                eprintln!("shoal: skipping {}: {err:#}", dir.display());
+                eprintln!("ocean-graft: skipping {}: {err:#}", dir.display());
                 continue;
             }
         };
@@ -1270,7 +1273,7 @@ fn cmd_reap(idle: &str, watch: Option<&str>) -> Result<()> {
             );
             loop {
                 if let Err(err) = reap_once(idle) {
-                    eprintln!("shoal: {err:#}");
+                    eprintln!("ocean-graft: {err:#}");
                 }
                 std::thread::sleep(interval);
             }
