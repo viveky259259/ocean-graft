@@ -1,6 +1,6 @@
 {
   "name": "ocean-graft",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Instant copy-on-write sessions for Claude: fork the repository in milliseconds with dependencies installed, checkpoint and rewind, run variants in parallel, and land tested work on your branch.",
   "keywords": [
     "worktree",
