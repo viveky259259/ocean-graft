@@ -867,21 +867,28 @@ fn sandbox_command(
         "--ro-bind",
         "/",
         "/",
-    ])
-    .args(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"])
-    // Hide the template, the other sessions and the checkpoints...
-    .arg("--tmpfs")
-    .arg(project_dir)
-    // ...then bring back only this session, writable.
-    .arg("--bind")
-    .arg(session)
-    .arg(session)
-    .args(["--setenv", "XDG_CACHE_HOME", "/tmp/.cache"])
-    .args(["--setenv", "npm_config_cache", "/tmp/.npm"])
-    .arg("--chdir")
-    .arg(session)
-    .arg("--")
-    .args(command);
+    ]);
+    // When running as root (overlay backend), dropping all capabilities also
+    // drops CAP_DAC_READ_SEARCH, preventing traversal of non-root 0700/0750
+    // ancestor directories (e.g. /home/<user>) on the way to the session dir.
+    #[cfg(target_os = "linux")]
+    if unsafe { libc::geteuid() } == 0 {
+        cmd.args(["--cap-add", "CAP_DAC_READ_SEARCH"]);
+    }
+    cmd.args(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"])
+        // Hide the template, the other sessions and the checkpoints...
+        .arg("--tmpfs")
+        .arg(project_dir)
+        // ...then bring back only this session, writable.
+        .arg("--bind")
+        .arg(session)
+        .arg(session)
+        .args(["--setenv", "XDG_CACHE_HOME", "/tmp/.cache"])
+        .args(["--setenv", "npm_config_cache", "/tmp/.npm"])
+        .arg("--chdir")
+        .arg(session)
+        .arg("--")
+        .args(command);
     Ok((cmd, TempDir(None)))
 }
 
